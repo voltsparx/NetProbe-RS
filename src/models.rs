@@ -1,0 +1,256 @@
+use std::fmt;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use clap::ValueEnum;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum ReportFormat {
+    Cli,
+    Txt,
+    Json,
+    Html,
+    Csv,
+}
+
+impl ReportFormat {
+    pub fn extension(self) -> &'static str {
+        match self {
+            ReportFormat::Cli => "txt",
+            ReportFormat::Txt => "txt",
+            ReportFormat::Json => "json",
+            ReportFormat::Html => "html",
+            ReportFormat::Csv => "csv",
+        }
+    }
+
+    pub fn from_extension(raw: &str) -> Option<Self> {
+        match raw.trim_start_matches('.').to_ascii_lowercase().as_str() {
+            "txt" | "log" => Some(ReportFormat::Txt),
+            "json" => Some(ReportFormat::Json),
+            "html" | "htm" => Some(ReportFormat::Html),
+            "csv" => Some(ReportFormat::Csv),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum ScanProfile {
+    Stealth,
+    Balanced,
+    Turbo,
+    Aggressive,
+    RootOnly,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ProfileDefaults {
+    pub concurrency: usize,
+    pub timeout_ms: u64,
+    pub delay_ms: u64,
+}
+
+impl ScanProfile {
+    pub fn defaults(self) -> ProfileDefaults {
+        match self {
+            ScanProfile::Stealth => ProfileDefaults {
+                concurrency: 32,
+                timeout_ms: 3000,
+                delay_ms: 30,
+            },
+            ScanProfile::Balanced => ProfileDefaults {
+                concurrency: 128,
+                timeout_ms: 1200,
+                delay_ms: 5,
+            },
+            ScanProfile::Turbo => ProfileDefaults {
+                concurrency: 512,
+                timeout_ms: 700,
+                delay_ms: 0,
+            },
+            ScanProfile::Aggressive => ProfileDefaults {
+                concurrency: 768,
+                timeout_ms: 550,
+                delay_ms: 0,
+            },
+            ScanProfile::RootOnly => ProfileDefaults {
+                concurrency: 72,
+                timeout_ms: 1800,
+                delay_ms: 8,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeSettings {
+    pub concurrency: usize,
+    pub timeout: Duration,
+    pub delay: Duration,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanRequest {
+    pub target: String,
+    pub ports: Vec<u16>,
+    pub top_ports: Option<usize>,
+    pub include_udp: bool,
+    pub reverse_dns: bool,
+    pub service_detection: bool,
+    pub explain: bool,
+    pub report_format: ReportFormat,
+    pub profile: ScanProfile,
+    pub profile_explicit: bool,
+    pub root_only: bool,
+    pub aggressive_root: bool,
+    pub privileged_probes: bool,
+    pub lab_mode: bool,
+    pub allow_external: bool,
+    pub strict_safety: bool,
+    pub output_path: Option<PathBuf>,
+    pub lua_script: Option<PathBuf>,
+    pub timeout_ms: Option<u64>,
+    pub concurrency: Option<usize>,
+    pub delay_ms: Option<u64>,
+}
+
+impl ScanRequest {
+    pub fn runtime_settings(&self) -> RuntimeSettings {
+        let defaults = self.profile.defaults();
+        RuntimeSettings {
+            concurrency: self
+                .concurrency
+                .unwrap_or(defaults.concurrency)
+                .clamp(1, 4096),
+            timeout: Duration::from_millis(self.timeout_ms.unwrap_or(defaults.timeout_ms)),
+            delay: Duration::from_millis(self.delay_ms.unwrap_or(defaults.delay_ms)),
+        }
+    }
+
+    pub fn requires_root(&self) -> bool {
+        self.aggressive_root || self.privileged_probes
+    }
+
+    pub fn effective_privileged_probes(&self) -> bool {
+        self.privileged_probes || self.aggressive_root
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PortState {
+    Open,
+    Closed,
+    Filtered,
+    OpenOrFiltered,
+}
+
+impl PortState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PortState::Open => "open",
+            PortState::Closed => "closed",
+            PortState::Filtered => "filtered",
+            PortState::OpenOrFiltered => "open|filtered",
+        }
+    }
+}
+
+impl fmt::Display for PortState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortFinding {
+    pub port: u16,
+    pub protocol: String,
+    pub state: PortState,
+    pub service: Option<String>,
+    pub banner: Option<String>,
+    pub reason: String,
+    pub matched_by: Option<String>,
+    pub confidence: Option<f32>,
+    pub educational_note: Option<String>,
+    pub latency_ms: Option<u128>,
+    pub explanation: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostResult {
+    pub target: String,
+    pub ip: String,
+    pub reverse_dns: Option<String>,
+    pub warnings: Vec<String>,
+    pub ports: Vec<PortFinding>,
+    pub risk_score: u8,
+    pub ai_findings: Vec<String>,
+    pub defensive_advice: Vec<String>,
+    pub learning_notes: Vec<String>,
+    pub lua_findings: Vec<String>,
+}
+
+impl HostResult {
+    pub fn open_port_count(&self) -> usize {
+        self.ports
+            .iter()
+            .filter(|p| matches!(p.state, PortState::Open | PortState::OpenOrFiltered))
+            .count()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EngineStats {
+    pub async_engine_tasks: usize,
+    pub thread_pool_tasks: usize,
+    pub parallel_tasks: usize,
+    pub lua_hooks_ran: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanRequestSummary {
+    pub target: String,
+    pub port_count: usize,
+    pub include_udp: bool,
+    pub explain: bool,
+    pub profile: ScanProfile,
+    pub root_only: bool,
+    pub aggressive_root: bool,
+    pub privileged_probes: bool,
+    pub report_format: ReportFormat,
+    pub lab_mode: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanMetadata {
+    pub started_at: DateTime<Utc>,
+    pub finished_at: DateTime<Utc>,
+    pub duration_ms: i64,
+    pub engine_stats: EngineStats,
+    pub knowledge: KnowledgeStats,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeStats {
+    pub services_loaded: usize,
+    pub ranked_tcp_ports: usize,
+    pub probe_payloads_loaded: usize,
+    pub fingerprint_rules_loaded: usize,
+    pub fingerprint_rules_compiled: usize,
+    pub fingerprint_rules_skipped: usize,
+    pub nse_scripts_seen: usize,
+    pub nselib_modules_seen: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanReport {
+    pub metadata: ScanMetadata,
+    pub request: ScanRequestSummary,
+    pub hosts: Vec<HostResult>,
+}
