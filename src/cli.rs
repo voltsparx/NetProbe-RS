@@ -55,25 +55,34 @@ struct ScanArgs {
     )]
     ports: Option<String>,
 
-    #[arg(long = "all-ports", help = "Scan ports 1-65535")]
+    #[arg(short = 'A', long = "all-ports", help = "Scan ports 1-65535")]
     all_ports: bool,
 
-    #[arg(long = "top-ports", help = "Scan N most common TCP ports")]
+    #[arg(short = 't', long = "top-ports", help = "Scan N most common TCP ports")]
     top_ports: Option<usize>,
 
-    #[arg(long = "udp", help = "Add UDP probing")]
+    #[arg(short = 'u', long = "udp", help = "Add UDP probing")]
     udp: bool,
 
-    #[arg(long = "reverse-dns", help = "Enable PTR reverse DNS lookups")]
+    #[arg(
+        short = 'r',
+        long = "reverse-dns",
+        help = "Enable PTR reverse DNS lookups"
+    )]
     reverse_dns: bool,
 
-    #[arg(long = "no-service-detect", help = "Disable banner/service detection")]
+    #[arg(
+        short = 'n',
+        long = "no-service-detect",
+        help = "Disable banner/service detection"
+    )]
     no_service_detect: bool,
 
-    #[arg(long = "explain", help = "Show explain-mode per finding")]
+    #[arg(short = 'e', long = "explain", help = "Show explain-mode per finding")]
     explain: bool,
 
     #[arg(
+        short = 'f',
         long = "file-type",
         value_enum,
         help = "Report format for file export: txt, csv, html, json"
@@ -83,62 +92,83 @@ struct ScanArgs {
     #[arg(long = "report", value_enum, hide = true)]
     report_legacy: Option<ReportFormat>,
 
-    #[arg(long = "profile", value_enum)]
+    #[arg(short = 'P', long = "profile", value_enum)]
     profile: Option<ScanProfile>,
 
     #[arg(
+        short = 'R',
         long = "root-only",
+        visible_alias = "termux-root",
         help = "Termux/mobile root preset: enables privileged probes with mobile-safe defaults"
     )]
     root_only: bool,
 
     #[arg(
+        short = 'g',
         long = "aggressive-root",
-        visible_alias = "aggresive-root",
+        visible_aliases = ["aggresive-root", "agg-root"],
         help = "Enable root-required aggressive scan extensions"
     )]
     aggressive_root: bool,
 
     #[arg(
+        short = 'k',
         long = "privileged-probes",
+        visible_aliases = ["priv-probes", "pp"],
         help = "Use privileged source-port probing (requires root/sudo)"
     )]
     privileged_probes: bool,
 
-    #[arg(long = "lab-mode", help = "Only allow local/private targets")]
+    #[arg(
+        short = 'l',
+        long = "lab-mode",
+        help = "Only allow local/private targets"
+    )]
     lab_mode: bool,
 
     #[arg(
+        short = 'a',
         long = "allow-external",
+        visible_alias = "allow-public",
         help = "Acknowledge and allow scanning public IP targets"
     )]
     allow_external: bool,
 
     #[arg(
+        short = 's',
         long = "strict-safety",
         help = "Block scan instead of warning when external target safety checks fail"
     )]
     strict_safety: bool,
 
-    #[arg(long = "output", help = "Output file name (example: scan-report)")]
+    #[arg(
+        short = 'o',
+        long = "output",
+        help = "Output file name (example: scan-report)"
+    )]
     output: Option<String>,
 
     #[arg(
+        short = 'L',
         long = "location",
         help = "Directory where output file should be stored"
     )]
     location: Option<PathBuf>,
 
-    #[arg(long = "lua-script", help = "Lua hook file path")]
+    #[arg(short = 'x', long = "lua-script", help = "Lua hook file path")]
     lua_script: Option<PathBuf>,
 
-    #[arg(long = "timeout-ms", help = "Probe timeout in ms")]
+    #[arg(short = 'T', long = "timeout-ms", help = "Probe timeout in ms")]
     timeout_ms: Option<u64>,
 
-    #[arg(long = "concurrency", help = "Max concurrent probes")]
+    #[arg(short = 'c', long = "concurrency", help = "Max concurrent probes")]
     concurrency: Option<usize>,
 
-    #[arg(long = "delay-ms", help = "Delay between probe dispatches in ms")]
+    #[arg(
+        short = 'd',
+        long = "delay-ms",
+        help = "Delay between probe dispatches in ms"
+    )]
     delay_ms: Option<u64>,
 }
 

@@ -31,6 +31,10 @@ cargo run -- scan 192.168.1.10 --root-only --allow-external
 cargo run -- scan 192.168.1.20 --output internal-audit --file-type json
 cargo run -- scan 192.168.1.20 --output internal-audit --location ./reports --file-type html
 cargo run -- scan 192.168.1.20 --location ./reports --file-type csv
+
+# Shortcut aliases
+cargo run -- scan 192.168.1.10 -R -a -o termux-scan -f json
+cargo run -- scan 192.168.1.10 -g -k -a -t 200 -u
 ```
 
 ## Notes
