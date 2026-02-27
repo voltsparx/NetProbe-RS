@@ -4,7 +4,7 @@
 
 It reimplements proven network scanning concepts with a modern, safe architecture while helping users understand *why* results matter — not just what was found.
 
-**Author**: voltsparx
+**Author**: voltsparx<br>
 **Contact**: voltsparx@gmail.com
 
 ---
