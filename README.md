@@ -1,22 +1,61 @@
 # NetProbe-RS
 
-`NetProbe-RS` is a Rust-native, explainable network reconnaissance tool inspired by Nmap's architecture and data files.
+**NetProbe-RS** is a Rust-native, explainable network reconnaissance tool focused on learning, safety, and actionable insights.
 
-This repository includes:
+It reimplements proven network scanning concepts with a modern, safe architecture while helping users understand *why* results matter — not just what was found.
 
-- A reverse-engineered architecture mapping from `temp/nmap`.
-- A modular Rust scanner with async scanning, thread-pool DNS, Rayon analysis, Lua hooks, and multi-format output.
-- Fingerprint/probe loading from `temp/nmap/nmap-service-probes` and service/port mapping from `temp/nmap/nmap-services`.
-- Educational AI notes, explain mode, and defensive guidance.
-- Safety controls with flexible behavior (`--lab-mode`, `--allow-external`, `--strict-safety`).
+**Author**: voltsparx
+**Contact**: voltsparx@gmail.com
 
-## Quick start
+---
+
+## ✨ Why NetProbe-RS?
+
+NetProbe-RS is designed to make network reconnaissance understandable and safe by default.
+
+Instead of only reporting open ports, it explains findings, highlights risks, and provides defensive context — making it ideal for:
+
+- 🎓 Students & learners
+- 🛡️ Blue teams & defenders
+- 🧪 Lab environments
+- 🧑‍💻 Internal audits
+- 🔬 Security research
+
+---
+
+## 🧩 Features
+
+- 🔎 Explainable scan results with defensive guidance  
+- ⚡ Rust async engine for high-performance scanning  
+- 🧵 Thread-pool DNS resolution  
+- 🧠 Parallel analysis using Rayon  
+- 🧪 Lua hooks for custom probes & automation  
+- 📄 Multi-format output: JSON, HTML, CSV  
+- 🛡️ Safety controls to prevent unintended scanning  
+- 📱 Termux/mobile-friendly presets  
+- ⚙️ Persistent configuration & last-run metadata  
+
+---
+
+## 🛡️ Safety Controls
+
+NetProbe-RS promotes responsible usage through built-in safeguards:
+
+- `--lab-mode` → restricts scans to safe lab environments  
+- `--allow-external` → explicitly allow external targets  
+- `--strict-safety` → enforces conservative scan behavior  
+
+---
+
+## 🚀 Quick Start
 
 ```bash
 cargo run -- scan 127.0.0.1 --explain
 ```
 
-Common usage:
+---
+
+## 🧪 Common Usage
 
 ```bash
 cargo run -- scan scanme.nmap.org --top-ports 100 --allow-external
@@ -26,33 +65,129 @@ cargo run -- scan 127.0.0.1 --top-ports 20 --reverse-dns
 cargo run -- scan 192.168.1.10 --profile aggressive --allow-external
 cargo run -- scan 192.168.1.10 --aggressive-root --privileged-probes --allow-external
 cargo run -- scan 192.168.1.10 --root-only --allow-external
+```
 
-# Output controls
+---
+
+## 📄 Output Controls
+
+```bash
 cargo run -- scan 192.168.1.20 --output internal-audit --file-type json
 cargo run -- scan 192.168.1.20 --output internal-audit --location ./reports --file-type html
 cargo run -- scan 192.168.1.20 --location ./reports --file-type csv
+```
 
-# Shortcut aliases
+---
+
+## ⚡ Shortcut Aliases
+
+```bash
 cargo run -- scan 192.168.1.10 -R -a -o termux-scan -f json
 cargo run -- scan 192.168.1.10 -g -k -a -t 200 -u
 ```
 
-## Notes
+---
 
-- `temp/` is ignored in git so local reverse-engineering artifacts do not get committed.
-- Service names and top-port ranking are loaded from `temp/nmap/nmap-services` when present, with built-in fallback defaults.
-- Fingerprint rules and probe payloads are parsed from `temp/nmap/nmap-service-probes` where supported by Rust regex capabilities.
-- On startup, NetProbe-RS creates `~/.netprobe-rs-config/config.ini` and stores persistent app configuration/last-run metadata there.
-- By default it prints to console only and does not create scan output files unless `--output`, `--location`, or `--file-type` is provided.
-- `--root-only` is a Termux/mobile-tuned preset: it enables privileged scanning, keeps safer runtime limits, and defaults to top 200 ports when no port scope is given.
-- `--aggressive-root` and `--privileged-probes` require root/admin privileges; in Termux use a root shell (`su`/`tsu`) first.
-- This project does not copy Nmap source code; it re-implements core ideas in Rust.
+## 🧠 Example (Explain Mode)
 
-## Install helpers
+```
+Port 22/tcp open — SSH
+Risk: Medium
+Why: Remote access service exposed.
+Guidance: Use key-based authentication and disable password login.
+```
 
-Use cross-platform install scripts in `building-scripts/`:
+---
 
-- Linux/macOS: `./building-scripts/install.sh`
-- Termux: `./building-scripts/install-termux.sh`
-- Windows PowerShell: `.\building-scripts\install.ps1`
-- Windows CMD: `building-scripts\install.bat`
+## ⚙️ How It Works
+
+- Architecture study and reimplementation inspired by Nmap's design principles  
+- Async scanning engine with adaptive concurrency  
+- Service and port mapping with built-in defaults and optional local data loading  
+- Fingerprint and probe parsing where supported  
+- Modular design for extensibility and scripting  
+
+---
+
+## 📝 Notes
+
+- `temp/` is ignored in git so local study artifacts are not committed.  
+- Service names and top-port ranking load from `temp/nmap/nmap-services` when present.  
+- Fingerprint rules and probe payloads parse from `temp/nmap/nmap-service-probes` where supported.  
+- On startup, NetProbe-RS creates `~/.netprobe-rs-config/config.ini` for persistent settings.  
+- By default, output is printed to console unless `--output`, `--location`, or `--file-type` is provided.  
+
+### 📱 Termux / Mobile Presets
+
+- `--root-only` enables privileged scanning with safer runtime limits  
+- Defaults to top 200 ports when no scope is provided  
+- For privileged probes, run inside a root shell (`su` / `tsu`)  
+
+---
+
+## 📦 Installation Helpers
+
+Cross-platform install scripts are provided in `building-scripts/`:
+
+### Linux/macOS
+```bash
+./building-scripts/install.sh
+```
+
+### Termux
+```bash
+./building-scripts/install-termux.sh
+```
+
+### Windows PowerShell
+```powershell
+.\building-scripts\install.ps1
+```
+
+### Windows CMD
+```cmd
+building-scripts\install.bat
+```
+
+---
+
+## ⚖️ Legal & Ethical Use
+
+NetProbe-RS is intended for:
+
+- authorized security testing
+- lab environments
+- educational use
+- defensive security research
+
+Always obtain proper authorization before scanning networks you do not own or manage.
+
+---
+
+## 🛣️ Roadmap (Planned)
+
+- 📊 Risk scoring & attack surface summaries  
+- 🗺️ Network topology visualization  
+- 🔄 Baseline comparison & drift detection  
+- 🧠 Adaptive scan intelligence  
+- 📦 Prebuilt binaries for major platforms  
+
+---
+
+## 🤝 Contributing
+
+Contributions, ideas, and feedback are welcome!
+
+If you’d like to improve NetProbe-RS, feel free to open an issue or submit a pull request.
+
+---
+
+## ⭐ Acknowledgment
+
+NetProbe-RS draws inspiration from the design principles of Nmap while reimplementing core ideas with a modern Rust architecture focused on safety, clarity, and extensibility.
+
+---
+
+## 📜 License
+
+**MIT**
