@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# Flow sketch: phase selection -> build/install action -> CLI availability
+# Flow sketch: action selection -> build/install action -> CLI availability
 # Pseudo-block:
 #   parse args -> run step -> print result
 # this script is the project mechanic; wrench first, test later.
@@ -25,28 +25,42 @@ PATH_UPDATE_MODE="ask"
 usage() {
   cat <<'EOF'
 Usage:
-  ./building-scripts/install.sh [phase] [options]
+  ./building-scripts/install.sh [action] [options]
 
-Phases:
-  phase1 | test      Build a test binary into build-<os>/ in repo root
-  phase2 | install   Install binary to local/custom bin and optionally add PATH
-  phase3 | upgrade   Rebuild and replace existing installed binary
-  phase4 | remove    Remove installed binary
+Actions:
+  install            Install binary to local/custom bin and optionally add PATH
+  update             Rebuild and replace existing installed binary
+  test               Build a test binary into build-<os>/ in repo root
+  uninstall          Remove installed binary and optionally clean PATH entry
+
+Prompt mode:
+  Run without an action to choose from an interactive menu.
+
+Compatibility aliases:
+  phase1 -> test, phase2 -> install, phase3 -> update, phase4 -> uninstall
+  upgrade -> update, remove -> uninstall
 
 Options:
-  --install-dir <dir>  Install/remove target directory
+  --install-dir <dir>  Install/uninstall target directory
   --add-to-path        Add install dir to PATH without prompting
   --no-path-update     Do not add install dir to PATH
   -h, --help           Show this help
 EOF
 }
 
-PHASE="install"
+ACTION=""
 if [ "$#" -gt 0 ]; then
   case "$1" in
-    phase1|phase2|phase3|phase4|test|install|upgrade|remove)
-      PHASE="$1"
+    phase1|phase2|phase3|phase4|test|install|update|uninstall|upgrade|remove)
+      ACTION="$1"
       shift
+      ;;
+    -*)
+      ;;
+    *)
+      echo "error: unknown action '$1'" >&2
+      usage
+      exit 1
       ;;
   esac
 fi
@@ -80,26 +94,45 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
-normalize_phase() {
+normalize_action() {
   case "$1" in
     phase1|test) printf '%s\n' "test" ;;
     phase2|install) printf '%s\n' "install" ;;
-    phase3|upgrade) printf '%s\n' "upgrade" ;;
-    phase4|remove) printf '%s\n' "remove" ;;
+    phase3|upgrade|update) printf '%s\n' "update" ;;
+    phase4|remove|uninstall) printf '%s\n' "uninstall" ;;
     *)
-      echo "error: unknown phase '$1'" >&2
+      echo "error: unknown action '$1'" >&2
       usage
       exit 1
       ;;
   esac
 }
 
-PHASE="$(normalize_phase "$PHASE")"
+choose_action_interactive() {
+  if [ -t 0 ]; then
+    printf '%s\n' "Choose action:"
+    printf '%s\n' "1) install (local/custom + PATH prompt)"
+    printf '%s\n' "2) update"
+    printf '%s\n' "3) test"
+    printf '%s\n' "4) uninstall"
+    printf '%s' "Choose [1/2/3/4] (default: 1): "
+    IFS= read -r choice || choice=""
+    case "$choice" in
+      2) printf '%s\n' "update" ;;
+      3) printf '%s\n' "test" ;;
+      4) printf '%s\n' "uninstall" ;;
+      *) printf '%s\n' "install" ;;
+    esac
+    return
+  fi
 
-if [ "$PHASE" = "remove" ] && [ "$PATH_UPDATE_MODE" = "yes" ]; then
-  echo "error: --add-to-path is not valid with remove phase. Use --no-path-update or omit PATH flags." >&2
-  exit 1
+  printf '%s\n' "install"
+}
+
+if [ -z "$ACTION" ]; then
+  ACTION="$(choose_action_interactive)"
 fi
+ACTION="$(normalize_action "$ACTION")"
 
 build_release_binary() {
   if ! command -v cargo >/dev/null 2>&1; then
@@ -314,7 +347,7 @@ maybe_remove_path_exports() {
   fi
 }
 
-phase_test() {
+action_test() {
   build_release_binary
   require_release_binary
 
@@ -327,21 +360,21 @@ phase_test() {
   echo "Test binary ready: $DEST_BIN"
 }
 
-phase_install() {
+action_install() {
   choose_install_dir_interactive
   install_binary_to_dir "$INSTALL_DIR"
   maybe_update_path "$INSTALL_DIR"
 }
 
-phase_upgrade() {
+action_update() {
   BIN_PATH="$(installed_binary_guess)"
   INSTALL_DIR="$(dirname "$BIN_PATH")"
   install_binary_to_dir "$INSTALL_DIR"
   maybe_update_path "$INSTALL_DIR"
-  echo "Upgrade complete."
+  echo "Update complete."
 }
 
-phase_remove() {
+action_uninstall() {
   BIN_PATH="$(installed_binary_guess)"
   removed="no"
   if [ -f "$BIN_PATH" ]; then
@@ -357,10 +390,10 @@ phase_remove() {
   maybe_remove_path_exports
 }
 
-case "$PHASE" in
-  test) phase_test ;;
-  install) phase_install ;;
-  upgrade) phase_upgrade ;;
-  remove) phase_remove ;;
+case "$ACTION" in
+  test) action_test ;;
+  install) action_install ;;
+  update) action_update ;;
+  uninstall) action_uninstall ;;
 esac
 

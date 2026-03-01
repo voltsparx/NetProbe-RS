@@ -1,10 +1,10 @@
-# Flow sketch: phase selection -> build/install action -> CLI availability
+# Flow sketch: action selection -> build/install action -> CLI availability
 # Pseudo-block:
-#   choose phase -> execute action -> verify output
+#   choose action -> execute action -> verify output
 # PowerShell here acts like a librarian with admin keys.
 
 param(
-    [string]$Phase = "install",
+    [string]$Action = "",
     [string]$InstallDir = "",
     [switch]$AddToPath,
     [switch]$NoPathUpdate,
@@ -19,43 +19,71 @@ $Manifest = Join-Path $RootDir "Cargo.toml"
 function Show-Usage {
     @"
 Usage:
-  .\building-scripts\install.ps1 [phase] [options]
+  .\building-scripts\install.ps1 [action] [options]
 
-Phases:
-  phase1 | test      Build a test binary into build-windows\ in repo root
-  phase2 | install   Install binary to local/custom bin and optionally add PATH
-  phase3 | upgrade   Rebuild and replace existing installed binary
-  phase4 | remove    Remove installed binary
+Actions:
+  install            Install binary to local/custom bin and optionally add PATH
+  update             Rebuild and replace existing installed binary
+  test               Build a test binary into build-windows\ in repo root
+  uninstall          Remove installed binary and optionally clean PATH entry
+
+Prompt mode:
+  Run without an action to choose from an interactive menu.
+
+Compatibility aliases:
+  phase1 -> test, phase2 -> install, phase3 -> update, phase4 -> uninstall
+  upgrade -> update, remove -> uninstall
 
 Options:
-  -InstallDir <dir>  Install/remove target directory
+  -InstallDir <dir>  Install/uninstall target directory
   -AddToPath         Add install dir to PATH without prompting
   -NoPathUpdate      Do not modify PATH
   -Help              Show this help
 "@ | Write-Host
 }
 
-function Resolve-Phase {
-    param([string]$RawPhase)
+function Resolve-Action {
+    param([string]$RawAction)
 
-    if ([string]::IsNullOrWhiteSpace($RawPhase)) {
-        return "install"
+    if ([string]::IsNullOrWhiteSpace($RawAction)) {
+        return ""
     }
 
-    switch ($RawPhase.ToLowerInvariant()) {
+    switch ($RawAction.ToLowerInvariant()) {
         "phase1" { return "test" }
         "test" { return "test" }
         "phase2" { return "install" }
         "install" { return "install" }
-        "phase3" { return "upgrade" }
-        "upgrade" { return "upgrade" }
-        "phase4" { return "remove" }
-        "remove" { return "remove" }
+        "phase3" { return "update" }
+        "upgrade" { return "update" }
+        "update" { return "update" }
+        "phase4" { return "uninstall" }
+        "remove" { return "uninstall" }
+        "uninstall" { return "uninstall" }
         "help" { return "help" }
         "-h" { return "help" }
         "--help" { return "help" }
-        default { throw "Unknown phase '$RawPhase'. Use phase1|phase2|phase3|phase4 or test|install|upgrade|remove." }
+        default { throw "Unknown action '$RawAction'. Use install|update|test|uninstall." }
     }
+}
+
+function Request-Action {
+    if ($Host.Name -match "ConsoleHost|Visual Studio Code Host") {
+        Write-Host "Choose action:"
+        Write-Host "1) install (local/custom + PATH prompt)"
+        Write-Host "2) update"
+        Write-Host "3) test"
+        Write-Host "4) uninstall"
+        $choice = Read-Host "Choose [1/2/3/4] (default: 1)"
+        switch ($choice) {
+            "2" { return "update" }
+            "3" { return "test" }
+            "4" { return "uninstall" }
+            default { return "install" }
+        }
+    }
+
+    return "install"
 }
 
 function ConvertTo-NormalizedPath {
@@ -272,19 +300,19 @@ function Resolve-InstalledBinaryPath {
     return (Join-Path (Get-DefaultInstallDir) "netprobe-rs.exe")
 }
 
-$normalizedPhase = if ($Help) { "help" } else { Resolve-Phase $Phase }
-if ($normalizedPhase -eq "help") {
+$normalizedAction = if ($Help) { "help" } else { Resolve-Action $Action }
+if ($normalizedAction -eq "help") {
     Show-Usage
     exit 0
 }
 
-if ($normalizedPhase -eq "remove" -and $AddToPath) {
-    throw "-AddToPath is not valid with remove phase. Use -NoPathUpdate or omit PATH flags."
+if ([string]::IsNullOrWhiteSpace($normalizedAction)) {
+    $normalizedAction = Request-Action
 }
 
 $pathMode = Get-PathUpdateMode
 
-switch ($normalizedPhase) {
+switch ($normalizedAction) {
     "test" {
         $source = Build-ReleaseBinary
         $buildDir = Join-Path $RootDir "build-windows"
@@ -298,14 +326,14 @@ switch ($normalizedPhase) {
         Install-BinaryToDirectory $targetDir
         Invoke-AddToPath $targetDir $pathMode
     }
-    "upgrade" {
+    "update" {
         $installedBinary = Resolve-InstalledBinaryPath $InstallDir
         $targetDir = Split-Path -Parent $installedBinary
         Install-BinaryToDirectory $targetDir
         Invoke-AddToPath $targetDir $pathMode
-        Write-Host "Upgrade complete."
+        Write-Host "Update complete."
     }
-    "remove" {
+    "uninstall" {
         $installedBinary = Resolve-InstalledBinaryPath $InstallDir
         $targetDir = Split-Path -Parent $installedBinary
         if (Test-Path $installedBinary) {

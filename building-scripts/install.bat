@@ -1,4 +1,4 @@
-REM Flow sketch: phase selection -> build/install action -> CLI availability
+REM Flow sketch: action selection -> build/install action -> CLI availability
 REM Pseudo-block:
 REM   choose command -> run command -> return status
 

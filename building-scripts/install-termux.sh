@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# Flow sketch: phase selection -> build/install action -> CLI availability
+# Flow sketch: action selection -> build/install action -> CLI availability
 # Pseudo-block:
 #   parse args -> run step -> print result
 # this script packs hiking boots for termux before the scan starts.

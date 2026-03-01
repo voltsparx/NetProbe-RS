@@ -152,28 +152,32 @@ Cross-platform install scripts are provided in `building-scripts/`:
 
 ### Linux/macOS
 ```bash
-./building-scripts/install.sh phase1   # test build -> ./build-linux or ./build-macos
-./building-scripts/install.sh phase2   # install (local/custom + PATH prompt)
-./building-scripts/install.sh phase3   # upgrade installed binary
-./building-scripts/install.sh phase4   # remove installed binary
+./building-scripts/install.sh             # prompt mode
+./building-scripts/install.sh install
+./building-scripts/install.sh update
+./building-scripts/install.sh test
+./building-scripts/install.sh uninstall
 ```
 
 ### Termux
 ```bash
-./building-scripts/install-termux.sh phase2
+./building-scripts/install-termux.sh      # prompt mode
+./building-scripts/install-termux.sh install
 ```
 
 ### Windows PowerShell
 ```powershell
-.\building-scripts\install.ps1 phase1
-.\building-scripts\install.ps1 phase2
-.\building-scripts\install.ps1 phase3
-.\building-scripts\install.ps1 phase4
+.\building-scripts\install.ps1             # prompt mode
+.\building-scripts\install.ps1 install
+.\building-scripts\install.ps1 update
+.\building-scripts\install.ps1 test
+.\building-scripts\install.ps1 uninstall
 ```
 
 ### Windows CMD
 ```cmd
-building-scripts\install.bat phase2
+building-scripts\install.bat
+building-scripts\install.bat install
 ```
 
 Installed command name:
