@@ -1,3 +1,8 @@
+// Flow sketch: scan report -> renderer -> user-facing output
+// Pseudo-block:
+//   read input -> process safely -> return deterministic output
+// html output wears a suit so results can meet management.
+
 use crate::models::ScanReport;
 
 pub fn render(report: &ScanReport) -> String {
@@ -88,9 +93,9 @@ pub fn render(report: &ScanReport) -> String {
         }
         html.push_str("</tbody></table>");
 
-        if !host.ai_findings.is_empty() {
+        if !host.insights.is_empty() {
             html.push_str("<h3>Insights</h3><ul>");
-            for finding in &host.ai_findings {
+            for finding in &host.insights {
                 html.push_str(&format!("<li>{}</li>", esc(finding)));
             }
             html.push_str("</ul>");
@@ -137,3 +142,4 @@ fn esc(input: &str) -> String {
     }
     out
 }
+

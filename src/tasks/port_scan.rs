@@ -1,3 +1,7 @@
+// Flow sketch: host target -> task pipeline -> enriched host result
+// Pseudo-block:
+//   read input -> process safely -> return deterministic output
+
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -36,7 +40,7 @@ pub async fn run(
         warnings: Vec::new(),
         ports: findings,
         risk_score: 0,
-        ai_findings: Vec::new(),
+        insights: Vec::new(),
         defensive_advice: Vec::new(),
         learning_notes: Vec::new(),
         lua_findings: Vec::new(),
@@ -44,3 +48,4 @@ pub async fn run(
 
     Ok((host, task_count))
 }
+

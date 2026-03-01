@@ -1,56 +1,69 @@
 # building-scripts
 
-Cross-platform install helpers for `netprobe-rs`.
+Cross-platform lifecycle helpers for `netprobe-rs`.
+
+## Phases
+
+- `phase1` / `test`: build release and copy test binary to `build-<os>/` in repo root
+- `phase2` / `install`: install to local/custom bin and optionally add install path to `PATH`
+- `phase3` / `upgrade`: rebuild and replace installed binary
+- `phase4` / `remove`: remove installed binary
 
 ## Linux / macOS
 
 ```bash
-./building-scripts/install.sh
+./building-scripts/install.sh phase1
+./building-scripts/install.sh phase2
+./building-scripts/install.sh phase3
+./building-scripts/install.sh phase4
 ```
 
-Optional environment variable:
+Options:
 
-- `NETPROBE_RS_INSTALL_DIR` (default: `~/.local/bin`)
+- `--install-dir <dir>` for custom install/remove target
+- `--add-to-path` to add install directory to PATH without prompting
+- `--no-path-update` to skip PATH changes
 
 ## Termux (Android)
 
 ```bash
 chmod +x ./building-scripts/install-termux.sh
-./building-scripts/install-termux.sh
+./building-scripts/install-termux.sh phase2
 ```
 
-Optional environment variable:
-
-- `NETPROBE_RS_INSTALL_DIR` (default: `$PREFIX/bin`)
+The Termux script installs dependencies first, then runs the same phase flow as `install.sh`.
 
 ## Windows PowerShell
 
 ```powershell
-.\building-scripts\install.ps1
+.\building-scripts\install.ps1 phase1
+.\building-scripts\install.ps1 phase2
+.\building-scripts\install.ps1 phase3
+.\building-scripts\install.ps1 phase4
 ```
 
-Optional parameter:
+Options:
 
-- `-InstallDir` (default: `$HOME\.local\bin`)
+- `-InstallDir <dir>` for custom install/remove target
+- `-AddToPath` to add install directory to PATH without prompting
+- `-NoPathUpdate` to skip PATH changes
+- `-Help` for usage
 
 ## Windows CMD
 
 ```cmd
-building-scripts\install.bat
+building-scripts\install.bat phase2
 ```
 
 ## Result
 
-The scripts build release mode and install:
+Installed command name:
 
-- `recon` on Linux/macOS
-- `recon` on Termux
-- `recon.exe` on Windows
+- `netprobe-rs` on Linux/macOS/Termux
+- `netprobe-rs.exe` on Windows
 
-to the selected install directory.
-
-For Termux root-capable scans after install:
+Example:
 
 ```bash
-su -c "recon scan 192.168.1.10 --root-only --allow-external"
+netprobe-rs 192.168.1.10 --root-only --allow-external
 ```

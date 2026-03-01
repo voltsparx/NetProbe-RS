@@ -1,6 +1,6 @@
 [package]
 name = "netprobe-rs"
-version = "0.1.0"
+version = "1.3.0"
 edition = "2021"
 authors = ["voltsparx"]
 description = "Nmap-inspired network recon scanner in Rust with explainable output."

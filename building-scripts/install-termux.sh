@@ -1,4 +1,9 @@
 #!/usr/bin/env sh
+# Flow sketch: phase selection -> build/install action -> CLI availability
+# Pseudo-block:
+#   parse args -> run step -> print result
+# this script packs hiking boots for termux before the scan starts.
+
 set -eu
 
 if [ -z "${PREFIX:-}" ]; then
@@ -7,26 +12,14 @@ if [ -z "${PREFIX:-}" ]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-INSTALL_DIR="${NETPROBE_RS_INSTALL_DIR:-$PREFIX/bin}"
 
 echo "Installing Termux build dependencies..."
 pkg update -y
 pkg install -y rust clang pkg-config make
 
-echo "Building netprobe-rs (release)..."
-cargo build --release --manifest-path "$ROOT_DIR/Cargo.toml"
+NETPROBE_RS_OS_TAG="termux" \
+NETPROBE_RS_DEFAULT_INSTALL_DIR="${NETPROBE_RS_INSTALL_DIR:-$PREFIX/bin}" \
+sh "$SCRIPT_DIR/install.sh" "$@"
 
-SRC_BIN="$ROOT_DIR/target/release/netprobe-rs"
-if [ ! -f "$SRC_BIN" ]; then
-  echo "error: release binary not found at $SRC_BIN" >&2
-  exit 1
-fi
+echo "Tip: run 'tsu' or 'su' for root-required scan modes when using --root-only."
 
-mkdir -p "$INSTALL_DIR"
-DEST_BIN="$INSTALL_DIR/recon"
-cp "$SRC_BIN" "$DEST_BIN"
-chmod +x "$DEST_BIN"
-
-echo "Installed: $DEST_BIN"
-echo "Tip: run 'tsu' or 'su' for root-required scan modes."

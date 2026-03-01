@@ -1,3 +1,7 @@
+// Flow sketch: scan report -> renderer -> user-facing output
+// Pseudo-block:
+//   read input -> process safely -> return deterministic output
+
 use crate::models::ScanReport;
 
 pub fn render(report: &ScanReport) -> String {
@@ -48,7 +52,7 @@ pub fn render(report: &ScanReport) -> String {
                     .unwrap_or_else(|| "n/a".to_string())
             ));
         }
-        for finding in &host.ai_findings {
+        for finding in &host.insights {
             out.push_str(&format!("insight={}\n", finding));
         }
         for note in &host.learning_notes {
@@ -61,3 +65,4 @@ pub fn render(report: &ScanReport) -> String {
 
     out
 }
+

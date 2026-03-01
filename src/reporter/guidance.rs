@@ -1,3 +1,7 @@
+// Flow sketch: ports -> scoring/findings/guidance -> insights
+// Pseudo-block:
+//   read input -> process safely -> return deterministic output
+
 use std::collections::BTreeSet;
 
 use crate::models::{HostResult, PortState};
@@ -67,3 +71,4 @@ pub fn build_advice(host: &HostResult) -> Vec<String> {
 
     advice.into_iter().collect()
 }
+

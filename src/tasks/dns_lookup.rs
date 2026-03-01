@@ -1,3 +1,7 @@
+// Flow sketch: host target -> task pipeline -> enriched host result
+// Pseudo-block:
+//   read input -> process safely -> return deterministic output
+
 use std::net::IpAddr;
 
 use crate::engines::thread_pool;
@@ -10,3 +14,4 @@ pub async fn resolve(target: &str) -> NetProbeResult<Vec<IpAddr>> {
 pub async fn reverse(ip: IpAddr) -> Option<String> {
     thread_pool::reverse_lookup(ip).await
 }
+

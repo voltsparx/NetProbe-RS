@@ -1,3 +1,8 @@
+// Flow sketch: scan request -> probe engine -> raw findings
+// Pseudo-block:
+//   read input -> process safely -> return deterministic output
+// lua hooks are guest artists, not permanent band members.
+
 use std::fs;
 use std::path::Path;
 
@@ -43,3 +48,4 @@ pub fn run(host: &HostResult, script_path: Option<&Path>) -> NetProbeResult<Vec<
 
     Ok(findings)
 }
+

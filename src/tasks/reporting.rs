@@ -1,3 +1,7 @@
+// Flow sketch: host target -> task pipeline -> enriched host result
+// Pseudo-block:
+//   read input -> process safely -> return deterministic output
+
 use std::path::Path;
 
 use crate::error::NetProbeResult;
@@ -12,3 +16,4 @@ pub async fn run(
     let rendered = output::render(report, format)?;
     output::emit(&rendered, format, output_path).await
 }
+

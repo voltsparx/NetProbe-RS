@@ -1,3 +1,7 @@
+// Flow sketch: scan report -> renderer -> user-facing output
+// Pseudo-block:
+//   read input -> process safely -> return deterministic output
+
 use crate::error::{NetProbeError, NetProbeResult};
 use crate::models::ScanReport;
 use serde::Serialize;
@@ -52,3 +56,4 @@ pub fn render(report: &ScanReport) -> NetProbeResult<String> {
     String::from_utf8(bytes)
         .map_err(|err| NetProbeError::Parse(format!("utf8 conversion failed: {err}")))
 }
+

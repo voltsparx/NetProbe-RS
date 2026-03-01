@@ -1,3 +1,7 @@
+-- Flow sketch: input -> processing -> output
+-- Pseudo-block:
+--   inspect context -> add signal -> return note
+
 function analyze(host)
   local findings = {}
   local admin_services = { ["ssh"] = true, ["ms-wbt-server"] = true, ["telnet"] = true, ["vnc"] = true }
@@ -30,4 +34,5 @@ function analyze(host)
 
   return findings
 end
+
 

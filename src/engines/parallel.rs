@@ -1,13 +1,18 @@
+// Flow sketch: scan request -> probe engine -> raw findings
+// Pseudo-block:
+//   read input -> process safely -> return deterministic output
+// parallel workers share the load so no single thread sweats alone.
+
 use std::collections::BTreeSet;
 
 use rayon::prelude::*;
 
-use crate::ai::risk;
+use crate::reporter::scoring;
 use crate::models::{PortFinding, PortState};
 
 pub fn compute_risk_and_signals(ports: &[PortFinding]) -> (u8, Vec<String>, usize) {
-    let raw_score: u32 = ports.par_iter().map(risk::score_port).sum();
-    let risk_score = risk::normalize(raw_score);
+    let raw_score: u32 = ports.par_iter().map(scoring::score_port).sum();
+    let risk_score = scoring::normalize(raw_score);
 
     let services: BTreeSet<String> = ports
         .par_iter()
@@ -40,3 +45,4 @@ pub fn compute_risk_and_signals(ports: &[PortFinding]) -> (u8, Vec<String>, usiz
 
     (risk_score, findings, ports.len() + 1)
 }
+

@@ -1,3 +1,7 @@
+// Flow sketch: ports -> scoring/findings/guidance -> insights
+// Pseudo-block:
+//   read input -> process safely -> return deterministic output
+
 use std::collections::BTreeSet;
 
 use crate::models::{HostResult, PortState};
@@ -48,3 +52,4 @@ pub fn generate_findings(host: &HostResult) -> Vec<String> {
 
     findings
 }
+

@@ -1,6 +1,11 @@
+// Flow sketch: input -> core processing -> output model
+// Pseudo-block:
+//   read input -> process safely -> return deterministic output
+
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::process::Command;
 use std::sync::Arc;
+#[cfg(unix)]
+use std::process::Command;
 
 use chrono::Utc;
 use futures::future::join_all;
@@ -124,6 +129,7 @@ pub async fn run_scan(mut request: ScanRequest) -> NetProbeResult<ScanReport> {
             port_count: selected_ports.len(),
             include_udp: request.include_udp,
             explain: request.explain,
+            verbose: request.verbose,
             profile: request.profile,
             root_only: request.root_only,
             aggressive_root: request.aggressive_root,
@@ -173,7 +179,7 @@ async fn process_host(
     let lua_findings = lua_engine::run(&host, request.lua_script.as_deref())?;
     host.lua_findings = lua_findings;
     if !host.lua_findings.is_empty() {
-        host.ai_findings.push(format!(
+        host.insights.push(format!(
             "lua hooks added {} custom findings",
             host.lua_findings.len()
         ));
@@ -356,3 +362,4 @@ fn is_termux_env() -> bool {
         })
         .unwrap_or(false)
 }
+

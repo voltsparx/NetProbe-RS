@@ -1,3 +1,7 @@
+// Flow sketch: scan report -> renderer -> user-facing output
+// Pseudo-block:
+//   read input -> process safely -> return deterministic output
+
 use std::path::Path;
 
 use crate::engines::thread_pool;
@@ -38,3 +42,4 @@ pub async fn emit(
     }
     Ok(())
 }
+

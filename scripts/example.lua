@@ -1,3 +1,8 @@
+-- Flow sketch: input -> processing -> output
+-- Pseudo-block:
+--   inspect context -> add signal -> return note
+-- example script keeps it tiny so customization feels approachable.
+
 function analyze(host)
   local findings = {}
   for _, port in ipairs(host.ports or {}) do
@@ -7,4 +12,5 @@ function analyze(host)
   end
   return findings
 end
+
 

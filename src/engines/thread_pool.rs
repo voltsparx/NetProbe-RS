@@ -1,3 +1,7 @@
+// Flow sketch: scan request -> probe engine -> raw findings
+// Pseudo-block:
+//   read input -> process safely -> return deterministic output
+
 use std::collections::HashSet;
 use std::fs;
 use std::net::{IpAddr, ToSocketAddrs};
@@ -55,3 +59,4 @@ pub async fn write_output(path: &Path, body: &str) -> NetProbeResult<()> {
 
     Ok(())
 }
+

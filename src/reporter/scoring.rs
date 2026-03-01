@@ -1,3 +1,8 @@
+// Flow sketch: ports -> scoring/findings/guidance -> insights
+// Pseudo-block:
+//   read input -> process safely -> return deterministic output
+// risk points are seasoning, not destiny.
+
 use crate::models::{PortFinding, PortState};
 
 pub fn score_port(port: &PortFinding) -> u32 {
@@ -41,3 +46,4 @@ pub fn normalize(raw_score: u32) -> u8 {
     let scaled = (raw_score as f64 * 0.72).round() as u32;
     scaled.min(100) as u8
 }
+

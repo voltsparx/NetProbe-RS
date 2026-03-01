@@ -1,4 +1,10 @@
+// Flow sketch: input -> core processing -> output model
+// Pseudo-block:
+//   read input -> process safely -> return deterministic output
+// the CLI is a polite bouncer: clear args only.
+
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
@@ -28,9 +34,11 @@ impl FileType {
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "recon",
+    name = "netprobe-rs",
     version,
     about = "NetProbe-RS: Nmap-inspired scanner in safe, explainable Rust",
+    override_usage = "netprobe-rs <target> [OPTIONS]\n       netprobe-rs scan <target> [OPTIONS]",
+    after_help = "Nmap-style shortcuts supported: -sU, -sS, -A, -T0..-T5, -p-",
     arg_required_else_help = true
 )]
 pub struct Cli {
@@ -55,14 +63,31 @@ struct ScanArgs {
     )]
     ports: Option<String>,
 
-    #[arg(short = 'A', long = "all-ports", help = "Scan ports 1-65535")]
+    #[arg(
+        long = "all-ports",
+        visible_alias = "p-",
+        help = "Scan ports 1-65535 (Nmap: -p-)"
+    )]
     all_ports: bool,
 
     #[arg(short = 't', long = "top-ports", help = "Scan N most common TCP ports")]
     top_ports: Option<usize>,
 
-    #[arg(short = 'u', long = "udp", help = "Add UDP probing")]
+    #[arg(
+        short = 'U',
+        long = "udp",
+        visible_alias = "sU",
+        help = "Add UDP probing (Nmap: -sU)"
+    )]
     udp: bool,
+
+    #[arg(
+        short = 'S',
+        long = "syn",
+        visible_alias = "sS",
+        help = "Use privileged TCP probing (Nmap: -sS). Will auto-prompt for sudo/su if required"
+    )]
+    syn: bool,
 
     #[arg(
         short = 'r',
@@ -71,15 +96,32 @@ struct ScanArgs {
     )]
     reverse_dns: bool,
 
+    #[arg(short = 'n', long = "no-dns", help = "Skip reverse DNS lookups (Nmap-compatible)")]
+    no_dns: bool,
+
     #[arg(
-        short = 'n',
+        short = 'N',
         long = "no-service-detect",
         help = "Disable banner/service detection"
     )]
     no_service_detect: bool,
 
-    #[arg(short = 'e', long = "explain", help = "Show explain-mode per finding")]
+    #[arg(
+        long = "service-detect",
+        visible_alias = "sV",
+        help = "Enable banner/service detection (Nmap: -sV)"
+    )]
+    service_detect: bool,
+
+    #[arg(
+        short = 'e',
+        long = "explain",
+        help = "Show concise per-port explanation lines in scan output"
+    )]
     explain: bool,
+
+    #[arg(short = 'v', long = "verbose", help = "Show full terminal output sections")]
+    verbose: bool,
 
     #[arg(
         short = 'f',
@@ -96,9 +138,17 @@ struct ScanArgs {
     profile: Option<ScanProfile>,
 
     #[arg(
+        short = 'A',
+        long = "aggressive",
+        help = "Aggressive scan mode (Nmap: -A). Uses deeper probes and may require root"
+    )]
+    aggressive: bool,
+
+    #[arg(
         short = 'R',
         long = "root-only",
         visible_alias = "termux-root",
+        hide = true,
         help = "Termux/mobile root preset: enables privileged probes with mobile-safe defaults"
     )]
     root_only: bool,
@@ -107,6 +157,7 @@ struct ScanArgs {
         short = 'g',
         long = "aggressive-root",
         visible_aliases = ["aggresive-root", "agg-root"],
+        hide = true,
         help = "Enable root-required aggressive scan extensions"
     )]
     aggressive_root: bool,
@@ -115,6 +166,7 @@ struct ScanArgs {
         short = 'k',
         long = "privileged-probes",
         visible_aliases = ["priv-probes", "pp"],
+        hide = true,
         help = "Use privileged source-port probing (requires root/sudo)"
     )]
     privileged_probes: bool,
@@ -158,7 +210,7 @@ struct ScanArgs {
     #[arg(short = 'x', long = "lua-script", help = "Lua hook file path")]
     lua_script: Option<PathBuf>,
 
-    #[arg(short = 'T', long = "timeout-ms", help = "Probe timeout in ms")]
+    #[arg(short = 'w', long = "timeout-ms", help = "Probe timeout in ms")]
     timeout_ms: Option<u64>,
 
     #[arg(short = 'c', long = "concurrency", help = "Max concurrent probes")]
@@ -173,11 +225,146 @@ struct ScanArgs {
 }
 
 impl Cli {
+    pub fn parse_normalized() -> Self {
+        let args: Vec<OsString> = std::env::args_os().collect();
+        Self::parse_from(normalize_args(args))
+    }
+
     pub fn into_request(self) -> NetProbeResult<ScanRequest> {
         match self.command {
             Commands::Scan(scan) => scan.into_request(),
         }
     }
+}
+
+pub fn maybe_render_flag_explain_mode() -> Option<String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.is_empty() {
+        return None;
+    }
+
+    let first = args[0].as_str();
+    let (enabled, inline_value) = if let Some((flag, value)) = first.split_once('=') {
+        (flag == "--explain", Some(value.to_string()))
+    } else {
+        (first == "--explain", None)
+    };
+
+    if !enabled {
+        return None;
+    }
+
+    // Keep legacy behavior for `--explain --flag`, but never hijack real scan invocations.
+    if let Some(inline) = inline_value {
+        if inline.trim().is_empty() {
+            return Some(render_flag_explain(Some("--explain")));
+        }
+        return Some(render_flag_explain(Some(inline.as_str())));
+    }
+
+    if args.len() == 1 {
+        return Some(render_flag_explain(Some("--explain")));
+    }
+
+    if args.len() == 2 && args[1].starts_with('-') {
+        return Some(render_flag_explain(Some(args[1].as_str())));
+    }
+
+    None
+}
+
+pub fn maybe_render_flag_help_mode() -> Option<String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.is_empty() {
+        return None;
+    }
+
+    let first = args[0].as_str();
+    let inline = if let Some((flag, value)) = first.split_once('=') {
+        if flag == "--flag-help" {
+            Some(value.to_string())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some(value) = inline {
+        let query = if value.trim().is_empty() {
+            "--scan"
+        } else {
+            value.as_str()
+        };
+        return Some(render_flag_explain(Some(query)));
+    }
+
+    if first != "--flag-help" {
+        return None;
+    }
+
+    if args.len() == 1 {
+        return Some(render_flag_explain(Some("--scan")));
+    }
+
+    if args.len() == 2 {
+        return Some(render_flag_explain(Some(args[1].as_str())));
+    }
+
+    None
+}
+
+pub fn maybe_render_quick_help_mode() -> Option<String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.len() != 1 {
+        return None;
+    }
+
+    let token = args[0].as_str();
+    if token != "-h" && token != "--help" {
+        return None;
+    }
+
+    Some(
+        "Usage:\n  netprobe-rs <target> [options]\n\nCommon options:\n  -p, --ports <list|range>   Select ports (example: -p 22,80,443)\n      --all-ports            Scan ports 1-65535 (Nmap: -p-)\n  -U, --udp                  Enable UDP probes (Nmap: -sU)\n  -S, --syn                  Enable privileged TCP probes (Nmap: -sS)\n  -A, --aggressive           Aggressive mode (Nmap: -A)\n  -w, --timeout-ms <ms>      Probe timeout in milliseconds\n  -r, --reverse-dns          Enable reverse DNS lookups\n  -n, --no-dns               Disable reverse DNS lookups\n  -e, --explain              Add concise per-port rationale in output\n  -v, --verbose              Show full output sections\n  -f, --file-type <type>     Export format: txt|json|html|csv\n  -o, --output <name>        Output filename\n  -L, --location <dir>       Output directory\n\nNmap-style shortcuts accepted:\n  -sU  -sS  -A  -T0..-T5  -p-\n\nFlag docs mode:\n  netprobe-rs --flag-help --scan\n  netprobe-rs --flag-help -sU\n  netprobe-rs --explain --scan   (legacy alias)\n\nCompatibility:\n  netprobe-rs scan <target> [options] still works.".to_string(),
+    )
+}
+
+fn render_flag_explain(raw_query: Option<&str>) -> String {
+    let key = raw_query
+        .map(|value| value.trim().trim_start_matches('-').to_ascii_lowercase())
+        .unwrap_or_else(|| "scan".to_string());
+
+    let body = match key.as_str() {
+        "scan" => {
+            "Default scan mode. Use `netprobe-rs <target>` without the `scan` subcommand."
+        }
+        "p" | "ports" => "Select ports or ranges. Example: `-p 22,80,443` or `-p 1-1024`.",
+        "s" | "su" | "udp" => "Enable UDP probing (`-sU` or `--udp`).",
+        "ss" | "syn" => {
+            "Enable privileged TCP probing (`-sS` or `--syn`). If needed, the tool re-runs with sudo/su."
+        }
+        "a" | "aggressive" => {
+            "Aggressive mode (`-A`): enables deeper detection and root-required probe paths."
+        }
+        "t" | "timing" => {
+            "Timing profile (`-T0`..`-T5`). Mapped to internal profiles from stealth to aggressive."
+        }
+        "p-" | "all-ports" => "Scan all TCP ports 1-65535 (`-p-` or `--all-ports`).",
+        "v" | "verbose" => "Show extended terminal sections (`-v` or `--verbose`).",
+        "e" | "explain" => {
+            "When used in scans, `--explain` adds concise per-port rationale lines in output."
+        }
+        _ => {
+            "Unknown flag. Try one of: --scan, -p, -sU, -sS, -A, -T4, -p-, -v, --explain. Tip: use --flag-help <flag>."
+        }
+    };
+
+    format!(
+        "Flag help for `{}`\n\n{}\n\nExamples:\n  netprobe-rs 192.168.1.10\n  netprobe-rs -sU -p 53,161 192.168.1.10\n  netprobe-rs -A -T4 10.0.0.5\n  netprobe-rs --explain --scan",
+        raw_query.unwrap_or("--scan"),
+        body
+    )
 }
 
 impl ScanArgs {
@@ -203,13 +390,14 @@ impl ScanArgs {
         }
 
         let root_only = self.root_only || matches!(self.profile, Some(ScanProfile::RootOnly));
-        let effective_aggressive_root = self.aggressive_root || root_only;
-        let effective_privileged_probes = self.privileged_probes || root_only;
+        let effective_aggressive_root = self.aggressive || self.aggressive_root || root_only;
+        let effective_privileged_probes =
+            self.syn || self.privileged_probes || self.aggressive || root_only;
 
-        let profile_explicit = self.profile.is_some() || self.root_only;
+        let profile_explicit = self.profile.is_some() || self.root_only || self.aggressive;
         let profile = if root_only {
             ScanProfile::RootOnly
-        } else if self.aggressive_root && self.profile.is_none() {
+        } else if (self.aggressive || self.aggressive_root) && self.profile.is_none() {
             ScanProfile::Aggressive
         } else {
             self.profile.unwrap_or(ScanProfile::Balanced)
@@ -272,9 +460,10 @@ impl ScanArgs {
             ports,
             top_ports,
             include_udp: self.udp || effective_aggressive_root,
-            reverse_dns: self.reverse_dns,
-            service_detection: effective_aggressive_root || !self.no_service_detect,
+            reverse_dns: self.reverse_dns && !self.no_dns,
+            service_detection: self.service_detect || effective_aggressive_root || !self.no_service_detect,
             explain: self.explain,
+            verbose: self.verbose,
             report_format,
             profile,
             profile_explicit,
@@ -290,6 +479,81 @@ impl ScanArgs {
             concurrency,
             delay_ms,
         })
+    }
+}
+
+fn normalize_args(args: Vec<OsString>) -> Vec<OsString> {
+    if args.is_empty() {
+        return args;
+    }
+
+    let mut normalized = Vec::with_capacity(args.len() + 2);
+    normalized.push(args[0].clone());
+
+    let mut mapped = Vec::new();
+    let mut idx = 1usize;
+    while idx < args.len() {
+        let token = args[idx].to_string_lossy().to_string();
+        match token.as_str() {
+            "--scan" => {}
+            "-sU" => mapped.push("--udp".into()),
+            "-sS" => mapped.push("--syn".into()),
+            "-A" => mapped.push("--aggressive".into()),
+            "-p-" => mapped.push("--all-ports".into()),
+            "-sV" => mapped.push("--service-detect".into()),
+            "-T" => {
+                if idx + 1 < args.len() {
+                    let level = args[idx + 1].to_string_lossy().to_string();
+                    if let Some(profile) = map_timing_to_profile(level.as_str()) {
+                        mapped.push("--profile".into());
+                        mapped.push(profile.into());
+                        idx += 1;
+                    } else {
+                        mapped.push(args[idx].clone());
+                    }
+                } else {
+                    mapped.push(args[idx].clone());
+                }
+            }
+            _ => {
+                if token.starts_with("-T") && token.len() == 3 {
+                    if let Some(profile) = map_timing_to_profile(&token[2..]) {
+                        mapped.push("--profile".into());
+                        mapped.push(profile.into());
+                    } else {
+                        mapped.push(args[idx].clone());
+                    }
+                } else {
+                    mapped.push(args[idx].clone());
+                }
+            }
+        }
+        idx += 1;
+    }
+
+    if should_inject_scan(&mapped) {
+        normalized.push("scan".into());
+    }
+    normalized.extend(mapped);
+    normalized
+}
+
+fn should_inject_scan(mapped: &[OsString]) -> bool {
+    if mapped.is_empty() {
+        return false;
+    }
+
+    let first = mapped[0].to_string_lossy();
+    !matches!(first.as_ref(), "scan" | "-h" | "--help" | "-V" | "--version")
+}
+
+fn map_timing_to_profile(level: &str) -> Option<&'static str> {
+    match level.trim() {
+        "0" | "1" => Some("stealth"),
+        "2" | "3" => Some("balanced"),
+        "4" => Some("turbo"),
+        "5" => Some("aggressive"),
+        _ => None,
     }
 }
 

@@ -4,7 +4,8 @@
 
 It reimplements proven network scanning concepts with a modern, safe architecture while helping users understand *why* results matter — not just what was found.
 
-**Author**: voltsparx<br>
+**Version**: v1.3  <br>
+**Author**: voltsparx  <br>
 **Contact**: voltsparx@gmail.com
 
 ---
@@ -26,12 +27,15 @@ Instead of only reporting open ports, it explains findings, highlights risks, an
 ## 🧩 Features
 
 - 🔎 Explainable scan results with defensive guidance  
+- 🎯 Nmap-style command flow (`netprobe-rs <target>`) and short aliases  
 - ⚡ Rust async engine for high-performance scanning  
 - 🧵 Thread-pool DNS resolution  
 - 🧠 Parallel analysis using Rayon  
 - 🧪 Lua hooks for custom probes & automation  
-- 📄 Multi-format output: JSON, HTML, CSV  
+- 📄 Multi-format output: CLI, TXT, JSON, HTML, CSV  
+- 🚦 Cleaner terminal output (focused, less noisy by default)  
 - 🛡️ Safety controls to prevent unintended scanning  
+- 🔐 Auto privilege elevation for root-required scan modes (sudo/su/doas where available)  
 - 📱 Termux/mobile-friendly presets  
 - ⚙️ Persistent configuration & last-run metadata  
 
@@ -50,7 +54,9 @@ NetProbe-RS promotes responsible usage through built-in safeguards:
 ## 🚀 Quick Start
 
 ```bash
-cargo run -- scan 127.0.0.1 --explain
+cargo run -- 127.0.0.1 --explain
+# after install:
+netprobe-rs 127.0.0.1 --top-ports 100
 ```
 
 ---
@@ -58,13 +64,13 @@ cargo run -- scan 127.0.0.1 --explain
 ## 🧪 Common Usage
 
 ```bash
-cargo run -- scan scanme.nmap.org --top-ports 100 --allow-external
-cargo run -- scan 192.168.1.1 --ports 22,80,443 --profile stealth --explain --lab-mode
-cargo run -- scan 10.0.0.5 --udp --lua-script scripts/example.lua --lab-mode
-cargo run -- scan 127.0.0.1 --top-ports 20 --reverse-dns
-cargo run -- scan 192.168.1.10 --profile aggressive --allow-external
-cargo run -- scan 192.168.1.10 --aggressive-root --privileged-probes --allow-external
-cargo run -- scan 192.168.1.10 --root-only --allow-external
+netprobe-rs scanme.nmap.org --top-ports 100 --allow-external
+netprobe-rs 192.168.1.1 --ports 22,80,443 --profile stealth --explain --lab-mode
+netprobe-rs 10.0.0.5 --udp --lua-script scripts/example.lua --lab-mode
+netprobe-rs 127.0.0.1 --top-ports 20 --reverse-dns
+netprobe-rs 192.168.1.10 --profile aggressive --allow-external
+netprobe-rs 192.168.1.10 --aggressive-root --privileged-probes --allow-external
+netprobe-rs 192.168.1.10 --root-only --allow-external
 ```
 
 ---
@@ -72,9 +78,9 @@ cargo run -- scan 192.168.1.10 --root-only --allow-external
 ## 📄 Output Controls
 
 ```bash
-cargo run -- scan 192.168.1.20 --output internal-audit --file-type json
-cargo run -- scan 192.168.1.20 --output internal-audit --location ./reports --file-type html
-cargo run -- scan 192.168.1.20 --location ./reports --file-type csv
+netprobe-rs 192.168.1.20 --output internal-audit --file-type json
+netprobe-rs 192.168.1.20 --output internal-audit --location ./reports --file-type html
+netprobe-rs 192.168.1.20 --location ./reports --file-type csv
 ```
 
 ---
@@ -82,8 +88,20 @@ cargo run -- scan 192.168.1.20 --location ./reports --file-type csv
 ## ⚡ Shortcut Aliases
 
 ```bash
-cargo run -- scan 192.168.1.10 -R -a -o termux-scan -f json
-cargo run -- scan 192.168.1.10 -g -k -a -t 200 -u
+netprobe-rs 192.168.1.10 -a -o termux-scan -f json
+netprobe-rs 192.168.1.10 -A -a -w 700 -U
+netprobe-rs 192.168.1.10 -sU -p 53,161
+netprobe-rs 192.168.1.10 -T4 -p-
+```
+
+---
+
+## 🧾 Flag Help Mode
+
+```bash
+netprobe-rs --flag-help --scan
+netprobe-rs --flag-help -sU
+netprobe-rs --explain --scan   # legacy alias for flag docs mode
 ```
 
 ---
@@ -116,6 +134,9 @@ Guidance: Use key-based authentication and disable password login.
 - Fingerprint rules and probe payloads parse from `temp/nmap/nmap-service-probes` where supported.  
 - On startup, NetProbe-RS creates `~/.netprobe-rs-config/config.ini` for persistent settings.  
 - By default, output is printed to console unless `--output`, `--location`, or `--file-type` is provided.  
+- `netprobe-rs scan <target>` is still supported for compatibility, but `netprobe-rs <target>` is preferred.  
+- Timeout short flag is `-w` (`--timeout-ms`), while Nmap-style timing shortcuts use `-T0..-T5`.  
+- Root-required scan modes auto-attempt elevation on Unix-like systems when possible.  
 
 ### 📱 Termux / Mobile Presets
 
@@ -131,23 +152,34 @@ Cross-platform install scripts are provided in `building-scripts/`:
 
 ### Linux/macOS
 ```bash
-./building-scripts/install.sh
+./building-scripts/install.sh phase1   # test build -> ./build-linux or ./build-macos
+./building-scripts/install.sh phase2   # install (local/custom + PATH prompt)
+./building-scripts/install.sh phase3   # upgrade installed binary
+./building-scripts/install.sh phase4   # remove installed binary
 ```
 
 ### Termux
 ```bash
-./building-scripts/install-termux.sh
+./building-scripts/install-termux.sh phase2
 ```
 
 ### Windows PowerShell
 ```powershell
-.\building-scripts\install.ps1
+.\building-scripts\install.ps1 phase1
+.\building-scripts\install.ps1 phase2
+.\building-scripts\install.ps1 phase3
+.\building-scripts\install.ps1 phase4
 ```
 
 ### Windows CMD
 ```cmd
-building-scripts\install.bat
+building-scripts\install.bat phase2
 ```
+
+Installed command name:
+
+- `netprobe-rs` (Linux/macOS/Termux)
+- `netprobe-rs.exe` (Windows)
 
 ---
 
@@ -166,7 +198,7 @@ Always obtain proper authorization before scanning networks you do not own or ma
 
 ## 🛣️ Roadmap (Planned)
 
-- 📊 Risk scoring & attack surface summaries  
+- 🧬 Service/version enrichment and better fingerprint confidence reporting  
 - 🗺️ Network topology visualization  
 - 🔄 Baseline comparison & drift detection  
 - 🧠 Adaptive scan intelligence  

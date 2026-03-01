@@ -1,3 +1,8 @@
+// Flow sketch: scan request -> probe engine -> raw findings
+// Pseudo-block:
+//   read input -> process safely -> return deterministic output
+// async probes sprint; timeouts keep them from running marathons.
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{
@@ -652,3 +657,4 @@ fn sanitize_banner(raw: &[u8]) -> String {
     }
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
+

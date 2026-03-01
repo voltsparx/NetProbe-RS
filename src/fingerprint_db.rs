@@ -1,3 +1,7 @@
+// Flow sketch: input -> core processing -> output model
+// Pseudo-block:
+//   read input -> process safely -> return deterministic output
+
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
@@ -720,3 +724,4 @@ fn count_files_with_extension(root: &Path, ext: &str) -> usize {
     }
     count
 }
+

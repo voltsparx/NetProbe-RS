@@ -1,3 +1,7 @@
+// Flow sketch: input -> core processing -> output model
+// Pseudo-block:
+//   read input -> process safely -> return deterministic output
+
 use thiserror::Error;
 
 pub type NetProbeResult<T> = Result<T, NetProbeError>;
@@ -23,3 +27,4 @@ pub enum NetProbeError {
     #[error("config error: {0}")]
     Config(String),
 }
+

@@ -1,3 +1,8 @@
+// Flow sketch: ports -> scoring/findings/guidance -> insights
+// Pseudo-block:
+//   read input -> process safely -> return deterministic output
+// explanations translate packet noise into human words.
+
 use crate::models::{PortFinding, PortState};
 
 pub fn attach_explanations(ports: &mut [PortFinding]) {
@@ -39,3 +44,4 @@ fn explain_port(finding: &PortFinding) -> String {
         format!("{state_reason}; reason='{}'", finding.reason)
     }
 }
+

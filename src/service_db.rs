@@ -1,3 +1,7 @@
+// Flow sketch: input -> core processing -> output model
+// Pseudo-block:
+//   read input -> process safely -> return deterministic output
+
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -148,3 +152,4 @@ impl ServiceRegistry {
         }
     }
 }
+

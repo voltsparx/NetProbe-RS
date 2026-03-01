@@ -1,3 +1,7 @@
+// Flow sketch: input -> core processing -> output model
+// Pseudo-block:
+//   read input -> process safely -> return deterministic output
+
 use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -103,6 +107,7 @@ pub struct ScanRequest {
     pub reverse_dns: bool,
     pub service_detection: bool,
     pub explain: bool,
+    pub verbose: bool,
     pub report_format: ReportFormat,
     pub profile: ScanProfile,
     pub profile_explicit: bool,
@@ -190,19 +195,11 @@ pub struct HostResult {
     pub warnings: Vec<String>,
     pub ports: Vec<PortFinding>,
     pub risk_score: u8,
-    pub ai_findings: Vec<String>,
+    #[serde(rename = "insights", alias = "ai_findings")]
+    pub insights: Vec<String>,
     pub defensive_advice: Vec<String>,
     pub learning_notes: Vec<String>,
     pub lua_findings: Vec<String>,
-}
-
-impl HostResult {
-    pub fn open_port_count(&self) -> usize {
-        self.ports
-            .iter()
-            .filter(|p| matches!(p.state, PortState::Open | PortState::OpenOrFiltered))
-            .count()
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -219,6 +216,7 @@ pub struct ScanRequestSummary {
     pub port_count: usize,
     pub include_udp: bool,
     pub explain: bool,
+    pub verbose: bool,
     pub profile: ScanProfile,
     pub root_only: bool,
     pub aggressive_root: bool,
@@ -254,3 +252,4 @@ pub struct ScanReport {
     pub request: ScanRequestSummary,
     pub hosts: Vec<HostResult>,
 }
+

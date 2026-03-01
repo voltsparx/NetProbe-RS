@@ -1,4 +1,6 @@
 /target/
+.cargo-target/
+build-*/
 **/*.rs.bk
 temp/
 reports/

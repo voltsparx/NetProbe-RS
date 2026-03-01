@@ -1,3 +1,7 @@
+// Flow sketch: input -> core processing -> output model
+// Pseudo-block:
+//   read input -> process safely -> return deterministic output
+
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
@@ -274,3 +278,4 @@ fn parse_profile(raw: &String) -> Option<ScanProfile> {
         _ => None,
     }
 }
+
