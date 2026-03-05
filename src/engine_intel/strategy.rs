@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use crate::models::{ScanProfile, ScanRequest};
 
+#[allow(dead_code)] // used only by the tests and may not be referenced in a normal build
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionMode {
     Async,
@@ -189,6 +190,8 @@ mod tests {
             total_shards: None,
             shard_index: None,
             scan_seed: None,
+            resume_from_checkpoint: true,
+            fresh_scan: false,
         }
     }
 

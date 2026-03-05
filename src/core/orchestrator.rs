@@ -2,7 +2,7 @@
 // Pseudo-block:
 //   read input -> process safely -> return deterministic output
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 #[cfg(unix)]
 use std::process::Command;
@@ -11,6 +11,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use futures::stream::{FuturesUnordered, StreamExt};
 
+use crate::config::{self, ShardCheckpointState};
 use crate::engine_async::port_scan;
 use crate::engine_intel::{
     analysis,
@@ -28,13 +29,29 @@ use crate::models::{
 use crate::service_db::ServiceRegistry;
 
 const MAX_RESOLVED_HOSTS: usize = 16;
+const PORT_BATCH_SIZE: usize = 256;
+
+struct ScanWorkItem {
+    checkpoint_unit: String,
+    ip: IpAddr,
+    ports: Vec<u16>,
+}
 
 struct HostExecution {
+    checkpoint_unit: String,
     host: HostResult,
     async_tasks: usize,
     thread_pool_tasks: usize,
     parallel_tasks: usize,
     lua_hooks_ran: bool,
+}
+
+struct ShardCheckpointRuntime {
+    signature: String,
+    unit_label: String,
+    planned_units: Vec<String>,
+    completed_units: HashSet<String>,
+    resumed_units: usize,
 }
 
 pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
@@ -83,8 +100,17 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
 
     let (host_targets, selected_ports, shard_dimension, total_shards, shard_index) =
         apply_sharding(host_targets, selected_ports, &request, &mut global_warnings)?;
+    let (work_items, mut checkpoint_runtime) = prepare_shard_checkpoint(
+        &request,
+        host_targets,
+        &selected_ports,
+        total_shards,
+        shard_index,
+        shard_dimension,
+        &mut global_warnings,
+    )?;
 
-    let strategy = strategy::plan(&request, host_targets.len(), selected_ports.len());
+    let strategy = strategy::plan(&request, work_items.len(), selected_ports.len());
     if !request.profile_explicit {
         request.profile = match strategy.mode {
             ExecutionMode::Async => {
@@ -113,7 +139,8 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
         ));
     }
 
-    let mut host_queue = VecDeque::from(host_targets);
+    let defer_host_enrichment = shard_dimension == "ports";
+    let mut host_queue = VecDeque::from(work_items);
     let host_concurrency = host_parallelism(request.profile, strategy.mode, host_queue.len());
     let mut in_flight = FuturesUnordered::new();
     let mut hosts = Vec::new();
@@ -122,17 +149,17 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
     let mut lua_hooks_ran = false;
 
     while in_flight.len() < host_concurrency {
-        let Some(ip) = host_queue.pop_front() else {
+        let Some(work_item) = host_queue.pop_front() else {
             break;
         };
         in_flight.push(process_host(
             request.clone(),
-            ip,
-            selected_ports.clone(),
+            work_item,
             global_warnings.clone(),
             service_registry.clone(),
             fingerprint_db.clone(),
             strategy.clone(),
+            defer_host_enrichment,
         ));
     }
 
@@ -142,18 +169,74 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
         thread_pool_tasks += execution.thread_pool_tasks;
         parallel_tasks += execution.parallel_tasks;
         lua_hooks_ran = lua_hooks_ran || execution.lua_hooks_ran;
+        let checkpoint_unit = execution.checkpoint_unit.clone();
         hosts.push(execution.host);
+        if let Some(runtime) = checkpoint_runtime.as_mut() {
+            if runtime.completed_units.insert(checkpoint_unit) {
+                persist_shard_checkpoint_state(
+                    &request,
+                    total_shards,
+                    shard_index,
+                    shard_dimension,
+                    selected_ports.len(),
+                    runtime,
+                )?;
+            }
+        }
 
-        if let Some(ip) = host_queue.pop_front() {
+        if let Some(work_item) = host_queue.pop_front() {
             in_flight.push(process_host(
                 request.clone(),
-                ip,
-                selected_ports.clone(),
+                work_item,
                 global_warnings.clone(),
                 service_registry.clone(),
                 fingerprint_db.clone(),
                 strategy.clone(),
+                defer_host_enrichment,
             ));
+        }
+    }
+
+    if defer_host_enrichment {
+        hosts = merge_hosts_by_ip(hosts);
+        for host in &mut hosts {
+            let (extra_thread_pool_tasks, extra_parallel_tasks, extra_lua_hooks_ran) =
+                finalize_host(
+                    request.lua_script.as_deref(),
+                    request.explain,
+                    request.reverse_dns,
+                    host,
+                )
+                .await?;
+            thread_pool_tasks += extra_thread_pool_tasks;
+            parallel_tasks += extra_parallel_tasks;
+            lua_hooks_ran = lua_hooks_ran || extra_lua_hooks_ran;
+        }
+    }
+
+    let checkpoint_enabled = checkpoint_runtime.is_some();
+    let mut checkpoint_unit_label = "none".to_string();
+    let mut checkpoint_planned_units = 0usize;
+    let mut checkpoint_completed_units = 0usize;
+    let mut checkpoint_resumed_units = 0usize;
+    if let Some(runtime) = checkpoint_runtime.as_ref() {
+        checkpoint_unit_label = runtime.unit_label.clone();
+        checkpoint_planned_units = runtime.planned_units.len();
+        checkpoint_completed_units = runtime.completed_units.len();
+        checkpoint_resumed_units = runtime.resumed_units;
+    }
+    if let Some(runtime) = checkpoint_runtime.take() {
+        if runtime.completed_units.len() >= runtime.planned_units.len() {
+            config::clear_shard_checkpoint(&runtime.signature)?;
+        } else {
+            persist_shard_checkpoint_state(
+                &request,
+                total_shards,
+                shard_index,
+                shard_dimension,
+                selected_ports.len(),
+                &runtime,
+            )?;
         }
     }
 
@@ -178,6 +261,11 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
                 shard_index,
                 shard_dimension: shard_dimension.to_string(),
                 scan_seed: request.scan_seed,
+                checkpoint_enabled,
+                checkpoint_unit_label,
+                checkpoint_planned_units,
+                checkpoint_completed_units,
+                checkpoint_resumed_units,
             },
             knowledge: KnowledgeStats {
                 services_loaded: service_registry.service_count(),
@@ -205,6 +293,8 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
             total_shards: request.total_shards,
             shard_index: request.shard_index,
             scan_seed: request.scan_seed,
+            resume_from_checkpoint: request.resume_from_checkpoint,
+            fresh_scan: request.fresh_scan,
         },
         hosts,
     };
@@ -220,17 +310,18 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
 
 async fn process_host(
     request: ScanRequest,
-    ip: IpAddr,
-    selected_ports: Vec<u16>,
+    work_item: ScanWorkItem,
     global_warnings: Vec<String>,
     service_registry: Arc<ServiceRegistry>,
     fingerprint_db: Arc<FingerprintDatabase>,
     strategy: ScanStrategy,
+    defer_enrichment: bool,
 ) -> NProbeResult<HostExecution> {
+    let ip = work_item.ip;
     let (mut host, async_tasks) = port_scan::run(
         &request,
         ip,
-        selected_ports,
+        work_item.ports,
         service_registry,
         fingerprint_db,
         &strategy,
@@ -239,15 +330,108 @@ async fn process_host(
     host.warnings.extend(global_warnings);
 
     let mut thread_pool_tasks = 0usize;
-    if request.reverse_dns {
-        if let Some(reverse_dns) = dns::reverse(ip).await {
-            host.reverse_dns = Some(reverse_dns);
-            thread_pool_tasks += 1;
+    let mut parallel_tasks = 0usize;
+    let mut lua_hooks_ran = false;
+
+    if !defer_enrichment {
+        if request.reverse_dns {
+            if let Some(reverse_dns) = dns::reverse(ip).await {
+                host.reverse_dns = Some(reverse_dns);
+                thread_pool_tasks += 1;
+            }
+        }
+
+        parallel_tasks = analysis::run(&mut host, request.explain);
+        let lua_findings = lua::run(&host, request.lua_script.as_deref())?;
+        host.lua_findings = lua_findings;
+        if !host.lua_findings.is_empty() {
+            host.insights.push(format!(
+                "lua hooks added {} custom findings",
+                host.lua_findings.len()
+            ));
+        }
+        lua_hooks_ran = true;
+    }
+
+    Ok(HostExecution {
+        checkpoint_unit: work_item.checkpoint_unit,
+        host,
+        async_tasks,
+        thread_pool_tasks,
+        parallel_tasks,
+        lua_hooks_ran,
+    })
+}
+
+fn merge_hosts_by_ip(hosts: Vec<HostResult>) -> Vec<HostResult> {
+    let mut merged = Vec::<HostResult>::new();
+    let mut index_by_ip = BTreeMap::<String, usize>::new();
+
+    for mut host in hosts {
+        if let Some(existing_idx) = index_by_ip.get(&host.ip).copied() {
+            let existing = &mut merged[existing_idx];
+            existing.ports.append(&mut host.ports);
+            existing.warnings.append(&mut host.warnings);
+            existing.insights.append(&mut host.insights);
+            existing.defensive_advice.append(&mut host.defensive_advice);
+            existing.learning_notes.append(&mut host.learning_notes);
+            existing.lua_findings.append(&mut host.lua_findings);
+            if existing.reverse_dns.is_none() {
+                existing.reverse_dns = host.reverse_dns.take();
+            }
+        } else {
+            index_by_ip.insert(host.ip.clone(), merged.len());
+            merged.push(host);
         }
     }
 
-    let parallel_tasks = analysis::run(&mut host, request.explain);
-    let lua_findings = lua::run(&host, request.lua_script.as_deref())?;
+    for host in &mut merged {
+        host.ports.sort_by(|a, b| {
+            a.port
+                .cmp(&b.port)
+                .then_with(|| a.protocol.cmp(&b.protocol))
+        });
+        host.ports
+            .dedup_by(|left, right| left.port == right.port && left.protocol == right.protocol);
+        dedupe_sort_strings(&mut host.warnings);
+        dedupe_sort_strings(&mut host.insights);
+        dedupe_sort_strings(&mut host.defensive_advice);
+        dedupe_sort_strings(&mut host.learning_notes);
+        dedupe_sort_strings(&mut host.lua_findings);
+    }
+
+    merged
+}
+
+fn dedupe_sort_strings(values: &mut Vec<String>) {
+    values.sort_unstable();
+    values.dedup();
+}
+
+async fn finalize_host(
+    lua_script: Option<&std::path::Path>,
+    explain: bool,
+    reverse_dns_enabled: bool,
+    host: &mut HostResult,
+) -> NProbeResult<(usize, usize, bool)> {
+    let mut thread_pool_tasks = 0usize;
+    if reverse_dns_enabled {
+        if let Ok(ip) = host.ip.parse::<IpAddr>() {
+            if let Some(reverse_dns) = dns::reverse(ip).await {
+                host.reverse_dns = Some(reverse_dns);
+                thread_pool_tasks += 1;
+            }
+        }
+    }
+
+    host.risk_score = 0;
+    host.insights.clear();
+    host.defensive_advice.clear();
+    host.learning_notes.clear();
+    host.lua_findings.clear();
+
+    let parallel_tasks = analysis::run(host, explain);
+    let lua_findings = lua::run(host, lua_script)?;
     host.lua_findings = lua_findings;
     if !host.lua_findings.is_empty() {
         host.insights.push(format!(
@@ -256,13 +440,7 @@ async fn process_host(
         ));
     }
 
-    Ok(HostExecution {
-        host,
-        async_tasks,
-        thread_pool_tasks,
-        parallel_tasks,
-        lua_hooks_ran: true,
-    })
+    Ok((thread_pool_tasks, parallel_tasks, true))
 }
 
 fn enforce_safety(
@@ -478,6 +656,239 @@ fn apply_sharding(
     Ok((hosts, ports, dimension, total, index))
 }
 
+fn prepare_shard_checkpoint(
+    request: &ScanRequest,
+    host_targets: Vec<IpAddr>,
+    selected_ports: &[u16],
+    total_shards: u16,
+    shard_index: u16,
+    shard_dimension: &str,
+    warnings: &mut Vec<String>,
+) -> NProbeResult<(Vec<ScanWorkItem>, Option<ShardCheckpointRuntime>)> {
+    let work_items = build_scan_work_items(&host_targets, selected_ports, shard_dimension);
+    if total_shards <= 1 || shard_dimension == "none" || work_items.is_empty() {
+        return Ok((work_items, None));
+    }
+
+    let unit_label = if shard_dimension == "ports" {
+        "port-batches"
+    } else {
+        "hosts"
+    };
+    let planned_units: Vec<String> = work_items
+        .iter()
+        .map(|item| item.checkpoint_unit.clone())
+        .collect();
+    let planned_set: HashSet<String> = planned_units.iter().cloned().collect();
+    let signature = checkpoint_signature(
+        request,
+        &planned_units,
+        selected_ports,
+        total_shards,
+        shard_index,
+        shard_dimension,
+    );
+
+    if request.fresh_scan {
+        let _ = config::clear_shard_checkpoint(&signature);
+        warnings.push(format!(
+            "fresh-scan active: reset checkpoint for shard {}/{}",
+            shard_index + 1,
+            total_shards
+        ));
+    }
+
+    let mut completed_units = HashSet::new();
+    if request.resume_from_checkpoint && !request.fresh_scan {
+        if let Some(existing) = config::load_shard_checkpoint(&signature)? {
+            for unit in existing.completed_units {
+                if planned_set.contains(&unit) {
+                    completed_units.insert(unit);
+                }
+            }
+        }
+    }
+
+    let mut resumed_units = completed_units.len();
+    if resumed_units >= planned_units.len() && !planned_units.is_empty() {
+        warnings.push(format!(
+            "completed shard checkpoint found for shard {}/{}; reset and scanning again",
+            shard_index + 1,
+            total_shards
+        ));
+        completed_units.clear();
+        resumed_units = 0;
+        config::clear_shard_checkpoint(&signature)?;
+    }
+
+    if resumed_units > 0 {
+        warnings.push(format!(
+            "resuming shard {}/{} from checkpoint: {} of {} {} already complete",
+            shard_index + 1,
+            total_shards,
+            resumed_units,
+            planned_units.len(),
+            unit_label
+        ));
+    } else if !request.resume_from_checkpoint {
+        warnings.push(format!(
+            "checkpoint resume disabled for shard {}/{}",
+            shard_index + 1,
+            total_shards
+        ));
+    }
+
+    let remaining_items = work_items
+        .into_iter()
+        .filter(|item| !completed_units.contains(&item.checkpoint_unit))
+        .collect::<Vec<_>>();
+
+    let runtime = ShardCheckpointRuntime {
+        signature,
+        unit_label: unit_label.to_string(),
+        planned_units,
+        completed_units,
+        resumed_units,
+    };
+    persist_shard_checkpoint_state(
+        request,
+        total_shards,
+        shard_index,
+        shard_dimension,
+        selected_ports.len(),
+        &runtime,
+    )?;
+
+    Ok((remaining_items, Some(runtime)))
+}
+
+fn build_scan_work_items(
+    hosts: &[IpAddr],
+    selected_ports: &[u16],
+    shard_dimension: &str,
+) -> Vec<ScanWorkItem> {
+    if hosts.is_empty() || selected_ports.is_empty() {
+        return Vec::new();
+    }
+
+    if shard_dimension == "ports" {
+        let mut items = Vec::new();
+        for ip in hosts.iter().copied() {
+            for (batch_index, chunk) in selected_ports.chunks(PORT_BATCH_SIZE).enumerate() {
+                let first = *chunk.first().unwrap_or(&0);
+                let last = *chunk.last().unwrap_or(&0);
+                let unit = format!("{ip}:ports:{batch_index}:{first}-{last}");
+                items.push(ScanWorkItem {
+                    checkpoint_unit: unit,
+                    ip,
+                    ports: chunk.to_vec(),
+                });
+            }
+        }
+        return items;
+    }
+
+    hosts
+        .iter()
+        .copied()
+        .map(|ip| ScanWorkItem {
+            checkpoint_unit: ip.to_string(),
+            ip,
+            ports: selected_ports.to_vec(),
+        })
+        .collect()
+}
+
+fn checkpoint_signature(
+    request: &ScanRequest,
+    planned_units: &[String],
+    selected_ports: &[u16],
+    total_shards: u16,
+    shard_index: u16,
+    shard_dimension: &str,
+) -> String {
+    let mut signature_input = String::new();
+    signature_input.push_str("nprobe-rs-shard-checkpoint-v1|");
+    signature_input.push_str(&request.target);
+    signature_input.push('|');
+    signature_input.push_str(&format!("{:?}", request.profile));
+    signature_input.push('|');
+    signature_input.push_str(if request.include_udp { "1" } else { "0" });
+    signature_input.push('|');
+    signature_input.push_str(if request.service_detection { "1" } else { "0" });
+    signature_input.push('|');
+    signature_input.push_str(if request.effective_privileged_probes() {
+        "1"
+    } else {
+        "0"
+    });
+    signature_input.push('|');
+    signature_input.push_str(&total_shards.to_string());
+    signature_input.push('|');
+    signature_input.push_str(&shard_index.to_string());
+    signature_input.push('|');
+    signature_input.push_str(shard_dimension);
+    signature_input.push('|');
+    signature_input.push_str(
+        &request
+            .scan_seed
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+    );
+    signature_input.push('|');
+    signature_input.push_str("units=");
+    for unit in planned_units {
+        signature_input.push_str(unit);
+        signature_input.push(',');
+    }
+    signature_input.push('|');
+    signature_input.push_str("ports=");
+    for port in selected_ports {
+        signature_input.push_str(&port.to_string());
+        signature_input.push(',');
+    }
+
+    format!("{:016x}", fnv1a64(signature_input.as_bytes()))
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut hash = OFFSET_BASIS;
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
+fn persist_shard_checkpoint_state(
+    request: &ScanRequest,
+    total_shards: u16,
+    shard_index: u16,
+    shard_dimension: &str,
+    port_count: usize,
+    runtime: &ShardCheckpointRuntime,
+) -> NProbeResult<()> {
+    let mut completed_units: Vec<String> = runtime.completed_units.iter().cloned().collect();
+    completed_units.sort_unstable();
+    let state = ShardCheckpointState::new(
+        runtime.signature.clone(),
+        request.target.clone(),
+        total_shards,
+        shard_index,
+        shard_dimension,
+        &runtime.unit_label,
+        runtime.planned_units.clone(),
+        completed_units,
+        port_count,
+        request.scan_seed,
+    );
+    config::save_shard_checkpoint(&state)?;
+    Ok(())
+}
+
 fn shard_slice<T>(items: Vec<T>, total_shards: u16, shard_index: u16) -> Vec<T> {
     let total = total_shards as usize;
     let index = shard_index as usize;
@@ -512,7 +923,43 @@ fn host_parallelism(profile: ScanProfile, mode: ExecutionMode, host_count: usize
 
 #[cfg(test)]
 mod tests {
-    use super::shard_slice;
+    use super::{checkpoint_signature, shard_slice};
+    use crate::models::{ReportFormat, ScanProfile, ScanRequest};
+
+    fn base_request() -> ScanRequest {
+        ScanRequest {
+            target: "127.0.0.1".to_string(),
+            ports: vec![22, 80, 443],
+            top_ports: None,
+            include_udp: false,
+            reverse_dns: false,
+            service_detection: true,
+            explain: false,
+            verbose: false,
+            report_format: ReportFormat::Cli,
+            profile: ScanProfile::Balanced,
+            profile_explicit: false,
+            root_only: false,
+            aggressive_root: false,
+            privileged_probes: false,
+            lab_mode: false,
+            allow_external: false,
+            strict_safety: false,
+            output_path: None,
+            lua_script: None,
+            timeout_ms: None,
+            concurrency: None,
+            delay_ms: None,
+            rate_limit_pps: None,
+            burst_size: None,
+            max_retries: None,
+            total_shards: Some(4),
+            shard_index: Some(1),
+            scan_seed: Some(99),
+            resume_from_checkpoint: true,
+            fresh_scan: false,
+        }
+    }
 
     #[test]
     fn shard_slice_even_distribution() {
@@ -523,5 +970,17 @@ mod tests {
         assert_eq!(shard0, vec![0, 3, 6, 9]);
         assert_eq!(shard1, vec![1, 4, 7]);
         assert_eq!(shard2, vec![2, 5, 8]);
+    }
+
+    #[test]
+    fn checkpoint_signature_changes_with_shard_index() {
+        let request = base_request();
+        let hosts = vec!["10.0.0.1".to_string(), "10.0.0.2".to_string()];
+        let ports = vec![22, 80, 443];
+
+        let sig_a = checkpoint_signature(&request, &hosts, &ports, 4, 1, "hosts");
+        let sig_b = checkpoint_signature(&request, &hosts, &ports, 4, 2, "hosts");
+
+        assert_ne!(sig_a, sig_b);
     }
 }

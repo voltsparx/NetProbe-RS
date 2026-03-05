@@ -27,6 +27,15 @@ pub fn render(report: &ScanReport) -> String {
     if let Some(seed) = report.metadata.engine_stats.scan_seed {
         out.push_str(&format!("Scan seed: {seed}\n"));
     }
+    if report.metadata.engine_stats.checkpoint_enabled {
+        out.push_str(&format!(
+            "Shard progress: {}/{} {} complete (resumed {})\n",
+            report.metadata.engine_stats.checkpoint_completed_units,
+            report.metadata.engine_stats.checkpoint_planned_units,
+            report.metadata.engine_stats.checkpoint_unit_label,
+            report.metadata.engine_stats.checkpoint_resumed_units
+        ));
+    }
 
     for host in &report.hosts {
         out.push_str(&format!(

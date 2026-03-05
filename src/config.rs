@@ -8,12 +8,68 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{NProbeError, NProbeResult};
 use crate::models::{ScanProfile, ScanRequest};
 
 const CONFIG_DIR_NAME: &str = ".nprobe-rs-config";
 const CONFIG_FILE_NAME: &str = "config.ini";
+const CHECKPOINT_DIR_NAME: &str = "checkpoints";
+const SHARD_CHECKPOINT_VERSION: u8 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardCheckpointState {
+    pub version: u8,
+    pub signature: String,
+    pub target: String,
+    pub total_shards: u16,
+    pub shard_index: u16,
+    pub shard_dimension: String,
+    #[serde(default = "default_checkpoint_unit_kind")]
+    pub unit_kind: String,
+    #[serde(default, alias = "planned_hosts")]
+    pub planned_units: Vec<String>,
+    #[serde(default, alias = "completed_hosts")]
+    pub completed_units: Vec<String>,
+    pub port_count: usize,
+    pub scan_seed: Option<u64>,
+    pub updated_at: String,
+}
+
+impl ShardCheckpointState {
+    pub fn new(
+        signature: String,
+        target: String,
+        total_shards: u16,
+        shard_index: u16,
+        shard_dimension: &str,
+        unit_kind: &str,
+        planned_units: Vec<String>,
+        completed_units: Vec<String>,
+        port_count: usize,
+        scan_seed: Option<u64>,
+    ) -> Self {
+        Self {
+            version: SHARD_CHECKPOINT_VERSION,
+            signature,
+            target,
+            total_shards,
+            shard_index,
+            shard_dimension: shard_dimension.to_string(),
+            unit_kind: unit_kind.to_string(),
+            planned_units,
+            completed_units,
+            port_count,
+            scan_seed,
+            updated_at: Utc::now().to_rfc3339(),
+        }
+    }
+}
+
+fn default_checkpoint_unit_kind() -> String {
+    "hosts".to_string()
+}
 
 pub fn apply_defaults(request: &mut ScanRequest) -> NProbeResult<()> {
     let kv = load_or_default_map()?;
@@ -116,6 +172,60 @@ pub fn init_and_update(request: &ScanRequest) -> NProbeResult<PathBuf> {
     Ok(config_path)
 }
 
+pub fn load_shard_checkpoint(signature: &str) -> NProbeResult<Option<ShardCheckpointState>> {
+    let checkpoint_path = shard_checkpoint_path(signature)?;
+    if !checkpoint_path.exists() {
+        return Ok(None);
+    }
+
+    let body = fs::read_to_string(&checkpoint_path)?;
+    let parsed = serde_json::from_str::<ShardCheckpointState>(&body).map_err(|err| {
+        NProbeError::Config(format!(
+            "failed to parse shard checkpoint '{}': {err}",
+            checkpoint_path.display()
+        ))
+    })?;
+
+    if parsed.signature != signature || parsed.version != SHARD_CHECKPOINT_VERSION {
+        return Ok(None);
+    }
+
+    Ok(Some(parsed))
+}
+
+pub fn save_shard_checkpoint(state: &ShardCheckpointState) -> NProbeResult<PathBuf> {
+    let checkpoint_path = shard_checkpoint_path(&state.signature)?;
+    let parent = checkpoint_path.parent().ok_or_else(|| {
+        NProbeError::Config("invalid checkpoint path without parent directory".to_string())
+    })?;
+    fs::create_dir_all(parent)?;
+
+    let tmp_path = parent.join(format!("{}.tmp", checkpoint_file_name(&state.signature)));
+    let mut state_to_save = state.clone();
+    state_to_save.updated_at = Utc::now().to_rfc3339();
+
+    let body = serde_json::to_string_pretty(&state_to_save)?;
+    fs::write(&tmp_path, body)?;
+
+    if checkpoint_path.exists() {
+        let _ = fs::remove_file(&checkpoint_path);
+    }
+    fs::rename(&tmp_path, &checkpoint_path).map_err(|err| {
+        let _ = fs::remove_file(&tmp_path);
+        NProbeError::Io(err)
+    })?;
+
+    Ok(checkpoint_path)
+}
+
+pub fn clear_shard_checkpoint(signature: &str) -> NProbeResult<()> {
+    let checkpoint_path = shard_checkpoint_path(signature)?;
+    if checkpoint_path.exists() {
+        fs::remove_file(checkpoint_path)?;
+    }
+    Ok(())
+}
+
 fn update_runtime_values(kv: &mut BTreeMap<String, String>, request: &ScanRequest) {
     kv.insert("config_version".to_string(), "1".to_string());
     kv.insert("last_run_utc".to_string(), Utc::now().to_rfc3339());
@@ -206,6 +316,14 @@ fn update_runtime_values(kv: &mut BTreeMap<String, String>, request: &ScanReques
         "last_scan_seed".to_string(),
         request.scan_seed.map(|v| v.to_string()).unwrap_or_default(),
     );
+    kv.insert(
+        "last_resume_checkpoint".to_string(),
+        request.resume_from_checkpoint.to_string(),
+    );
+    kv.insert(
+        "last_fresh_scan".to_string(),
+        request.fresh_scan.to_string(),
+    );
 
     let run_count = kv
         .get("run_count")
@@ -227,6 +345,16 @@ fn resolve_config_dir() -> NProbeResult<PathBuf> {
     Err(NProbeError::Config(
         "could not resolve user home directory for config".to_string(),
     ))
+}
+
+fn shard_checkpoint_path(signature: &str) -> NProbeResult<PathBuf> {
+    Ok(resolve_config_dir()?
+        .join(CHECKPOINT_DIR_NAME)
+        .join(checkpoint_file_name(signature)))
+}
+
+fn checkpoint_file_name(signature: &str) -> String {
+    format!("shard-{signature}.json")
 }
 
 fn detect_home_dir() -> Option<PathBuf> {

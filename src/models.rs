@@ -128,6 +128,8 @@ pub struct ScanRequest {
     pub total_shards: Option<u16>,
     pub shard_index: Option<u16>,
     pub scan_seed: Option<u64>,
+    pub resume_from_checkpoint: bool,
+    pub fresh_scan: bool,
 }
 
 impl ScanRequest {
@@ -223,6 +225,11 @@ pub struct EngineStats {
     pub shard_index: u16,
     pub shard_dimension: String,
     pub scan_seed: Option<u64>,
+    pub checkpoint_enabled: bool,
+    pub checkpoint_unit_label: String,
+    pub checkpoint_planned_units: usize,
+    pub checkpoint_completed_units: usize,
+    pub checkpoint_resumed_units: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -241,6 +248,8 @@ pub struct ScanRequestSummary {
     pub total_shards: Option<u16>,
     pub shard_index: Option<u16>,
     pub scan_seed: Option<u64>,
+    pub resume_from_checkpoint: bool,
+    pub fresh_scan: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

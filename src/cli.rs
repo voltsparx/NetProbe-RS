@@ -260,6 +260,19 @@ struct ScanArgs {
         help = "Deterministic seed for shuffled probe ordering"
     )]
     scan_seed: Option<u64>,
+
+    #[arg(
+        long = "resume",
+        help = "Resume from existing shard checkpoint when available"
+    )]
+    resume: bool,
+
+    #[arg(
+        long = "fresh-scan",
+        conflicts_with = "resume",
+        help = "Ignore and reset shard checkpoint before scanning"
+    )]
+    fresh_scan: bool,
 }
 
 impl Cli {
@@ -364,7 +377,7 @@ pub fn maybe_render_quick_help_mode() -> Option<String> {
     }
 
     Some(
-        "Usage:\n  nprobe-rs <target> [options]\n\nCommon options:\n  -p, --ports <list|range>   Select ports (example: -p 22,80,443)\n      --all-ports            Scan ports 1-65535 (Nmap: -p-)\n  -U, --udp                  Enable UDP probes (Nmap: -sU)\n  -S, --syn                  Enable privileged TCP probes (Nmap: -sS)\n  -A, --aggressive           Aggressive mode (Nmap: -A)\n  -w, --timeout-ms <ms>      Probe timeout in milliseconds\n      --rate-pps <num>       Dispatch rate target in packets per second\n      --burst-size <num>     Token-bucket burst limit\n      --max-retries <num>    Adaptive retries per probe (0..20)\n      --total-shards <num>   Total shard count for distributed scans\n      --shard-index <num>    Current shard index (requires total-shards)\n      --scan-seed <num>      Deterministic port shuffle seed\n  -r, --reverse-dns          Enable reverse DNS lookups\n  -n, --no-dns               Disable reverse DNS lookups\n  -e, --explain              Add concise per-port rationale in output\n  -v, --verbose              Show full output sections\n  -f, --file-type <type>     Export format: txt|json|html|csv\n  -o, --output <name>        Output filename\n  -L, --location <dir>       Output directory\n\nNmap-style shortcuts accepted:\n  -sU  -sS  -A  -T0..-T5  -p-\n\nFlag docs mode:\n  nprobe-rs --flag-help --scan\n  nprobe-rs --flag-help -sU\n  nprobe-rs --explain --scan   (legacy alias)\n\nCompatibility:\n  nprobe-rs scan <target> [options] still works.".to_string(),
+        "Usage:\n  nprobe-rs <target> [options]\n\nCommon options:\n  -p, --ports <list|range>   Select ports (example: -p 22,80,443)\n      --all-ports            Scan ports 1-65535 (Nmap: -p-)\n  -U, --udp                  Enable UDP probes (Nmap: -sU)\n  -S, --syn                  Enable privileged TCP probes (Nmap: -sS)\n  -A, --aggressive           Aggressive mode (Nmap: -A)\n  -w, --timeout-ms <ms>      Probe timeout in milliseconds\n      --rate-pps <num>       Dispatch rate target in packets per second\n      --burst-size <num>     Token-bucket burst limit\n      --max-retries <num>    Adaptive retries per probe (0..20)\n      --total-shards <num>   Total shard count for distributed scans\n      --shard-index <num>    Current shard index (requires total-shards)\n      --scan-seed <num>      Deterministic port shuffle seed\n      --resume               Resume from shard checkpoint\n      --fresh-scan           Ignore/reset shard checkpoint for this run\n  -r, --reverse-dns          Enable reverse DNS lookups\n  -n, --no-dns               Disable reverse DNS lookups\n  -e, --explain              Add concise per-port rationale in output\n  -v, --verbose              Show full output sections\n  -f, --file-type <type>     Export format: txt|json|html|csv\n  -o, --output <name>        Output filename\n  -L, --location <dir>       Output directory\n\nNmap-style shortcuts accepted:\n  -sU  -sS  -A  -T0..-T5  -p-\n\nFlag docs mode:\n  nprobe-rs --flag-help --scan\n  nprobe-rs --flag-help -sU\n  nprobe-rs --explain --scan   (legacy alias)\n\nCompatibility:\n  nprobe-rs scan <target> [options] still works.".to_string(),
     )
 }
 
@@ -406,6 +419,10 @@ fn render_flag_explain(raw_query: Option<&str>) -> String {
         }
         "scanseed" | "scan-seed" => {
             "Use deterministic seed for shuffled probe order (`--scan-seed`)."
+        }
+        "resume" => "Resume from existing shard checkpoint when available (`--resume`).",
+        "freshscan" | "fresh-scan" => {
+            "Ignore/reset shard checkpoint and start from scratch (`--fresh-scan`)."
         }
         "v" | "verbose" => "Show extended terminal sections (`-v` or `--verbose`).",
         "e" | "explain" => {
@@ -537,6 +554,8 @@ impl ScanArgs {
         let total_shards = self.total_shards;
         let shard_index = self.shard_index.or_else(|| total_shards.map(|_| 0));
         let scan_seed = self.scan_seed;
+        let resume_from_checkpoint = self.resume || !self.fresh_scan;
+        let fresh_scan = self.fresh_scan;
         let mut top_ports = top_ports;
 
         if root_only {
@@ -594,6 +613,8 @@ impl ScanArgs {
             total_shards,
             shard_index,
             scan_seed,
+            resume_from_checkpoint,
+            fresh_scan,
         })
     }
 }
