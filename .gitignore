@@ -1,6 +1,24 @@
+#----------------------
+# Local build artifacts
+#----------------------
 /target/
 .cargo-target/
 build-*/
 **/*.rs.bk
 temp/
 reports/
+
+#----------------------
+# IDE and editor files
+#----------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+*.swn
+
+#----------------------
+# Self Assesment files
+#----------------------
+self-assessment/
+intel-source/
