@@ -8,6 +8,7 @@ mod config;
 mod core;
 mod engine_async;
 mod engine_intel;
+mod engine_packet;
 mod engine_parallel;
 mod engine_plugin;
 mod engine_probe;
