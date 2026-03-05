@@ -16,4 +16,3 @@ pub async fn run(
     let rendered = output::render(report, format)?;
     output::emit(&rendered, format, output_path).await
 }
-

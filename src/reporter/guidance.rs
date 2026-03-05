@@ -71,4 +71,3 @@ pub fn build_advice(host: &HostResult) -> Vec<String> {
 
     advice.into_iter().collect()
 }
-

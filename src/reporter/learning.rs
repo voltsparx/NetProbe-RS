@@ -86,4 +86,3 @@ fn teaching_note_for(finding: &PortFinding) -> Option<String> {
 
     Some(format!("{state_prefix}. {service_note}"))
 }
-

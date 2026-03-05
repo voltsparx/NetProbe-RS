@@ -2,9 +2,9 @@
 // Pseudo-block:
 //   read input -> process safely -> return deterministic output
 
-use crate::reporter::{findings, guidance, learning, reasoning};
 use crate::engines::parallel;
 use crate::models::HostResult;
+use crate::reporter::{findings, guidance, learning, reasoning};
 
 pub fn run(host: &mut HostResult, explain_mode: bool) -> usize {
     let (risk_score, mut insights, parallel_tasks) =
@@ -25,4 +25,3 @@ pub fn run(host: &mut HostResult, explain_mode: bool) -> usize {
 
     parallel_tasks
 }
-

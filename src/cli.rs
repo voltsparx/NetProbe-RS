@@ -96,7 +96,11 @@ struct ScanArgs {
     )]
     reverse_dns: bool,
 
-    #[arg(short = 'n', long = "no-dns", help = "Skip reverse DNS lookups (Nmap-compatible)")]
+    #[arg(
+        short = 'n',
+        long = "no-dns",
+        help = "Skip reverse DNS lookups (Nmap-compatible)"
+    )]
     no_dns: bool,
 
     #[arg(
@@ -120,7 +124,11 @@ struct ScanArgs {
     )]
     explain: bool,
 
-    #[arg(short = 'v', long = "verbose", help = "Show full terminal output sections")]
+    #[arg(
+        short = 'v',
+        long = "verbose",
+        help = "Show full terminal output sections"
+    )]
     verbose: bool,
 
     #[arg(
@@ -222,6 +230,36 @@ struct ScanArgs {
         help = "Delay between probe dispatches in ms"
     )]
     delay_ms: Option<u64>,
+
+    #[arg(
+        long = "rate-pps",
+        help = "Probe dispatch rate target (packets per second)"
+    )]
+    rate_limit_pps: Option<u32>,
+
+    #[arg(long = "burst-size", help = "Token-bucket burst size for rate control")]
+    burst_size: Option<usize>,
+
+    #[arg(long = "max-retries", help = "Adaptive retry limit per probe")]
+    max_retries: Option<u8>,
+
+    #[arg(
+        long = "total-shards",
+        help = "Total shard count for distributed scans"
+    )]
+    total_shards: Option<u16>,
+
+    #[arg(
+        long = "shard-index",
+        help = "Shard index in range [0, total-shards-1]"
+    )]
+    shard_index: Option<u16>,
+
+    #[arg(
+        long = "scan-seed",
+        help = "Deterministic seed for shuffled probe ordering"
+    )]
+    scan_seed: Option<u64>,
 }
 
 impl Cli {
@@ -326,7 +364,7 @@ pub fn maybe_render_quick_help_mode() -> Option<String> {
     }
 
     Some(
-        "Usage:\n  nprobe-rs <target> [options]\n\nCommon options:\n  -p, --ports <list|range>   Select ports (example: -p 22,80,443)\n      --all-ports            Scan ports 1-65535 (Nmap: -p-)\n  -U, --udp                  Enable UDP probes (Nmap: -sU)\n  -S, --syn                  Enable privileged TCP probes (Nmap: -sS)\n  -A, --aggressive           Aggressive mode (Nmap: -A)\n  -w, --timeout-ms <ms>      Probe timeout in milliseconds\n  -r, --reverse-dns          Enable reverse DNS lookups\n  -n, --no-dns               Disable reverse DNS lookups\n  -e, --explain              Add concise per-port rationale in output\n  -v, --verbose              Show full output sections\n  -f, --file-type <type>     Export format: txt|json|html|csv\n  -o, --output <name>        Output filename\n  -L, --location <dir>       Output directory\n\nNmap-style shortcuts accepted:\n  -sU  -sS  -A  -T0..-T5  -p-\n\nFlag docs mode:\n  nprobe-rs --flag-help --scan\n  nprobe-rs --flag-help -sU\n  nprobe-rs --explain --scan   (legacy alias)\n\nCompatibility:\n  nprobe-rs scan <target> [options] still works.".to_string(),
+        "Usage:\n  nprobe-rs <target> [options]\n\nCommon options:\n  -p, --ports <list|range>   Select ports (example: -p 22,80,443)\n      --all-ports            Scan ports 1-65535 (Nmap: -p-)\n  -U, --udp                  Enable UDP probes (Nmap: -sU)\n  -S, --syn                  Enable privileged TCP probes (Nmap: -sS)\n  -A, --aggressive           Aggressive mode (Nmap: -A)\n  -w, --timeout-ms <ms>      Probe timeout in milliseconds\n      --rate-pps <num>       Dispatch rate target in packets per second\n      --burst-size <num>     Token-bucket burst limit\n      --max-retries <num>    Adaptive retries per probe (0..20)\n      --total-shards <num>   Total shard count for distributed scans\n      --shard-index <num>    Current shard index (requires total-shards)\n      --scan-seed <num>      Deterministic port shuffle seed\n  -r, --reverse-dns          Enable reverse DNS lookups\n  -n, --no-dns               Disable reverse DNS lookups\n  -e, --explain              Add concise per-port rationale in output\n  -v, --verbose              Show full output sections\n  -f, --file-type <type>     Export format: txt|json|html|csv\n  -o, --output <name>        Output filename\n  -L, --location <dir>       Output directory\n\nNmap-style shortcuts accepted:\n  -sU  -sS  -A  -T0..-T5  -p-\n\nFlag docs mode:\n  nprobe-rs --flag-help --scan\n  nprobe-rs --flag-help -sU\n  nprobe-rs --explain --scan   (legacy alias)\n\nCompatibility:\n  nprobe-rs scan <target> [options] still works.".to_string(),
     )
 }
 
@@ -351,6 +389,24 @@ fn render_flag_explain(raw_query: Option<&str>) -> String {
             "Timing profile (`-T0`..`-T5`). Mapped to internal profiles from stealth to aggressive."
         }
         "p-" | "all-ports" => "Scan all TCP ports 1-65535 (`-p-` or `--all-ports`).",
+        "ratepps" | "rate-pps" => {
+            "Set probe dispatch rate target in packets/sec (`--rate-pps`). Lower values reduce scan pressure."
+        }
+        "burstsize" | "burst-size" => {
+            "Set token-bucket burst size (`--burst-size`) to smooth short-term packet bursts."
+        }
+        "maxretries" | "max-retries" => {
+            "Adaptive retry limit per probe (`--max-retries`, range: 0..20)."
+        }
+        "totalshards" | "total-shards" => {
+            "Enable distributed scanning with total shard count (`--total-shards`)."
+        }
+        "shardindex" | "shard-index" => {
+            "Select shard index for this node (`--shard-index`, requires `--total-shards`)."
+        }
+        "scanseed" | "scan-seed" => {
+            "Use deterministic seed for shuffled probe order (`--scan-seed`)."
+        }
         "v" | "verbose" => "Show extended terminal sections (`-v` or `--verbose`).",
         "e" | "explain" => {
             "When used in scans, `--explain` adds concise per-port rationale lines in output."
@@ -369,6 +425,43 @@ fn render_flag_explain(raw_query: Option<&str>) -> String {
 
 impl ScanArgs {
     fn into_request(self) -> NProbeResult<ScanRequest> {
+        if matches!(self.rate_limit_pps, Some(0)) {
+            return Err(NProbeError::Cli(
+                "--rate-pps must be greater than 0".to_string(),
+            ));
+        }
+        if matches!(self.burst_size, Some(0)) {
+            return Err(NProbeError::Cli(
+                "--burst-size must be greater than 0".to_string(),
+            ));
+        }
+        if let Some(retries) = self.max_retries {
+            if retries > 20 {
+                return Err(NProbeError::Cli(
+                    "--max-retries must be between 0 and 20".to_string(),
+                ));
+            }
+        }
+
+        if matches!(self.total_shards, Some(0) | Some(1)) {
+            return Err(NProbeError::Cli(
+                "--total-shards must be at least 2".to_string(),
+            ));
+        }
+        if self.shard_index.is_some() && self.total_shards.is_none() {
+            return Err(NProbeError::Cli(
+                "--shard-index requires --total-shards".to_string(),
+            ));
+        }
+        if let (Some(total), Some(index)) = (self.total_shards, self.shard_index) {
+            if index >= total {
+                return Err(NProbeError::Cli(format!(
+                    "--shard-index must be < --total-shards (got index={}, total={})",
+                    index, total
+                )));
+            }
+        }
+
         let (ports, top_ports) = if self.all_ports {
             ((1u16..=65535).collect(), None)
         } else if let Some(raw) = self.ports.as_deref() {
@@ -438,6 +531,12 @@ impl ScanArgs {
         let mut timeout_ms = self.timeout_ms;
         let mut concurrency = self.concurrency;
         let mut delay_ms = self.delay_ms;
+        let mut rate_limit_pps = self.rate_limit_pps;
+        let mut burst_size = self.burst_size;
+        let mut max_retries = self.max_retries;
+        let total_shards = self.total_shards;
+        let shard_index = self.shard_index.or_else(|| total_shards.map(|_| 0));
+        let scan_seed = self.scan_seed;
         let mut top_ports = top_ports;
 
         if root_only {
@@ -453,6 +552,15 @@ impl ScanArgs {
             if ports.is_empty() && top_ports.is_none() {
                 top_ports = Some(200);
             }
+            if rate_limit_pps.is_none() {
+                rate_limit_pps = Some(2_000);
+            }
+            if burst_size.is_none() {
+                burst_size = Some(64);
+            }
+            if max_retries.is_none() {
+                max_retries = Some(2);
+            }
         }
 
         Ok(ScanRequest {
@@ -461,7 +569,9 @@ impl ScanArgs {
             top_ports,
             include_udp: self.udp || effective_aggressive_root,
             reverse_dns: self.reverse_dns && !self.no_dns,
-            service_detection: self.service_detect || effective_aggressive_root || !self.no_service_detect,
+            service_detection: self.service_detect
+                || effective_aggressive_root
+                || !self.no_service_detect,
             explain: self.explain,
             verbose: self.verbose,
             report_format,
@@ -478,6 +588,12 @@ impl ScanArgs {
             timeout_ms,
             concurrency,
             delay_ms,
+            rate_limit_pps,
+            burst_size,
+            max_retries,
+            total_shards,
+            shard_index,
+            scan_seed,
         })
     }
 }
@@ -544,7 +660,10 @@ fn should_inject_scan(mapped: &[OsString]) -> bool {
     }
 
     let first = mapped[0].to_string_lossy();
-    !matches!(first.as_ref(), "scan" | "-h" | "--help" | "-V" | "--version")
+    !matches!(
+        first.as_ref(),
+        "scan" | "-h" | "--help" | "-V" | "--version"
+    )
 }
 
 fn map_timing_to_profile(level: &str) -> Option<&'static str> {

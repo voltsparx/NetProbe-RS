@@ -27,4 +27,3 @@ pub enum NProbeError {
     #[error("config error: {0}")]
     Config(String),
 }
-

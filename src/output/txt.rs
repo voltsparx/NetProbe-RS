@@ -65,4 +65,3 @@ pub fn render(report: &ScanReport) -> String {
 
     out
 }
-

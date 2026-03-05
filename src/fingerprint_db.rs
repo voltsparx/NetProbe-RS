@@ -724,4 +724,3 @@ fn count_files_with_extension(root: &Path, ext: &str) -> usize {
     }
     count
 }
-

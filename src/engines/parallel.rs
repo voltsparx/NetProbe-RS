@@ -7,8 +7,8 @@ use std::collections::BTreeSet;
 
 use rayon::prelude::*;
 
-use crate::reporter::scoring;
 use crate::models::{PortFinding, PortState};
+use crate::reporter::scoring;
 
 pub fn compute_risk_and_signals(ports: &[PortFinding]) -> (u8, Vec<String>, usize) {
     let raw_score: u32 = ports.par_iter().map(scoring::score_port).sum();
@@ -45,4 +45,3 @@ pub fn compute_risk_and_signals(ports: &[PortFinding]) -> (u8, Vec<String>, usiz
 
     (risk_score, findings, ports.len() + 1)
 }
-

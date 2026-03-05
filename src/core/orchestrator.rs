@@ -81,6 +81,9 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
         resolved
     };
 
+    let (host_targets, selected_ports, shard_dimension, total_shards, shard_index) =
+        apply_sharding(host_targets, selected_ports, &request, &mut global_warnings)?;
+
     let strategy = strategy::plan(&request, host_targets.len(), selected_ports.len());
     if !request.profile_explicit {
         request.profile = match strategy.mode {
@@ -97,6 +100,18 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
     }
     strategy::apply_runtime_overrides(&mut request, &strategy);
     global_warnings.extend(strategy.notes.iter().cloned());
+    if request.rate_limit_pps != Some(strategy.rate_limit_pps) {
+        global_warnings.push(format!(
+            "custom rate override active: {} pps",
+            request.rate_limit_pps.unwrap_or(strategy.rate_limit_pps)
+        ));
+    }
+    if request.max_retries != Some(strategy.max_retries) {
+        global_warnings.push(format!(
+            "custom retry override active: {}",
+            request.max_retries.unwrap_or(strategy.max_retries)
+        ));
+    }
 
     let mut host_queue = VecDeque::from(host_targets);
     let host_concurrency = host_parallelism(request.profile, strategy.mode, host_queue.len());
@@ -155,9 +170,14 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
                 parallel_tasks,
                 lua_hooks_ran,
                 execution_mode: strategy.mode.as_str().to_string(),
-                configured_rate_pps: strategy.rate_limit_pps,
-                max_retries: strategy.max_retries,
+                configured_rate_pps: request.rate_limit_pps.unwrap_or(strategy.rate_limit_pps),
+                configured_burst_size: request.burst_size.unwrap_or(strategy.burst_size),
+                max_retries: request.max_retries.unwrap_or(strategy.max_retries),
                 host_parallelism: host_concurrency,
+                total_shards,
+                shard_index,
+                shard_dimension: shard_dimension.to_string(),
+                scan_seed: request.scan_seed,
             },
             knowledge: KnowledgeStats {
                 services_loaded: service_registry.service_count(),
@@ -182,6 +202,9 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
             privileged_probes: request.effective_privileged_probes(),
             report_format: request.report_format,
             lab_mode: request.lab_mode,
+            total_shards: request.total_shards,
+            shard_index: request.shard_index,
+            scan_seed: request.scan_seed,
         },
         hosts,
     };
@@ -411,6 +434,66 @@ fn is_termux_env() -> bool {
         .unwrap_or(false)
 }
 
+fn apply_sharding(
+    host_targets: Vec<IpAddr>,
+    selected_ports: Vec<u16>,
+    request: &ScanRequest,
+    warnings: &mut Vec<String>,
+) -> NProbeResult<(Vec<IpAddr>, Vec<u16>, &'static str, u16, u16)> {
+    let Some(total) = request.total_shards else {
+        return Ok((host_targets, selected_ports, "none", 1, 0));
+    };
+    let index = request.shard_index.unwrap_or(0);
+
+    let mut hosts = host_targets;
+    let mut ports = selected_ports;
+    let dimension = if hosts.len() > 1 {
+        hosts = shard_slice(hosts, total, index);
+        "hosts"
+    } else if ports.len() > 1 {
+        ports = shard_slice(ports, total, index);
+        "ports"
+    } else {
+        "none"
+    };
+
+    warnings.push(format!(
+        "sharding active: index={} total={} dimension={}",
+        index, total, dimension
+    ));
+
+    if hosts.is_empty() {
+        return Err(NProbeError::Parse(format!(
+            "shard {} of {} has no hosts to scan",
+            index, total
+        )));
+    }
+    if ports.is_empty() {
+        return Err(NProbeError::Parse(format!(
+            "shard {} of {} has no ports to scan",
+            index, total
+        )));
+    }
+
+    Ok((hosts, ports, dimension, total, index))
+}
+
+fn shard_slice<T>(items: Vec<T>, total_shards: u16, shard_index: u16) -> Vec<T> {
+    let total = total_shards as usize;
+    let index = shard_index as usize;
+    items
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, item)| {
+            if idx % total == index {
+                Some(item)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 fn host_parallelism(profile: ScanProfile, mode: ExecutionMode, host_count: usize) -> usize {
     let base = match profile {
         ScanProfile::Stealth => 1,
@@ -425,4 +508,20 @@ fn host_parallelism(profile: ScanProfile, mode: ExecutionMode, host_count: usize
         ExecutionMode::PacketBlast => 4,
     };
     base.max(mode_floor).min(host_count.max(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shard_slice;
+
+    #[test]
+    fn shard_slice_even_distribution() {
+        let values: Vec<u16> = (0..10).collect();
+        let shard0 = shard_slice(values.clone(), 3, 0);
+        let shard1 = shard_slice(values.clone(), 3, 1);
+        let shard2 = shard_slice(values, 3, 2);
+        assert_eq!(shard0, vec![0, 3, 6, 9]);
+        assert_eq!(shard1, vec![1, 4, 7]);
+        assert_eq!(shard2, vec![2, 5, 8]);
+    }
 }

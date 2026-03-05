@@ -59,4 +59,3 @@ pub async fn write_output(path: &Path, body: &str) -> NProbeResult<()> {
 
     Ok(())
 }
-

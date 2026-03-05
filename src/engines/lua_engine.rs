@@ -48,4 +48,3 @@ pub fn run(host: &HostResult, script_path: Option<&Path>) -> NProbeResult<Vec<St
 
     Ok(findings)
 }
-

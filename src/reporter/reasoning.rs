@@ -44,4 +44,3 @@ fn explain_port(finding: &PortFinding) -> String {
         format!("{state_reason}; reason='{}'", finding.reason)
     }
 }
-

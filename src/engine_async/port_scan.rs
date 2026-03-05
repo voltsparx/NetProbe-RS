@@ -30,9 +30,10 @@ pub async fn run(
         aggressive_root: request.aggressive_root,
         privileged_probes: request.effective_privileged_probes(),
         fingerprint_db,
-        rate_limit_pps: strategy.rate_limit_pps,
-        burst_size: strategy.burst_size,
-        max_retries: strategy.max_retries,
+        rate_limit_pps: request.rate_limit_pps.unwrap_or(strategy.rate_limit_pps),
+        burst_size: request.burst_size.unwrap_or(strategy.burst_size),
+        max_retries: request.max_retries.unwrap_or(strategy.max_retries),
+        scan_seed: request.scan_seed,
     };
 
     let (findings, task_count) = scanner::scan_ports(config, services).await;

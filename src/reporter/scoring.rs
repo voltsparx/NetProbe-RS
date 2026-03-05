@@ -46,4 +46,3 @@ pub fn normalize(raw_score: u32) -> u8 {
     let scaled = (raw_score as f64 * 0.72).round() as u32;
     scaled.min(100) as u8
 }
-

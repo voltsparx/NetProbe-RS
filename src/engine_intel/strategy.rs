@@ -140,6 +140,18 @@ pub fn apply_runtime_overrides(request: &mut ScanRequest, strategy: &ScanStrateg
     if request.delay_ms.is_none() {
         request.delay_ms = Some(strategy.recommended_delay.as_millis() as u64);
     }
+
+    if request.rate_limit_pps.is_none() {
+        request.rate_limit_pps = Some(strategy.rate_limit_pps);
+    }
+
+    if request.burst_size.is_none() {
+        request.burst_size = Some(strategy.burst_size);
+    }
+
+    if request.max_retries.is_none() {
+        request.max_retries = Some(strategy.max_retries);
+    }
 }
 
 #[cfg(test)]
@@ -171,6 +183,12 @@ mod tests {
             timeout_ms: None,
             concurrency: None,
             delay_ms: None,
+            rate_limit_pps: None,
+            burst_size: None,
+            max_retries: None,
+            total_shards: None,
+            shard_index: None,
+            scan_seed: None,
         }
     }
 

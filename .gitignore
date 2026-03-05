@@ -23,6 +23,7 @@ output/
 #----------------------
 self-assesment/
 intel-source/
+cooking-reverse-engineering/
 *tree.txt
 *reverse-engineer.txt
 some-self-reverse-engineering-notes-cause-why-not.txt

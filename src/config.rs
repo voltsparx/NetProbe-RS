@@ -71,6 +71,27 @@ pub fn apply_defaults(request: &mut ScanRequest) -> NProbeResult<()> {
             .and_then(|v| v.parse::<u64>().ok());
     }
 
+    if request.rate_limit_pps.is_none() {
+        request.rate_limit_pps = kv
+            .get("default_rate_pps")
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|v| *v > 0);
+    }
+
+    if request.burst_size.is_none() {
+        request.burst_size = kv
+            .get("default_burst_size")
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0);
+    }
+
+    if request.max_retries.is_none() {
+        request.max_retries = kv
+            .get("default_max_retries")
+            .and_then(|v| v.parse::<u8>().ok())
+            .filter(|v| *v <= 20);
+    }
+
     if request.top_ports.is_none() && request.ports.is_empty() {
         request.top_ports = Some(100);
     }
@@ -146,6 +167,45 @@ fn update_runtime_values(kv: &mut BTreeMap<String, String>, request: &ScanReques
             .map(|p| p.display().to_string())
             .unwrap_or_default(),
     );
+    kv.insert(
+        "last_rate_pps".to_string(),
+        request
+            .rate_limit_pps
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+    );
+    kv.insert(
+        "last_burst_size".to_string(),
+        request
+            .burst_size
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+    );
+    kv.insert(
+        "last_max_retries".to_string(),
+        request
+            .max_retries
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+    );
+    kv.insert(
+        "last_total_shards".to_string(),
+        request
+            .total_shards
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+    );
+    kv.insert(
+        "last_shard_index".to_string(),
+        request
+            .shard_index
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+    );
+    kv.insert(
+        "last_scan_seed".to_string(),
+        request.scan_seed.map(|v| v.to_string()).unwrap_or_default(),
+    );
 
     let run_count = kv
         .get("run_count")
@@ -201,6 +261,9 @@ fn default_config_map() -> BTreeMap<String, String> {
     map.insert("default_timeout_ms".to_string(), "1200".to_string());
     map.insert("default_concurrency".to_string(), "128".to_string());
     map.insert("default_delay_ms".to_string(), "5".to_string());
+    map.insert("default_rate_pps".to_string(), "0".to_string());
+    map.insert("default_burst_size".to_string(), "0".to_string());
+    map.insert("default_max_retries".to_string(), "0".to_string());
     map.insert("default_file_type".to_string(), "txt".to_string());
     map.insert("default_lab_mode".to_string(), "false".to_string());
     map.insert("default_allow_external".to_string(), "false".to_string());
@@ -278,4 +341,3 @@ fn parse_profile(raw: &String) -> Option<ScanProfile> {
         _ => None,
     }
 }
-

@@ -56,4 +56,3 @@ pub fn render(report: &ScanReport) -> NProbeResult<String> {
     String::from_utf8(bytes)
         .map_err(|err| NProbeError::Parse(format!("utf8 conversion failed: {err}")))
 }
-

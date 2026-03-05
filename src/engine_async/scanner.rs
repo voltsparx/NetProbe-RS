@@ -36,6 +36,7 @@ pub struct AsyncScanConfig {
     pub rate_limit_pps: u32,
     pub burst_size: usize,
     pub max_retries: u8,
+    pub scan_seed: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -69,7 +70,11 @@ struct AdaptiveProbeController {
 
 #[derive(Debug, Clone)]
 struct RateGovernor {
-    rate_pps: u32,
+    configured_rate_pps: u32,
+    effective_rate_pps: f64,
+    min_rate_pps: f64,
+    max_rate_pps: f64,
+    success_credit: u8,
     burst_size: usize,
     tokens: f64,
     last_refill: Instant,
@@ -184,8 +189,18 @@ impl AdaptiveProbeController {
 impl RateGovernor {
     fn new(rate_pps: u32, burst_size: usize) -> Self {
         let burst = burst_size.max(1);
+        let max_rate_pps = rate_pps as f64;
+        let min_rate_pps = if rate_pps == 0 {
+            0.0
+        } else {
+            (max_rate_pps * 0.10).max(64.0)
+        };
         Self {
-            rate_pps,
+            configured_rate_pps: rate_pps,
+            effective_rate_pps: max_rate_pps,
+            min_rate_pps,
+            max_rate_pps,
+            success_credit: 0,
             burst_size: burst,
             tokens: burst as f64,
             last_refill: Instant::now(),
@@ -193,7 +208,7 @@ impl RateGovernor {
     }
 
     async fn wait_for_slot(&mut self) {
-        if self.rate_pps == 0 {
+        if self.configured_rate_pps == 0 {
             return;
         }
 
@@ -205,16 +220,18 @@ impl RateGovernor {
             }
 
             let missing = (1.0 - self.tokens).max(0.01);
-            let wait_secs = missing / self.rate_pps as f64;
-            let wait = Duration::from_secs_f64(wait_secs).clamp(
-                Duration::from_millis(1),
-                Duration::from_millis(50),
-            );
+            let wait_secs = missing / self.effective_rate_pps.max(1.0);
+            let wait = Duration::from_secs_f64(wait_secs)
+                .clamp(Duration::from_millis(1), Duration::from_millis(50));
             tokio::time::sleep(wait).await;
         }
     }
 
     fn refill(&mut self) {
+        if self.configured_rate_pps == 0 {
+            return;
+        }
+
         let now = Instant::now();
         let elapsed = now.saturating_duration_since(self.last_refill);
         self.last_refill = now;
@@ -222,8 +239,57 @@ impl RateGovernor {
             return;
         }
 
-        let added = elapsed.as_secs_f64() * self.rate_pps as f64;
-        self.tokens = (self.tokens + added).min(self.burst_size as f64);
+        let added = elapsed.as_secs_f64() * self.effective_rate_pps.max(1.0);
+        self.tokens = (self.tokens + added).min(self.effective_burst_cap());
+    }
+
+    fn observe(&mut self, feedback: ProbeFeedback) {
+        if self.configured_rate_pps == 0 {
+            return;
+        }
+
+        match feedback {
+            ProbeFeedback::Success(_) => {
+                self.success_credit = self.success_credit.saturating_add(1);
+                if self.success_credit >= 10 {
+                    let add_step = (self.max_rate_pps * 0.04).max(16.0);
+                    self.effective_rate_pps =
+                        (self.effective_rate_pps + add_step).min(self.max_rate_pps);
+                    self.success_credit = 0;
+                }
+            }
+            ProbeFeedback::Timeout => {
+                self.success_credit = 0;
+                let downshift = if self.effective_rate_pps > self.max_rate_pps * 0.55 {
+                    0.78
+                } else {
+                    0.88
+                };
+                self.effective_rate_pps = (self.effective_rate_pps * downshift)
+                    .clamp(self.min_rate_pps, self.max_rate_pps);
+            }
+            ProbeFeedback::Error => {
+                self.success_credit = 0;
+                self.effective_rate_pps =
+                    (self.effective_rate_pps * 0.92).clamp(self.min_rate_pps, self.max_rate_pps);
+            }
+        }
+
+        self.tokens = self.tokens.min(self.effective_burst_cap());
+    }
+
+    fn effective_burst_cap(&self) -> f64 {
+        if self.configured_rate_pps == 0 {
+            return self.burst_size as f64;
+        }
+
+        let ratio = if self.max_rate_pps > 0.0 {
+            (self.effective_rate_pps / self.max_rate_pps).clamp(0.10, 1.0)
+        } else {
+            1.0
+        };
+        let scaled = (self.burst_size as f64 * ratio).ceil();
+        scaled.clamp(4.0, self.burst_size as f64)
     }
 }
 
@@ -255,7 +321,7 @@ pub async fn scan_ports(
 async fn scan_tcp(config: &AsyncScanConfig, services: Arc<ServiceRegistry>) -> Vec<PortFinding> {
     let mut queue = VecDeque::from(shuffled_ports(
         &config.ports,
-        protocol_seed(config.target, 0x5450_435f_5343_414e),
+        protocol_seed(config.target, 0x5450_435f_5343_414e, config.scan_seed),
     ));
     let mut in_flight = FuturesUnordered::new();
     let mut findings = Vec::with_capacity(config.ports.len());
@@ -266,9 +332,13 @@ async fn scan_tcp(config: &AsyncScanConfig, services: Arc<ServiceRegistry>) -> V
     let mut governor = RateGovernor::new(config.rate_limit_pps, config.burst_size);
 
     while !queue.is_empty() || !in_flight.is_empty() {
-        let max_window = {
+        let (max_window, timeout_value, dispatch_delay) = {
             let state = control.lock().await;
-            state.current_window().max(1)
+            (
+                state.current_window().max(1),
+                state.current_timeout(),
+                state.dispatch_delay(config.dispatch_delay),
+            )
         };
 
         while in_flight.len() < max_window {
@@ -276,11 +346,6 @@ async fn scan_tcp(config: &AsyncScanConfig, services: Arc<ServiceRegistry>) -> V
                 break;
             };
             governor.wait_for_slot().await;
-
-            let timeout_value = {
-                let state = control.lock().await;
-                state.current_timeout()
-            };
 
             let service_registry = services.clone();
             let target = config.target;
@@ -305,10 +370,6 @@ async fn scan_tcp(config: &AsyncScanConfig, services: Arc<ServiceRegistry>) -> V
                 .await
             }));
 
-            let dispatch_delay = {
-                let state = control.lock().await;
-                state.dispatch_delay(config.dispatch_delay)
-            };
             if !dispatch_delay.is_zero() {
                 tokio::time::sleep(dispatch_delay).await;
             }
@@ -318,6 +379,7 @@ async fn scan_tcp(config: &AsyncScanConfig, services: Arc<ServiceRegistry>) -> V
             if let Ok(finding) = joined {
                 let feedback = classify_feedback(&finding);
                 control.lock().await.observe(feedback);
+                governor.observe(feedback);
                 findings.push(finding);
             }
         }
@@ -329,7 +391,7 @@ async fn scan_tcp(config: &AsyncScanConfig, services: Arc<ServiceRegistry>) -> V
 async fn scan_udp(config: &AsyncScanConfig, services: Arc<ServiceRegistry>) -> Vec<PortFinding> {
     let mut queue = VecDeque::from(shuffled_ports(
         &config.ports,
-        protocol_seed(config.target, 0x5544_505f_5343_414e),
+        protocol_seed(config.target, 0x5544_505f_5343_414e, config.scan_seed),
     ));
     let mut in_flight = FuturesUnordered::new();
     let mut findings = Vec::with_capacity(config.ports.len());
@@ -340,9 +402,13 @@ async fn scan_udp(config: &AsyncScanConfig, services: Arc<ServiceRegistry>) -> V
     let mut governor = RateGovernor::new(config.rate_limit_pps, config.burst_size);
 
     while !queue.is_empty() || !in_flight.is_empty() {
-        let max_window = {
+        let (max_window, timeout_value, dispatch_delay) = {
             let state = control.lock().await;
-            state.current_window().max(1)
+            (
+                state.current_window().max(1),
+                state.current_timeout(),
+                state.dispatch_delay(config.dispatch_delay),
+            )
         };
 
         while in_flight.len() < max_window {
@@ -350,11 +416,6 @@ async fn scan_udp(config: &AsyncScanConfig, services: Arc<ServiceRegistry>) -> V
                 break;
             };
             governor.wait_for_slot().await;
-
-            let timeout_value = {
-                let state = control.lock().await;
-                state.current_timeout()
-            };
 
             let service_registry = services.clone();
             let target = config.target;
@@ -377,10 +438,6 @@ async fn scan_udp(config: &AsyncScanConfig, services: Arc<ServiceRegistry>) -> V
                 .await
             }));
 
-            let dispatch_delay = {
-                let state = control.lock().await;
-                state.dispatch_delay(config.dispatch_delay)
-            };
             if !dispatch_delay.is_zero() {
                 tokio::time::sleep(dispatch_delay).await;
             }
@@ -390,6 +447,7 @@ async fn scan_udp(config: &AsyncScanConfig, services: Arc<ServiceRegistry>) -> V
             if let Ok(finding) = joined {
                 let feedback = classify_feedback(&finding);
                 control.lock().await.observe(feedback);
+                governor.observe(feedback);
                 findings.push(finding);
             }
         }
@@ -458,7 +516,7 @@ fn xorshift64(mut value: u64) -> u64 {
     value
 }
 
-fn protocol_seed(target: IpAddr, marker: u64) -> u64 {
+fn protocol_seed(target: IpAddr, marker: u64, custom_seed: Option<u64>) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -477,7 +535,7 @@ fn protocol_seed(target: IpAddr, marker: u64) -> u64 {
             }
         }
     }
-    seed
+    seed ^ custom_seed.unwrap_or(0)
 }
 
 async fn scan_one_tcp(
@@ -557,7 +615,10 @@ async fn scan_one_tcp(
                 finding.reason = if retry_index == 0 && aggressive_root {
                     "tcp handshake completed on aggressive retry".to_string()
                 } else {
-                    format!("tcp handshake completed on adaptive retry {}", retry_index + 1)
+                    format!(
+                        "tcp handshake completed on adaptive retry {}",
+                        retry_index + 1
+                    )
                 };
                 finding.latency_ms = Some(start.elapsed().as_millis());
                 open_stream = Some(stream);
@@ -736,7 +797,10 @@ async fn scan_one_udp(
                 finding.reason = if retry_index == 0 && aggressive_root {
                     "udp response payload received on aggressive retry".to_string()
                 } else {
-                    format!("udp response payload received on adaptive retry {}", retry_index + 1)
+                    format!(
+                        "udp response payload received on adaptive retry {}",
+                        retry_index + 1
+                    )
                 };
                 finding.latency_ms = Some(start.elapsed().as_millis());
                 finding.banner = Some(sanitize_banner(&buffer));
@@ -762,13 +826,17 @@ async fn scan_one_udp(
                 finding.reason = if retry_index == 0 && aggressive_root {
                     "icmp port unreachable on aggressive retry".to_string()
                 } else {
-                    format!("icmp port unreachable on adaptive retry {}", retry_index + 1)
+                    format!(
+                        "icmp port unreachable on adaptive retry {}",
+                        retry_index + 1
+                    )
                 };
                 finding.latency_ms = Some(start.elapsed().as_millis());
                 break;
             }
             UdpProbeOutcome::NoReply => {
-                finding.reason = format!("{}; retry {} got no reply", finding.reason, retry_index + 1);
+                finding.reason =
+                    format!("{}; retry {} got no reply", finding.reason, retry_index + 1);
             }
             UdpProbeOutcome::Error(err) => {
                 finding.reason = format!(
@@ -1056,5 +1124,30 @@ mod tests {
         let window = control.current_window();
         assert!(window < 512);
         assert!(window >= 4);
+    }
+
+    #[test]
+    fn governor_backs_off_under_timeouts() {
+        let mut governor = RateGovernor::new(8_000, 128);
+        let baseline = governor.effective_rate_pps;
+        for _ in 0..6 {
+            governor.observe(ProbeFeedback::Timeout);
+        }
+        assert!(governor.effective_rate_pps < baseline);
+        assert!(governor.effective_rate_pps >= governor.min_rate_pps);
+    }
+
+    #[test]
+    fn governor_recovers_after_stable_success() {
+        let mut governor = RateGovernor::new(6_000, 96);
+        for _ in 0..5 {
+            governor.observe(ProbeFeedback::Timeout);
+        }
+        let slowed = governor.effective_rate_pps;
+        for _ in 0..40 {
+            governor.observe(ProbeFeedback::Success(Duration::from_millis(50)));
+        }
+        assert!(governor.effective_rate_pps > slowed);
+        assert!(governor.effective_rate_pps <= governor.max_rate_pps);
     }
 }

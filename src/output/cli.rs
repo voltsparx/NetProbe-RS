@@ -11,13 +11,22 @@ pub fn render(report: &ScanReport) -> String {
         env!("CARGO_PKG_VERSION"),
         report.metadata.started_at
     ));
+    let shard_display = report.metadata.engine_stats.shard_index.saturating_add(1);
     out.push_str(&format!(
-        "Engine mode: {} | rate target: {} pps | retries: {} | host parallelism: {}\n",
+        "Engine mode: {} | rate: {} pps (burst {}) | retries: {} | host parallelism: {} | shard: {}/{} ({})\n",
         report.metadata.engine_stats.execution_mode,
         report.metadata.engine_stats.configured_rate_pps,
+        report.metadata.engine_stats.configured_burst_size,
         report.metadata.engine_stats.max_retries,
-        report.metadata.engine_stats.host_parallelism
+        report.metadata.engine_stats.host_parallelism,
+        shard_display,
+        report.metadata.engine_stats.total_shards,
+        report.metadata.engine_stats.shard_dimension
     ));
+
+    if let Some(seed) = report.metadata.engine_stats.scan_seed {
+        out.push_str(&format!("Scan seed: {seed}\n"));
+    }
 
     for host in &report.hosts {
         out.push_str(&format!(
@@ -136,7 +145,11 @@ pub fn render(report: &ScanReport) -> String {
         .count();
     let seconds = report.metadata.duration_ms.max(0) as f64 / 1000.0;
     let ip_word = if scanned == 1 { "address" } else { "addresses" };
-    let host_word = if hosts_responded == 1 { "host" } else { "hosts" };
+    let host_word = if hosts_responded == 1 {
+        "host"
+    } else {
+        "hosts"
+    };
 
     out.push_str(&format!(
         "\nNProbe done: {} IP {} ({} {} responded) scanned in {:.2} seconds\n",

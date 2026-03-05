@@ -42,4 +42,3 @@ pub async fn emit(
     }
     Ok(())
 }
-

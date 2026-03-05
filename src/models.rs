@@ -122,6 +122,12 @@ pub struct ScanRequest {
     pub timeout_ms: Option<u64>,
     pub concurrency: Option<usize>,
     pub delay_ms: Option<u64>,
+    pub rate_limit_pps: Option<u32>,
+    pub burst_size: Option<usize>,
+    pub max_retries: Option<u8>,
+    pub total_shards: Option<u16>,
+    pub shard_index: Option<u16>,
+    pub scan_seed: Option<u64>,
 }
 
 impl ScanRequest {
@@ -210,8 +216,13 @@ pub struct EngineStats {
     pub lua_hooks_ran: bool,
     pub execution_mode: String,
     pub configured_rate_pps: u32,
+    pub configured_burst_size: usize,
     pub max_retries: u8,
     pub host_parallelism: usize,
+    pub total_shards: u16,
+    pub shard_index: u16,
+    pub shard_dimension: String,
+    pub scan_seed: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -227,6 +238,9 @@ pub struct ScanRequestSummary {
     pub privileged_probes: bool,
     pub report_format: ReportFormat,
     pub lab_mode: bool,
+    pub total_shards: Option<u16>,
+    pub shard_index: Option<u16>,
+    pub scan_seed: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -256,4 +270,3 @@ pub struct ScanReport {
     pub request: ScanRequestSummary,
     pub hosts: Vec<HostResult>,
 }
-

@@ -14,4 +14,3 @@ pub async fn resolve(target: &str) -> NProbeResult<Vec<IpAddr>> {
 pub async fn reverse(ip: IpAddr) -> Option<String> {
     thread_pool::reverse_lookup(ip).await
 }
-

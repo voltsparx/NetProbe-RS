@@ -52,4 +52,3 @@ pub fn generate_findings(host: &HostResult) -> Vec<String> {
 
     findings
 }
-
