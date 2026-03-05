@@ -11,6 +11,13 @@ pub fn render(report: &ScanReport) -> String {
         env!("CARGO_PKG_VERSION"),
         report.metadata.started_at
     ));
+    out.push_str(&format!(
+        "Engine mode: {} | rate target: {} pps | retries: {} | host parallelism: {}\n",
+        report.metadata.engine_stats.execution_mode,
+        report.metadata.engine_stats.configured_rate_pps,
+        report.metadata.engine_stats.max_retries,
+        report.metadata.engine_stats.host_parallelism
+    ));
 
     for host in &report.hosts {
         out.push_str(&format!(

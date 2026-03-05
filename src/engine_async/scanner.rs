@@ -33,6 +33,9 @@ pub struct AsyncScanConfig {
     pub aggressive_root: bool,
     pub privileged_probes: bool,
     pub fingerprint_db: Arc<FingerprintDatabase>,
+    pub rate_limit_pps: u32,
+    pub burst_size: usize,
+    pub max_retries: u8,
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +65,14 @@ struct AdaptiveProbeController {
     timeout_count: u64,
     error_count: u64,
     max_window: usize,
+}
+
+#[derive(Debug, Clone)]
+struct RateGovernor {
+    rate_pps: u32,
+    burst_size: usize,
+    tokens: f64,
+    last_refill: Instant,
 }
 
 impl AdaptiveProbeController {
@@ -170,6 +181,52 @@ impl AdaptiveProbeController {
     }
 }
 
+impl RateGovernor {
+    fn new(rate_pps: u32, burst_size: usize) -> Self {
+        let burst = burst_size.max(1);
+        Self {
+            rate_pps,
+            burst_size: burst,
+            tokens: burst as f64,
+            last_refill: Instant::now(),
+        }
+    }
+
+    async fn wait_for_slot(&mut self) {
+        if self.rate_pps == 0 {
+            return;
+        }
+
+        loop {
+            self.refill();
+            if self.tokens >= 1.0 {
+                self.tokens -= 1.0;
+                return;
+            }
+
+            let missing = (1.0 - self.tokens).max(0.01);
+            let wait_secs = missing / self.rate_pps as f64;
+            let wait = Duration::from_secs_f64(wait_secs).clamp(
+                Duration::from_millis(1),
+                Duration::from_millis(50),
+            );
+            tokio::time::sleep(wait).await;
+        }
+    }
+
+    fn refill(&mut self) {
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(self.last_refill);
+        self.last_refill = now;
+        if elapsed.is_zero() {
+            return;
+        }
+
+        let added = elapsed.as_secs_f64() * self.rate_pps as f64;
+        self.tokens = (self.tokens + added).min(self.burst_size as f64);
+    }
+}
+
 pub async fn scan_ports(
     config: AsyncScanConfig,
     services: Arc<ServiceRegistry>,
@@ -206,6 +263,7 @@ async fn scan_tcp(config: &AsyncScanConfig, services: Arc<ServiceRegistry>) -> V
         config.timeout,
         config.concurrency,
     )));
+    let mut governor = RateGovernor::new(config.rate_limit_pps, config.burst_size);
 
     while !queue.is_empty() || !in_flight.is_empty() {
         let max_window = {
@@ -217,6 +275,7 @@ async fn scan_tcp(config: &AsyncScanConfig, services: Arc<ServiceRegistry>) -> V
             let Some(port) = queue.pop_front() else {
                 break;
             };
+            governor.wait_for_slot().await;
 
             let timeout_value = {
                 let state = control.lock().await;
@@ -229,6 +288,7 @@ async fn scan_tcp(config: &AsyncScanConfig, services: Arc<ServiceRegistry>) -> V
             let aggressive_root = config.aggressive_root;
             let privileged_probes = config.privileged_probes;
             let fingerprint_db = config.fingerprint_db.clone();
+            let max_retries = config.max_retries;
 
             in_flight.push(tokio::spawn(async move {
                 scan_one_tcp(
@@ -238,6 +298,7 @@ async fn scan_tcp(config: &AsyncScanConfig, services: Arc<ServiceRegistry>) -> V
                     service_detection,
                     aggressive_root,
                     privileged_probes,
+                    max_retries,
                     service_registry,
                     fingerprint_db,
                 )
@@ -276,6 +337,7 @@ async fn scan_udp(config: &AsyncScanConfig, services: Arc<ServiceRegistry>) -> V
         config.timeout,
         config.concurrency,
     )));
+    let mut governor = RateGovernor::new(config.rate_limit_pps, config.burst_size);
 
     while !queue.is_empty() || !in_flight.is_empty() {
         let max_window = {
@@ -287,6 +349,7 @@ async fn scan_udp(config: &AsyncScanConfig, services: Arc<ServiceRegistry>) -> V
             let Some(port) = queue.pop_front() else {
                 break;
             };
+            governor.wait_for_slot().await;
 
             let timeout_value = {
                 let state = control.lock().await;
@@ -298,6 +361,7 @@ async fn scan_udp(config: &AsyncScanConfig, services: Arc<ServiceRegistry>) -> V
             let aggressive_root = config.aggressive_root;
             let privileged_probes = config.privileged_probes;
             let fingerprint_db = config.fingerprint_db.clone();
+            let max_retries = config.max_retries;
 
             in_flight.push(tokio::spawn(async move {
                 scan_one_udp(
@@ -306,6 +370,7 @@ async fn scan_udp(config: &AsyncScanConfig, services: Arc<ServiceRegistry>) -> V
                     timeout_value,
                     aggressive_root,
                     privileged_probes,
+                    max_retries,
                     service_registry,
                     fingerprint_db,
                 )
@@ -422,6 +487,7 @@ async fn scan_one_tcp(
     service_detection: bool,
     aggressive_root: bool,
     privileged_probes: bool,
+    max_retries: u8,
     services: Arc<ServiceRegistry>,
     fingerprint_db: Arc<FingerprintDatabase>,
 ) -> PortFinding {
@@ -476,30 +542,47 @@ async fn scan_one_tcp(
         }
     }
 
-    if aggressive_root && matches!(finding.state, PortState::Filtered) {
+    let adaptive_retry_budget = max_retries as usize + usize::from(aggressive_root);
+    for retry_index in 0..adaptive_retry_budget {
+        if !matches!(finding.state, PortState::Filtered) {
+            break;
+        }
+
         let retry_timeout = timeout_value
             .max(Duration::from_millis(450))
-            .saturating_add(Duration::from_millis(250));
+            .saturating_add(Duration::from_millis(200 + (retry_index as u64 * 120)));
         match timeout(retry_timeout, connect_tcp(target, port, privileged_probes)).await {
             Ok(Ok(stream)) => {
                 finding.state = PortState::Open;
-                finding.reason = "tcp handshake completed on aggressive retry".to_string();
+                finding.reason = if retry_index == 0 && aggressive_root {
+                    "tcp handshake completed on aggressive retry".to_string()
+                } else {
+                    format!("tcp handshake completed on adaptive retry {}", retry_index + 1)
+                };
                 finding.latency_ms = Some(start.elapsed().as_millis());
                 open_stream = Some(stream);
+                break;
             }
             Ok(Err(err)) if err.kind() == io::ErrorKind::ConnectionRefused => {
                 finding.state = PortState::Closed;
-                finding.reason = "connection refused on aggressive retry".to_string();
+                finding.reason = if retry_index == 0 && aggressive_root {
+                    "connection refused on aggressive retry".to_string()
+                } else {
+                    format!("connection refused on adaptive retry {}", retry_index + 1)
+                };
                 finding.latency_ms = Some(start.elapsed().as_millis());
+                break;
             }
             Ok(Err(err)) => {
                 finding.reason = format!(
-                    "{}; aggressive retry connect error: {}",
-                    finding.reason, err
+                    "{}; retry {} connect error: {}",
+                    finding.reason,
+                    retry_index + 1,
+                    err
                 );
             }
             Err(_) => {
-                finding.reason = format!("{}; aggressive retry timed out", finding.reason);
+                finding.reason = format!("{}; retry {} timed out", finding.reason, retry_index + 1);
             }
         }
     }
@@ -538,6 +621,7 @@ async fn scan_one_udp(
     timeout_value: Duration,
     aggressive_root: bool,
     privileged_probes: bool,
+    max_retries: u8,
     services: Arc<ServiceRegistry>,
     fingerprint_db: Arc<FingerprintDatabase>,
 ) -> PortFinding {
@@ -624,14 +708,17 @@ async fn scan_one_udp(
         }
     }
 
-    if aggressive_root
-        && matches!(
+    let adaptive_retry_budget = max_retries as usize + usize::from(aggressive_root);
+    for retry_index in 0..adaptive_retry_budget {
+        if !matches!(
             finding.state,
             PortState::OpenOrFiltered | PortState::Filtered
-        )
-    {
+        ) {
+            break;
+        }
+
         let retry_payload = payloads
-            .get(1)
+            .get((retry_index + 1).min(payloads.len().saturating_sub(1)))
             .cloned()
             .unwrap_or_else(|| payloads[0].clone());
         match udp_probe_once(
@@ -639,14 +726,18 @@ async fn scan_one_udp(
             &retry_payload,
             timeout_value
                 .max(Duration::from_millis(450))
-                .saturating_add(Duration::from_millis(250)),
-            Duration::from_millis(650),
+                .saturating_add(Duration::from_millis(200 + (retry_index as u64 * 140))),
+            Duration::from_millis(650 + (retry_index as u64 * 120)),
         )
         .await
         {
             UdpProbeOutcome::Response(buffer) => {
                 finding.state = PortState::Open;
-                finding.reason = "udp response payload received on aggressive retry".to_string();
+                finding.reason = if retry_index == 0 && aggressive_root {
+                    "udp response payload received on aggressive retry".to_string()
+                } else {
+                    format!("udp response payload received on adaptive retry {}", retry_index + 1)
+                };
                 finding.latency_ms = Some(start.elapsed().as_millis());
                 finding.banner = Some(sanitize_banner(&buffer));
                 if let Some(matched) =
@@ -664,17 +755,28 @@ async fn scan_one_udp(
                     finding.matched_by = Some("banner-heuristic".to_string());
                     finding.confidence = Some(0.56);
                 }
+                break;
             }
             UdpProbeOutcome::Closed => {
                 finding.state = PortState::Closed;
-                finding.reason = "icmp port unreachable on aggressive retry".to_string();
+                finding.reason = if retry_index == 0 && aggressive_root {
+                    "icmp port unreachable on aggressive retry".to_string()
+                } else {
+                    format!("icmp port unreachable on adaptive retry {}", retry_index + 1)
+                };
                 finding.latency_ms = Some(start.elapsed().as_millis());
+                break;
             }
             UdpProbeOutcome::NoReply => {
-                finding.reason = format!("{}; aggressive retry got no reply", finding.reason);
+                finding.reason = format!("{}; retry {} got no reply", finding.reason, retry_index + 1);
             }
             UdpProbeOutcome::Error(err) => {
-                finding.reason = format!("{}; aggressive retry error: {}", finding.reason, err);
+                finding.reason = format!(
+                    "{}; retry {} error: {}",
+                    finding.reason,
+                    retry_index + 1,
+                    err
+                );
             }
         }
     }

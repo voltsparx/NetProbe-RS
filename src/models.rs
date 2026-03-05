@@ -208,6 +208,10 @@ pub struct EngineStats {
     pub thread_pool_tasks: usize,
     pub parallel_tasks: usize,
     pub lua_hooks_ran: bool,
+    pub execution_mode: String,
+    pub configured_rate_pps: u32,
+    pub max_retries: u8,
+    pub host_parallelism: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

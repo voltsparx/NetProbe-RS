@@ -4,6 +4,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use crate::engine_async::scanner::{self, AsyncScanConfig};
+use crate::engine_intel::strategy::ScanStrategy;
 use crate::error::NProbeResult;
 use crate::fingerprint_db::FingerprintDatabase;
 use crate::models::{HostResult, ScanRequest};
@@ -15,6 +16,7 @@ pub async fn run(
     ports: Vec<u16>,
     services: Arc<ServiceRegistry>,
     fingerprint_db: Arc<FingerprintDatabase>,
+    strategy: &ScanStrategy,
 ) -> NProbeResult<(HostResult, usize)> {
     let runtime = request.runtime_settings();
     let config = AsyncScanConfig {
@@ -28,6 +30,9 @@ pub async fn run(
         aggressive_root: request.aggressive_root,
         privileged_probes: request.effective_privileged_probes(),
         fingerprint_db,
+        rate_limit_pps: strategy.rate_limit_pps,
+        burst_size: strategy.burst_size,
+        max_retries: strategy.max_retries,
     };
 
     let (findings, task_count) = scanner::scan_ports(config, services).await;

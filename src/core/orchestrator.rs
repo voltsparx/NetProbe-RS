@@ -12,7 +12,10 @@ use chrono::Utc;
 use futures::stream::{FuturesUnordered, StreamExt};
 
 use crate::engine_async::port_scan;
-use crate::engine_intel::analysis;
+use crate::engine_intel::{
+    analysis,
+    strategy::{self, ExecutionMode, ScanStrategy},
+};
 use crate::engine_parallel::dns;
 use crate::engine_plugin::lua;
 use crate::engine_report::reporting;
@@ -78,8 +81,25 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
         resolved
     };
 
+    let strategy = strategy::plan(&request, host_targets.len(), selected_ports.len());
+    if !request.profile_explicit {
+        request.profile = match strategy.mode {
+            ExecutionMode::Async => {
+                if request.strict_safety || request.lab_mode {
+                    ScanProfile::Stealth
+                } else {
+                    ScanProfile::Balanced
+                }
+            }
+            ExecutionMode::Hybrid => ScanProfile::Turbo,
+            ExecutionMode::PacketBlast => ScanProfile::Aggressive,
+        };
+    }
+    strategy::apply_runtime_overrides(&mut request, &strategy);
+    global_warnings.extend(strategy.notes.iter().cloned());
+
     let mut host_queue = VecDeque::from(host_targets);
-    let host_concurrency = host_parallelism(request.profile, host_queue.len());
+    let host_concurrency = host_parallelism(request.profile, strategy.mode, host_queue.len());
     let mut in_flight = FuturesUnordered::new();
     let mut hosts = Vec::new();
     let mut async_tasks = 0usize;
@@ -97,6 +117,7 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
             global_warnings.clone(),
             service_registry.clone(),
             fingerprint_db.clone(),
+            strategy.clone(),
         ));
     }
 
@@ -116,6 +137,7 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
                 global_warnings.clone(),
                 service_registry.clone(),
                 fingerprint_db.clone(),
+                strategy.clone(),
             ));
         }
     }
@@ -132,6 +154,10 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
                 thread_pool_tasks,
                 parallel_tasks,
                 lua_hooks_ran,
+                execution_mode: strategy.mode.as_str().to_string(),
+                configured_rate_pps: strategy.rate_limit_pps,
+                max_retries: strategy.max_retries,
+                host_parallelism: host_concurrency,
             },
             knowledge: KnowledgeStats {
                 services_loaded: service_registry.service_count(),
@@ -176,6 +202,7 @@ async fn process_host(
     global_warnings: Vec<String>,
     service_registry: Arc<ServiceRegistry>,
     fingerprint_db: Arc<FingerprintDatabase>,
+    strategy: ScanStrategy,
 ) -> NProbeResult<HostExecution> {
     let (mut host, async_tasks) = port_scan::run(
         &request,
@@ -183,6 +210,7 @@ async fn process_host(
         selected_ports,
         service_registry,
         fingerprint_db,
+        &strategy,
     )
     .await?;
     host.warnings.extend(global_warnings);
@@ -383,7 +411,7 @@ fn is_termux_env() -> bool {
         .unwrap_or(false)
 }
 
-fn host_parallelism(profile: ScanProfile, host_count: usize) -> usize {
+fn host_parallelism(profile: ScanProfile, mode: ExecutionMode, host_count: usize) -> usize {
     let base = match profile {
         ScanProfile::Stealth => 1,
         ScanProfile::Balanced => 2,
@@ -391,5 +419,10 @@ fn host_parallelism(profile: ScanProfile, host_count: usize) -> usize {
         ScanProfile::Aggressive => 6,
         ScanProfile::RootOnly => 2,
     };
-    base.min(host_count.max(1))
+    let mode_floor = match mode {
+        ExecutionMode::Async => 1,
+        ExecutionMode::Hybrid => 2,
+        ExecutionMode::PacketBlast => 4,
+    };
+    base.max(mode_floor).min(host_count.max(1))
 }
