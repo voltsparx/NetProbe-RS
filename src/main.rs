@@ -24,7 +24,7 @@ use std::path::Path;
 use std::process::{Command, ExitStatus};
 
 use crate::cli::Cli;
-use crate::error::{NetProbeError, NetProbeResult};
+use crate::error::{NProbeError, NProbeResult};
 use crate::models::ScanRequest;
 
 #[tokio::main]
@@ -35,7 +35,7 @@ async fn main() {
     }
 }
 
-async fn run() -> NetProbeResult<()> {
+async fn run() -> NProbeResult<()> {
     if let Some(help_text) = cli::maybe_render_quick_help_mode() {
         println!("{help_text}");
         return Ok(());
@@ -63,7 +63,7 @@ async fn run() -> NetProbeResult<()> {
     Ok(())
 }
 
-fn maybe_reexec_with_root(request: &ScanRequest, raw_args: &[OsString]) -> NetProbeResult<()> {
+fn maybe_reexec_with_root(request: &ScanRequest, raw_args: &[OsString]) -> NProbeResult<()> {
     #[cfg(not(unix))]
     let _ = raw_args;
 
@@ -74,7 +74,7 @@ fn maybe_reexec_with_root(request: &ScanRequest, raw_args: &[OsString]) -> NetPr
     #[cfg(unix)]
     {
         if !has_interactive_tty() {
-            return Err(NetProbeError::Safety(
+            return Err(NProbeError::Safety(
                 "root privileges are required, but no interactive terminal is available for password prompt. Re-run with sudo/su manually."
                     .to_string(),
             ));
@@ -94,21 +94,21 @@ fn maybe_reexec_with_root(request: &ScanRequest, raw_args: &[OsString]) -> NetPr
                 match Command::new("doas").arg(&exe).args(raw_args).status() {
                     Ok(status) => exit_with_status(status),
                     Err(fallback) if fallback.kind() == std::io::ErrorKind::NotFound => {
-                        return Err(NetProbeError::Safety(
+                        return Err(NProbeError::Safety(
                             "root privileges are required but neither 'sudo' nor 'doas' was found. Run as root manually."
                                 .to_string(),
                         ));
                     }
-                    Err(fallback) => return Err(NetProbeError::Io(fallback)),
+                    Err(fallback) => return Err(NProbeError::Io(fallback)),
                 }
             }
-            Err(err) => return Err(NetProbeError::Io(err)),
+            Err(err) => return Err(NProbeError::Io(err)),
         }
     }
 
     #[cfg(not(unix))]
     {
-        Err(NetProbeError::Safety(
+        Err(NProbeError::Safety(
             "this scan mode requires elevated privileges. Re-run from an admin shell."
                 .to_string(),
         ))

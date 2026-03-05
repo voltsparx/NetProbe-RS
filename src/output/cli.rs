@@ -7,14 +7,14 @@ use crate::models::{PortFinding, PortState, ScanReport};
 pub fn render(report: &ScanReport) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "Starting netprobe-rs {} at {}\n",
+        "Starting nprobe-rs {} at {}\n",
         env!("CARGO_PKG_VERSION"),
         report.metadata.started_at
     ));
 
     for host in &report.hosts {
         out.push_str(&format!(
-            "\nNetProbe scan report for {} ({})\n",
+            "\nNProbe scan report for {} ({})\n",
             host.target, host.ip
         ));
         let definite_response = host
@@ -132,7 +132,7 @@ pub fn render(report: &ScanReport) -> String {
     let host_word = if hosts_responded == 1 { "host" } else { "hosts" };
 
     out.push_str(&format!(
-        "\nNetProbe done: {} IP {} ({} {} responded) scanned in {:.2} seconds\n",
+        "\nNProbe done: {} IP {} ({} {} responded) scanned in {:.2} seconds\n",
         scanned, ip_word, hosts_responded, host_word, seconds
     ));
     out

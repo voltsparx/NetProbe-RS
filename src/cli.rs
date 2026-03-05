@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use crate::error::{NetProbeError, NetProbeResult};
+use crate::error::{NProbeError, NProbeResult};
 use crate::models::{ReportFormat, ScanProfile, ScanRequest};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -34,10 +34,10 @@ impl FileType {
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "netprobe-rs",
+    name = "nprobe-rs",
     version,
-    about = "NetProbe-RS: Nmap-inspired scanner in safe, explainable Rust",
-    override_usage = "netprobe-rs <target> [OPTIONS]\n       netprobe-rs scan <target> [OPTIONS]",
+    about = "NProbe-RS: Nmap-inspired scanner in safe, explainable Rust",
+    override_usage = "nprobe-rs <target> [OPTIONS]\n       nprobe-rs scan <target> [OPTIONS]",
     after_help = "Nmap-style shortcuts supported: -sU, -sS, -A, -T0..-T5, -p-",
     arg_required_else_help = true
 )]
@@ -230,7 +230,7 @@ impl Cli {
         Self::parse_from(normalize_args(args))
     }
 
-    pub fn into_request(self) -> NetProbeResult<ScanRequest> {
+    pub fn into_request(self) -> NProbeResult<ScanRequest> {
         match self.command {
             Commands::Scan(scan) => scan.into_request(),
         }
@@ -326,7 +326,7 @@ pub fn maybe_render_quick_help_mode() -> Option<String> {
     }
 
     Some(
-        "Usage:\n  netprobe-rs <target> [options]\n\nCommon options:\n  -p, --ports <list|range>   Select ports (example: -p 22,80,443)\n      --all-ports            Scan ports 1-65535 (Nmap: -p-)\n  -U, --udp                  Enable UDP probes (Nmap: -sU)\n  -S, --syn                  Enable privileged TCP probes (Nmap: -sS)\n  -A, --aggressive           Aggressive mode (Nmap: -A)\n  -w, --timeout-ms <ms>      Probe timeout in milliseconds\n  -r, --reverse-dns          Enable reverse DNS lookups\n  -n, --no-dns               Disable reverse DNS lookups\n  -e, --explain              Add concise per-port rationale in output\n  -v, --verbose              Show full output sections\n  -f, --file-type <type>     Export format: txt|json|html|csv\n  -o, --output <name>        Output filename\n  -L, --location <dir>       Output directory\n\nNmap-style shortcuts accepted:\n  -sU  -sS  -A  -T0..-T5  -p-\n\nFlag docs mode:\n  netprobe-rs --flag-help --scan\n  netprobe-rs --flag-help -sU\n  netprobe-rs --explain --scan   (legacy alias)\n\nCompatibility:\n  netprobe-rs scan <target> [options] still works.".to_string(),
+        "Usage:\n  nprobe-rs <target> [options]\n\nCommon options:\n  -p, --ports <list|range>   Select ports (example: -p 22,80,443)\n      --all-ports            Scan ports 1-65535 (Nmap: -p-)\n  -U, --udp                  Enable UDP probes (Nmap: -sU)\n  -S, --syn                  Enable privileged TCP probes (Nmap: -sS)\n  -A, --aggressive           Aggressive mode (Nmap: -A)\n  -w, --timeout-ms <ms>      Probe timeout in milliseconds\n  -r, --reverse-dns          Enable reverse DNS lookups\n  -n, --no-dns               Disable reverse DNS lookups\n  -e, --explain              Add concise per-port rationale in output\n  -v, --verbose              Show full output sections\n  -f, --file-type <type>     Export format: txt|json|html|csv\n  -o, --output <name>        Output filename\n  -L, --location <dir>       Output directory\n\nNmap-style shortcuts accepted:\n  -sU  -sS  -A  -T0..-T5  -p-\n\nFlag docs mode:\n  nprobe-rs --flag-help --scan\n  nprobe-rs --flag-help -sU\n  nprobe-rs --explain --scan   (legacy alias)\n\nCompatibility:\n  nprobe-rs scan <target> [options] still works.".to_string(),
     )
 }
 
@@ -337,7 +337,7 @@ fn render_flag_explain(raw_query: Option<&str>) -> String {
 
     let body = match key.as_str() {
         "scan" => {
-            "Default scan mode. Use `netprobe-rs <target>` without the `scan` subcommand."
+            "Default scan mode. Use `nprobe-rs <target>` without the `scan` subcommand."
         }
         "p" | "ports" => "Select ports or ranges. Example: `-p 22,80,443` or `-p 1-1024`.",
         "s" | "su" | "udp" => "Enable UDP probing (`-sU` or `--udp`).",
@@ -361,14 +361,14 @@ fn render_flag_explain(raw_query: Option<&str>) -> String {
     };
 
     format!(
-        "Flag help for `{}`\n\n{}\n\nExamples:\n  netprobe-rs 192.168.1.10\n  netprobe-rs -sU -p 53,161 192.168.1.10\n  netprobe-rs -A -T4 10.0.0.5\n  netprobe-rs --explain --scan",
+        "Flag help for `{}`\n\n{}\n\nExamples:\n  nprobe-rs 192.168.1.10\n  nprobe-rs -sU -p 53,161 192.168.1.10\n  nprobe-rs -A -T4 10.0.0.5\n  nprobe-rs --explain --scan",
         raw_query.unwrap_or("--scan"),
         body
     )
 }
 
 impl ScanArgs {
-    fn into_request(self) -> NetProbeResult<ScanRequest> {
+    fn into_request(self) -> NProbeResult<ScanRequest> {
         let (ports, top_ports) = if self.all_ports {
             ((1u16..=65535).collect(), None)
         } else if let Some(raw) = self.ports.as_deref() {
@@ -384,7 +384,7 @@ impl ScanArgs {
                 .profile
                 .is_some_and(|value| !matches!(value, ScanProfile::RootOnly))
         {
-            return Err(NetProbeError::Cli(
+            return Err(NProbeError::Cli(
                 "--root-only conflicts with --profile values other than root-only".to_string(),
             ));
         }
@@ -563,7 +563,7 @@ fn build_output_path(
     format: ReportFormat,
     output_requested: bool,
     force_extension: bool,
-) -> NetProbeResult<Option<PathBuf>> {
+) -> NProbeResult<Option<PathBuf>> {
     if !output_requested {
         return Ok(None);
     }
@@ -572,20 +572,20 @@ fn build_output_path(
         path.to_path_buf()
     } else {
         std::env::current_dir().map_err(|err| {
-            NetProbeError::Cli(format!("failed to read current working directory: {err}"))
+            NProbeError::Cli(format!("failed to read current working directory: {err}"))
         })?
     };
 
     let file_name = match output_name {
         Some(value) if value.trim().is_empty() => {
-            return Err(NetProbeError::Cli(
+            return Err(NProbeError::Cli(
                 "--output cannot be empty or whitespace".to_string(),
             ));
         }
         Some(value) => value.to_string(),
         None => {
             let stamp = Utc::now().format("%Y%m%d-%H%M%S");
-            format!("netprobe-report-{stamp}.{}", format.extension())
+            format!("nprobe-report-{stamp}.{}", format.extension())
         }
     };
 
@@ -601,14 +601,14 @@ fn build_output_path(
     Ok(Some(output_path))
 }
 
-fn parse_ports(raw: &str) -> NetProbeResult<Vec<u16>> {
+fn parse_ports(raw: &str) -> NProbeResult<Vec<u16>> {
     let mut ports = BTreeSet::new();
     for token in raw.split(',').map(str::trim).filter(|t| !t.is_empty()) {
         if let Some((start, end)) = token.split_once('-') {
             let start_port = parse_port(start)?;
             let end_port = parse_port(end)?;
             if start_port > end_port {
-                return Err(NetProbeError::Cli(format!(
+                return Err(NProbeError::Cli(format!(
                     "invalid port range '{token}': start > end"
                 )));
             }
@@ -621,18 +621,18 @@ fn parse_ports(raw: &str) -> NetProbeResult<Vec<u16>> {
     }
 
     if ports.is_empty() {
-        return Err(NetProbeError::Cli("no valid ports provided".to_string()));
+        return Err(NProbeError::Cli("no valid ports provided".to_string()));
     }
 
     Ok(ports.into_iter().collect())
 }
 
-fn parse_port(raw: &str) -> NetProbeResult<u16> {
+fn parse_port(raw: &str) -> NProbeResult<u16> {
     raw.parse::<u16>()
-        .map_err(|_| NetProbeError::Cli(format!("invalid port '{raw}'")))
+        .map_err(|_| NProbeError::Cli(format!("invalid port '{raw}'")))
         .and_then(|port| {
             if port == 0 {
-                Err(NetProbeError::Cli("port 0 is not scannable".to_string()))
+                Err(NProbeError::Cli("port 0 is not scannable".to_string()))
             } else {
                 Ok(port)
             }

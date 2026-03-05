@@ -9,7 +9,7 @@ pub fn render(report: &ScanReport) -> String {
     let mut html = String::new();
     html.push_str("<!doctype html><html><head><meta charset=\"utf-8\">");
     html.push_str("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">");
-    html.push_str("<title>NetProbe-RS Report</title>");
+    html.push_str("<title>NProbe-RS Report</title>");
     html.push_str("<style>");
     html.push_str(
         ":root{--bg:#f6f8fb;--panel:#ffffff;--ink:#16212f;--muted:#6a7789;--accent:#0f7a6e;--warn:#8f3f2e;}
@@ -28,7 +28,7 @@ pub fn render(report: &ScanReport) -> String {
     );
 
     html.push_str("<div class=\"card\">");
-    html.push_str("<h1>NetProbe-RS Report</h1>");
+    html.push_str("<h1>NProbe-RS Report</h1>");
     html.push_str(&format!(
         "<div class=\"meta\">Started: {}<br>Finished: {}<br>Duration: {} ms</div>",
         report.metadata.started_at, report.metadata.finished_at, report.metadata.duration_ms

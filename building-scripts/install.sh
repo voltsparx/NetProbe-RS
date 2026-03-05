@@ -17,9 +17,9 @@ detect_os_tag() {
   esac
 }
 
-OS_TAG="${NETPROBE_RS_OS_TAG:-$(detect_os_tag)}"
-DEFAULT_INSTALL_DIR="${NETPROBE_RS_DEFAULT_INSTALL_DIR:-${NETPROBE_RS_INSTALL_DIR:-$HOME/.local/bin}}"
-INSTALL_DIR="${NETPROBE_RS_INSTALL_DIR:-}"
+OS_TAG="${NPROBE_RS_OS_TAG:-$(detect_os_tag)}"
+DEFAULT_INSTALL_DIR="${NPROBE_RS_DEFAULT_INSTALL_DIR:-${NPROBE_RS_INSTALL_DIR:-$HOME/.local/bin}}"
+INSTALL_DIR="${NPROBE_RS_INSTALL_DIR:-}"
 PATH_UPDATE_MODE="ask"
 
 usage() {
@@ -140,12 +140,12 @@ build_release_binary() {
     exit 1
   fi
 
-  echo "Building netprobe-rs (release)..."
+  echo "Building nprobe-rs (release)..."
   cargo build --release --manifest-path "$ROOT_DIR/Cargo.toml"
 }
 
 release_binary_path() {
-  printf '%s\n' "$ROOT_DIR/target/release/netprobe-rs"
+  printf '%s\n' "$ROOT_DIR/target/release/nprobe-rs"
 }
 
 require_release_binary() {
@@ -194,8 +194,8 @@ path_contains_dir() {
 }
 
 rc_file_for_current_shell() {
-  if [ -n "${NETPROBE_RS_SHELL_RC:-}" ]; then
-    printf '%s\n' "$NETPROBE_RS_SHELL_RC"
+  if [ -n "${NPROBE_RS_SHELL_RC:-}" ]; then
+    printf '%s\n' "$NPROBE_RS_SHELL_RC"
     return
   fi
 
@@ -228,7 +228,7 @@ append_path_export() {
     return
   fi
 
-  marker="# netprobe-rs installer"
+  marker="# nprobe-rs installer"
   export_line="export PATH=\"$target_dir:\$PATH\" $marker"
   rc_parent="$(dirname "$rc_file")"
   mkdir -p "$rc_parent"
@@ -285,7 +285,7 @@ install_binary_to_dir() {
 
   SRC_BIN="$(release_binary_path)"
   mkdir -p "$target_dir"
-  DEST_BIN="$target_dir/netprobe-rs"
+  DEST_BIN="$target_dir/nprobe-rs"
   cp "$SRC_BIN" "$DEST_BIN"
   chmod +x "$DEST_BIN"
   echo "Installed: $DEST_BIN"
@@ -293,16 +293,16 @@ install_binary_to_dir() {
 
 installed_binary_guess() {
   if [ -n "$INSTALL_DIR" ]; then
-    printf '%s\n' "$INSTALL_DIR/netprobe-rs"
+    printf '%s\n' "$INSTALL_DIR/nprobe-rs"
     return
   fi
 
-  if command -v netprobe-rs >/dev/null 2>&1; then
-    command -v netprobe-rs
+  if command -v nprobe-rs >/dev/null 2>&1; then
+    command -v nprobe-rs
     return
   fi
 
-  printf '%s\n' "$DEFAULT_INSTALL_DIR/netprobe-rs"
+  printf '%s\n' "$DEFAULT_INSTALL_DIR/nprobe-rs"
 }
 
 remove_path_exports() {
@@ -311,12 +311,12 @@ remove_path_exports() {
     return 1
   fi
 
-  if ! grep -F "# netprobe-rs installer" "$rc_file" >/dev/null 2>&1; then
+  if ! grep -F "# nprobe-rs installer" "$rc_file" >/dev/null 2>&1; then
     return 1
   fi
 
-  tmp_file="$rc_file.netprobe-rs.tmp"
-  sed '/# netprobe-rs installer/d' "$rc_file" > "$tmp_file"
+  tmp_file="$rc_file.nprobe-rs.tmp"
+  sed '/# nprobe-rs installer/d' "$rc_file" > "$tmp_file"
   mv "$tmp_file" "$rc_file"
   return 0
 }
@@ -325,7 +325,7 @@ maybe_remove_path_exports() {
   apply_update="$PATH_UPDATE_MODE"
   if [ "$PATH_UPDATE_MODE" = "ask" ]; then
     if [ -t 0 ]; then
-      printf '%s' "Remove netprobe-rs PATH entry from shell config? [y/N]: "
+      printf '%s' "Remove nprobe-rs PATH entry from shell config? [y/N]: "
       IFS= read -r answer || answer=""
       case "$answer" in
         y|Y) apply_update="yes" ;;
@@ -338,9 +338,9 @@ maybe_remove_path_exports() {
 
   if [ "$apply_update" = "yes" ]; then
     if remove_path_exports; then
-      echo "Removed netprobe-rs PATH entry from shell config."
+      echo "Removed nprobe-rs PATH entry from shell config."
     else
-      echo "No netprobe-rs PATH entry found in shell config."
+      echo "No nprobe-rs PATH entry found in shell config."
     fi
   else
     echo "Skipped PATH update removal."
@@ -354,7 +354,7 @@ action_test() {
   BUILD_DIR="$ROOT_DIR/build-$OS_TAG"
   mkdir -p "$BUILD_DIR"
   SRC_BIN="$(release_binary_path)"
-  DEST_BIN="$BUILD_DIR/netprobe-rs"
+  DEST_BIN="$BUILD_DIR/nprobe-rs"
   cp "$SRC_BIN" "$DEST_BIN"
   chmod +x "$DEST_BIN"
   echo "Test binary ready: $DEST_BIN"

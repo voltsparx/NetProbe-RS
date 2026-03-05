@@ -2,7 +2,7 @@
 // Pseudo-block:
 //   read input -> process safely -> return deterministic output
 
-use crate::error::{NetProbeError, NetProbeResult};
+use crate::error::{NProbeError, NProbeResult};
 use crate::models::ScanReport;
 use serde::Serialize;
 
@@ -21,7 +21,7 @@ struct Row {
     risk_score: u8,
 }
 
-pub fn render(report: &ScanReport) -> NetProbeResult<String> {
+pub fn render(report: &ScanReport) -> NProbeResult<String> {
     let mut writer = csv::Writer::from_writer(Vec::new());
 
     for host in &report.hosts {
@@ -54,6 +54,6 @@ pub fn render(report: &ScanReport) -> NetProbeResult<String> {
 
     let bytes = writer.into_inner().map_err(|err| err.into_error())?;
     String::from_utf8(bytes)
-        .map_err(|err| NetProbeError::Parse(format!("utf8 conversion failed: {err}")))
+        .map_err(|err| NProbeError::Parse(format!("utf8 conversion failed: {err}")))
 }
 

@@ -1,6 +1,6 @@
 # building-scripts
 
-Cross-platform lifecycle helpers for `netprobe-rs`.
+Cross-platform lifecycle helpers for `nprobe-rs`.
 
 ## Actions
 
@@ -63,11 +63,11 @@ building-scripts\install.bat install
 
 Installed command name:
 
-- `netprobe-rs` on Linux/macOS/Termux
-- `netprobe-rs.exe` on Windows
+- `nprobe-rs` on Linux/macOS/Termux
+- `nprobe-rs.exe` on Windows
 
 Example:
 
 ```bash
-netprobe-rs 192.168.1.10 --root-only --allow-external
+nprobe-rs 192.168.1.10 --root-only --allow-external
 ```

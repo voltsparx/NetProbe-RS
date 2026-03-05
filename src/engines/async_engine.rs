@@ -612,7 +612,7 @@ fn default_probe_payload(port: u16) -> Vec<u8> {
     match port {
         80 | 8000 | 8080 | 8888 => b"HEAD / HTTP/1.0\r\nHost: target\r\n\r\n".to_vec(),
         21 => b"HELP\r\n".to_vec(),
-        25 | 587 => b"EHLO netprobe.local\r\n".to_vec(),
+        25 | 587 => b"EHLO nprobe.local\r\n".to_vec(),
         110 => b"CAPA\r\n".to_vec(),
         143 => b"A1 CAPABILITY\r\n".to_vec(),
         6379 => b"PING\r\n".to_vec(),

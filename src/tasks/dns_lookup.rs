@@ -5,9 +5,9 @@
 use std::net::IpAddr;
 
 use crate::engines::thread_pool;
-use crate::error::NetProbeResult;
+use crate::error::NProbeResult;
 
-pub async fn resolve(target: &str) -> NetProbeResult<Vec<IpAddr>> {
+pub async fn resolve(target: &str) -> NProbeResult<Vec<IpAddr>> {
     thread_pool::resolve_target(target).await
 }
 

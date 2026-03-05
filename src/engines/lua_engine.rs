@@ -8,12 +8,12 @@ use std::path::Path;
 
 use mlua::{Lua, LuaSerdeExt, Value};
 
-use crate::error::{NetProbeError, NetProbeResult};
+use crate::error::{NProbeError, NProbeResult};
 use crate::models::HostResult;
 
 const DEFAULT_LUA_RULES: &str = include_str!("../../lua/default_rules.lua");
 
-pub fn run(host: &HostResult, script_path: Option<&Path>) -> NetProbeResult<Vec<String>> {
+pub fn run(host: &HostResult, script_path: Option<&Path>) -> NProbeResult<Vec<String>> {
     let script = if let Some(path) = script_path {
         fs::read_to_string(path)?
     } else {
@@ -21,11 +21,11 @@ pub fn run(host: &HostResult, script_path: Option<&Path>) -> NetProbeResult<Vec<
     };
 
     let lua = Lua::new();
-    lua.load(&script).set_name("netprobe_rules").exec()?;
+    lua.load(&script).set_name("nprobe_rules").exec()?;
     let analyze = lua
         .globals()
         .get::<mlua::Function>("analyze")
-        .map_err(|_| NetProbeError::Parse("lua script must define analyze(host)".to_string()))?;
+        .map_err(|_| NProbeError::Parse("lua script must define analyze(host)".to_string()))?;
 
     let host_value = lua.to_value(host)?;
     let result: Value = analyze.call(host_value)?;
@@ -40,7 +40,7 @@ pub fn run(host: &HostResult, script_path: Option<&Path>) -> NetProbeResult<Vec<
             }
         }
         _ => {
-            return Err(NetProbeError::Parse(
+            return Err(NProbeError::Parse(
                 "analyze(host) must return string, table, or nil".to_string(),
             ));
         }

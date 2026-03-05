@@ -17,8 +17,8 @@ echo "Installing Termux build dependencies..."
 pkg update -y
 pkg install -y rust clang pkg-config make
 
-NETPROBE_RS_OS_TAG="termux" \
-NETPROBE_RS_DEFAULT_INSTALL_DIR="${NETPROBE_RS_INSTALL_DIR:-$PREFIX/bin}" \
+NPROBE_RS_OS_TAG="termux" \
+NPROBE_RS_DEFAULT_INSTALL_DIR="${NPROBE_RS_INSTALL_DIR:-$PREFIX/bin}" \
 sh "$SCRIPT_DIR/install.sh" "$@"
 
 echo "Tip: run 'tsu' or 'su' for root-required scan modes when using --root-only."

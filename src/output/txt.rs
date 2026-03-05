@@ -6,7 +6,7 @@ use crate::models::ScanReport;
 
 pub fn render(report: &ScanReport) -> String {
     let mut out = String::new();
-    out.push_str("netprobe-rs text report\n");
+    out.push_str("nprobe-rs text report\n");
     out.push_str(&format!(
         "started={} finished={} duration_ms={}\n",
         report.metadata.started_at, report.metadata.finished_at, report.metadata.duration_ms

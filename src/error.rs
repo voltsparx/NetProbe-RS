@@ -4,10 +4,10 @@
 
 use thiserror::Error;
 
-pub type NetProbeResult<T> = Result<T, NetProbeError>;
+pub type NProbeResult<T> = Result<T, NProbeError>;
 
 #[derive(Debug, Error)]
-pub enum NetProbeError {
+pub enum NProbeError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("csv error: {0}")]

@@ -1,6 +1,6 @@
-# NetProbe-RS
+# NProbe-RS
 
-**NetProbe-RS** is a Rust-native, explainable network reconnaissance tool focused on learning, safety, and actionable insights.
+**NProbe-RS** is a Rust-native, explainable network reconnaissance tool focused on learning, safety, and actionable insights.
 
 It reimplements proven network scanning concepts with a modern, safe architecture while helping users understand *why* results matter — not just what was found.
 
@@ -10,9 +10,9 @@ It reimplements proven network scanning concepts with a modern, safe architectur
 
 ---
 
-## ✨ Why NetProbe-RS?
+## ✨ Why NProbe-RS?
 
-NetProbe-RS is designed to make network reconnaissance understandable and safe by default.
+NProbe-RS is designed to make network reconnaissance understandable and safe by default.
 
 Instead of only reporting open ports, it explains findings, highlights risks, and provides defensive context — making it ideal for:
 
@@ -27,7 +27,7 @@ Instead of only reporting open ports, it explains findings, highlights risks, an
 ## 🧩 Features
 
 - 🔎 Explainable scan results with defensive guidance  
-- 🎯 Nmap-style command flow (`netprobe-rs <target>`) and short aliases  
+- 🎯 Nmap-style command flow (`nprobe-rs <target>`) and short aliases  
 - ⚡ Rust async engine for high-performance scanning  
 - 🧵 Thread-pool DNS resolution  
 - 🧠 Parallel analysis using Rayon  
@@ -43,7 +43,7 @@ Instead of only reporting open ports, it explains findings, highlights risks, an
 
 ## 🛡️ Safety Controls
 
-NetProbe-RS promotes responsible usage through built-in safeguards:
+NProbe-RS promotes responsible usage through built-in safeguards:
 
 - `--lab-mode` → restricts scans to safe lab environments  
 - `--allow-external` → explicitly allow external targets  
@@ -56,7 +56,7 @@ NetProbe-RS promotes responsible usage through built-in safeguards:
 ```bash
 cargo run -- 127.0.0.1 --explain
 # after install:
-netprobe-rs 127.0.0.1 --top-ports 100
+nprobe-rs 127.0.0.1 --top-ports 100
 ```
 
 ---
@@ -64,13 +64,13 @@ netprobe-rs 127.0.0.1 --top-ports 100
 ## 🧪 Common Usage
 
 ```bash
-netprobe-rs scanme.nmap.org --top-ports 100 --allow-external
-netprobe-rs 192.168.1.1 --ports 22,80,443 --profile stealth --explain --lab-mode
-netprobe-rs 10.0.0.5 --udp --lua-script scripts/example.lua --lab-mode
-netprobe-rs 127.0.0.1 --top-ports 20 --reverse-dns
-netprobe-rs 192.168.1.10 --profile aggressive --allow-external
-netprobe-rs 192.168.1.10 --aggressive-root --privileged-probes --allow-external
-netprobe-rs 192.168.1.10 --root-only --allow-external
+nprobe-rs scanme.nmap.org --top-ports 100 --allow-external
+nprobe-rs 192.168.1.1 --ports 22,80,443 --profile stealth --explain --lab-mode
+nprobe-rs 10.0.0.5 --udp --lua-script scripts/example.lua --lab-mode
+nprobe-rs 127.0.0.1 --top-ports 20 --reverse-dns
+nprobe-rs 192.168.1.10 --profile aggressive --allow-external
+nprobe-rs 192.168.1.10 --aggressive-root --privileged-probes --allow-external
+nprobe-rs 192.168.1.10 --root-only --allow-external
 ```
 
 ---
@@ -78,9 +78,9 @@ netprobe-rs 192.168.1.10 --root-only --allow-external
 ## 📄 Output Controls
 
 ```bash
-netprobe-rs 192.168.1.20 --output internal-audit --file-type json
-netprobe-rs 192.168.1.20 --output internal-audit --location ./reports --file-type html
-netprobe-rs 192.168.1.20 --location ./reports --file-type csv
+nprobe-rs 192.168.1.20 --output internal-audit --file-type json
+nprobe-rs 192.168.1.20 --output internal-audit --location ./reports --file-type html
+nprobe-rs 192.168.1.20 --location ./reports --file-type csv
 ```
 
 ---
@@ -88,10 +88,10 @@ netprobe-rs 192.168.1.20 --location ./reports --file-type csv
 ## ⚡ Shortcut Aliases
 
 ```bash
-netprobe-rs 192.168.1.10 -a -o termux-scan -f json
-netprobe-rs 192.168.1.10 -A -a -w 700 -U
-netprobe-rs 192.168.1.10 -sU -p 53,161
-netprobe-rs 192.168.1.10 -T4 -p-
+nprobe-rs 192.168.1.10 -a -o termux-scan -f json
+nprobe-rs 192.168.1.10 -A -a -w 700 -U
+nprobe-rs 192.168.1.10 -sU -p 53,161
+nprobe-rs 192.168.1.10 -T4 -p-
 ```
 
 ---
@@ -99,9 +99,9 @@ netprobe-rs 192.168.1.10 -T4 -p-
 ## 🧾 Flag Help Mode
 
 ```bash
-netprobe-rs --flag-help --scan
-netprobe-rs --flag-help -sU
-netprobe-rs --explain --scan   # legacy alias for flag docs mode
+nprobe-rs --flag-help --scan
+nprobe-rs --flag-help -sU
+nprobe-rs --explain --scan   # legacy alias for flag docs mode
 ```
 
 ---
@@ -132,9 +132,9 @@ Guidance: Use key-based authentication and disable password login.
 - `temp/` is ignored in git so local study artifacts are not committed.  
 - Service names and top-port ranking load from `temp/nmap/nmap-services` when present.  
 - Fingerprint rules and probe payloads parse from `temp/nmap/nmap-service-probes` where supported.  
-- On startup, NetProbe-RS creates `~/.netprobe-rs-config/config.ini` for persistent settings.  
+- On startup, NProbe-RS creates `~/.nprobe-rs-config/config.ini` for persistent settings.  
 - By default, output is printed to console unless `--output`, `--location`, or `--file-type` is provided.  
-- `netprobe-rs scan <target>` is still supported for compatibility, but `netprobe-rs <target>` is preferred.  
+- `nprobe-rs scan <target>` is still supported for compatibility, but `nprobe-rs <target>` is preferred.  
 - Timeout short flag is `-w` (`--timeout-ms`), while Nmap-style timing shortcuts use `-T0..-T5`.  
 - Root-required scan modes auto-attempt elevation on Unix-like systems when possible.  
 
@@ -182,14 +182,14 @@ building-scripts\install.bat install
 
 Installed command name:
 
-- `netprobe-rs` (Linux/macOS/Termux)
-- `netprobe-rs.exe` (Windows)
+- `nprobe-rs` (Linux/macOS/Termux)
+- `nprobe-rs.exe` (Windows)
 
 ---
 
 ## ⚖️ Legal & Ethical Use
 
-NetProbe-RS is intended for:
+NProbe-RS is intended for:
 
 - authorized security testing
 - lab environments
@@ -214,13 +214,13 @@ Always obtain proper authorization before scanning networks you do not own or ma
 
 Contributions, ideas, and feedback are welcome!
 
-If you’d like to improve NetProbe-RS, feel free to open an issue or submit a pull request.
+If you’d like to improve NProbe-RS, feel free to open an issue or submit a pull request.
 
 ---
 
 ## ⭐ Acknowledgment
 
-NetProbe-RS draws inspiration from the design principles of Nmap while reimplementing core ideas with a modern Rust architecture focused on safety, clarity, and extensibility.
+NProbe-RS draws inspiration from the design principles of Nmap while reimplementing core ideas with a modern Rust architecture focused on safety, clarity, and extensibility.
 
 ---
 

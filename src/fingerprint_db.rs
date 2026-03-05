@@ -306,7 +306,7 @@ impl FingerprintDatabase {
             vec![b"HEAD / HTTP/1.0\r\nHost: target\r\n\r\n".to_vec()],
         );
         payloads_tcp_by_port.insert(21, vec![b"HELP\r\n".to_vec()]);
-        payloads_tcp_by_port.insert(25, vec![b"EHLO netprobe.local\r\n".to_vec()]);
+        payloads_tcp_by_port.insert(25, vec![b"EHLO nprobe.local\r\n".to_vec()]);
         payloads_tcp_by_port.insert(110, vec![b"CAPA\r\n".to_vec()]);
         payloads_tcp_by_port.insert(143, vec![b"A1 CAPABILITY\r\n".to_vec()]);
         payloads_tcp_by_port.insert(6379, vec![b"PING\r\n".to_vec()]);

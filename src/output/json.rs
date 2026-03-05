@@ -2,10 +2,10 @@
 // Pseudo-block:
 //   read input -> process safely -> return deterministic output
 
-use crate::error::NetProbeResult;
+use crate::error::NProbeResult;
 use crate::models::ScanReport;
 
-pub fn render(report: &ScanReport) -> NetProbeResult<String> {
+pub fn render(report: &ScanReport) -> NProbeResult<String> {
     Ok(serde_json::to_string_pretty(report)?)
 }
 

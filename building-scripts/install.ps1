@@ -101,15 +101,15 @@ function ConvertTo-NormalizedPath {
 }
 
 function Get-DefaultInstallDir {
-    if (-not [string]::IsNullOrWhiteSpace($env:NETPROBE_RS_INSTALL_DIR)) {
-        return $env:NETPROBE_RS_INSTALL_DIR
+    if (-not [string]::IsNullOrWhiteSpace($env:NPROBE_RS_INSTALL_DIR)) {
+        return $env:NPROBE_RS_INSTALL_DIR
     }
     return (Join-Path $HOME ".local\bin")
 }
 
 function Get-ReleaseBinaryPath {
-    $primary = Join-Path $RootDir "target\release\netprobe-rs.exe"
-    $fallback = Join-Path $RootDir "target\release\netprobe-rs"
+    $primary = Join-Path $RootDir "target\release\nprobe-rs.exe"
+    $fallback = Join-Path $RootDir "target\release\nprobe-rs"
     if (Test-Path $primary) { return $primary }
     if (Test-Path $fallback) { return $fallback }
     throw "Release binary not found. Expected: $primary"
@@ -121,7 +121,7 @@ function Build-ReleaseBinary {
         throw "cargo was not found in PATH. Install Rust toolchain first: https://rustup.rs/"
     }
 
-    Write-Host "Building netprobe-rs (release)..."
+    Write-Host "Building nprobe-rs (release)..."
     & $cargo.Source build --release --manifest-path $Manifest
     if ($LASTEXITCODE -ne 0) {
         throw "cargo build failed with exit code $LASTEXITCODE"
@@ -280,7 +280,7 @@ function Install-BinaryToDirectory {
 
     $source = Build-ReleaseBinary
     New-Item -ItemType Directory -Force -Path $TargetDir | Out-Null
-    $dest = Join-Path $TargetDir "netprobe-rs.exe"
+    $dest = Join-Path $TargetDir "nprobe-rs.exe"
     Copy-Item -Path $source -Destination $dest -Force
     Write-Host "Installed: $dest"
 }
@@ -289,15 +289,15 @@ function Resolve-InstalledBinaryPath {
     param([string]$ExplicitInstallDir)
 
     if (-not [string]::IsNullOrWhiteSpace($ExplicitInstallDir)) {
-        return (Join-Path $ExplicitInstallDir "netprobe-rs.exe")
+        return (Join-Path $ExplicitInstallDir "nprobe-rs.exe")
     }
 
-    $command = Get-Command netprobe-rs -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    $command = Get-Command nprobe-rs -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($command -and $command.Source) {
         return $command.Source
     }
 
-    return (Join-Path (Get-DefaultInstallDir) "netprobe-rs.exe")
+    return (Join-Path (Get-DefaultInstallDir) "nprobe-rs.exe")
 }
 
 $normalizedAction = if ($Help) { "help" } else { Resolve-Action $Action }
@@ -317,7 +317,7 @@ switch ($normalizedAction) {
         $source = Build-ReleaseBinary
         $buildDir = Join-Path $RootDir "build-windows"
         New-Item -ItemType Directory -Force -Path $buildDir | Out-Null
-        $dest = Join-Path $buildDir "netprobe-rs.exe"
+        $dest = Join-Path $buildDir "nprobe-rs.exe"
         Copy-Item -Path $source -Destination $dest -Force
         Write-Host "Test binary ready: $dest"
     }

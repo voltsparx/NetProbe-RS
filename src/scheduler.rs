@@ -11,7 +11,7 @@ use chrono::Utc;
 use futures::future::join_all;
 
 use crate::engines::lua_engine;
-use crate::error::{NetProbeError, NetProbeResult};
+use crate::error::{NProbeError, NProbeResult};
 use crate::fingerprint_db::FingerprintDatabase;
 use crate::models::{
     EngineStats, HostResult, KnowledgeStats, ScanMetadata, ScanReport, ScanRequest,
@@ -30,7 +30,7 @@ struct HostExecution {
     lua_hooks_ran: bool,
 }
 
-pub async fn run_scan(mut request: ScanRequest) -> NetProbeResult<ScanReport> {
+pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
     let started = Utc::now();
     let mut thread_pool_tasks = 0usize;
 
@@ -49,7 +49,7 @@ pub async fn run_scan(mut request: ScanRequest) -> NetProbeResult<ScanReport> {
         request.ports.clone()
     };
     if selected_ports.is_empty() {
-        return Err(NetProbeError::Parse(
+        return Err(NProbeError::Parse(
             "no ports selected for scanning".to_string(),
         ));
     }
@@ -156,7 +156,7 @@ async fn process_host(
     global_warnings: Vec<String>,
     service_registry: Arc<ServiceRegistry>,
     fingerprint_db: Arc<FingerprintDatabase>,
-) -> NetProbeResult<HostExecution> {
+) -> NProbeResult<HostExecution> {
     let (mut host, async_tasks) = tasks::port_scan::run(
         &request,
         ip,
@@ -198,10 +198,10 @@ fn enforce_safety(
     request: &mut ScanRequest,
     resolved_ips: &[IpAddr],
     warnings: &mut Vec<String>,
-) -> NetProbeResult<()> {
+) -> NProbeResult<()> {
     let has_public_targets = resolved_ips.iter().any(|ip| !is_private_or_local(ip));
     if request.lab_mode && has_public_targets {
-        return Err(NetProbeError::Safety(
+        return Err(NProbeError::Safety(
             "lab mode allows only private/local target addresses".to_string(),
         ));
     }
@@ -218,7 +218,7 @@ fn enforce_safety(
             );
             apply_conservative_limits(request);
             if request.strict_safety {
-                return Err(NetProbeError::Safety(
+                return Err(NProbeError::Safety(
                     "strict safety is enabled and external targets were detected without --allow-external"
                         .to_string(),
                 ));
@@ -236,13 +236,13 @@ fn enforce_safety(
 fn enforce_privileged_modes(
     request: &mut ScanRequest,
     warnings: &mut Vec<String>,
-) -> NetProbeResult<()> {
+) -> NProbeResult<()> {
     if !request.requires_root() {
         return Ok(());
     }
 
     if !has_root_privileges() {
-        return Err(NetProbeError::Safety(build_root_required_message(request)));
+        return Err(NProbeError::Safety(build_root_required_message(request)));
     }
 
     warnings.push("root capability detected: privileged scan extensions enabled".to_string());

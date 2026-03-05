@@ -5,7 +5,7 @@
 use std::path::Path;
 
 use crate::engines::thread_pool;
-use crate::error::NetProbeResult;
+use crate::error::NProbeResult;
 use crate::models::{ReportFormat, ScanReport};
 
 pub mod cli;
@@ -14,7 +14,7 @@ pub mod html;
 pub mod json;
 pub mod txt;
 
-pub fn render(report: &ScanReport, format: ReportFormat) -> NetProbeResult<String> {
+pub fn render(report: &ScanReport, format: ReportFormat) -> NProbeResult<String> {
     match format {
         ReportFormat::Cli => Ok(cli::render(report)),
         ReportFormat::Txt => Ok(txt::render(report)),
@@ -28,7 +28,7 @@ pub async fn emit(
     body: &str,
     format: ReportFormat,
     output_path: Option<&Path>,
-) -> NetProbeResult<()> {
+) -> NProbeResult<()> {
     match output_path {
         Some(path) => {
             thread_pool::write_output(path, body).await?;

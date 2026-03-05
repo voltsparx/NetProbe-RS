@@ -10,9 +10,9 @@ use std::time::Duration;
 
 use dns_lookup::lookup_addr;
 
-use crate::error::{NetProbeError, NetProbeResult};
+use crate::error::{NProbeError, NProbeResult};
 
-pub async fn resolve_target(target: &str) -> NetProbeResult<Vec<IpAddr>> {
+pub async fn resolve_target(target: &str) -> NProbeResult<Vec<IpAddr>> {
     let input = target.to_string();
     let mut ips = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<IpAddr>> {
         let mut dedupe = HashSet::new();
@@ -27,7 +27,7 @@ pub async fn resolve_target(target: &str) -> NetProbeResult<Vec<IpAddr>> {
     .await??;
 
     if ips.is_empty() {
-        return Err(NetProbeError::Parse(format!(
+        return Err(NProbeError::Parse(format!(
             "could not resolve target '{}'",
             target
         )));
@@ -44,7 +44,7 @@ pub async fn reverse_lookup(ip: IpAddr) -> Option<String> {
     }
 }
 
-pub async fn write_output(path: &Path, body: &str) -> NetProbeResult<()> {
+pub async fn write_output(path: &Path, body: &str) -> NProbeResult<()> {
     let output_path = path.to_path_buf();
     let content = body.to_string();
     tokio::task::spawn_blocking(move || -> std::io::Result<()> {

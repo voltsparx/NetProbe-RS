@@ -9,13 +9,13 @@ use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 
-use crate::error::{NetProbeError, NetProbeResult};
+use crate::error::{NProbeError, NProbeResult};
 use crate::models::{ScanProfile, ScanRequest};
 
-const CONFIG_DIR_NAME: &str = ".netprobe-rs-config";
+const CONFIG_DIR_NAME: &str = ".nprobe-rs-config";
 const CONFIG_FILE_NAME: &str = "config.ini";
 
-pub fn apply_defaults(request: &mut ScanRequest) -> NetProbeResult<()> {
+pub fn apply_defaults(request: &mut ScanRequest) -> NProbeResult<()> {
     let kv = load_or_default_map()?;
 
     if !request.profile_explicit {
@@ -78,7 +78,7 @@ pub fn apply_defaults(request: &mut ScanRequest) -> NetProbeResult<()> {
     Ok(())
 }
 
-pub fn init_and_update(request: &ScanRequest) -> NetProbeResult<PathBuf> {
+pub fn init_and_update(request: &ScanRequest) -> NProbeResult<PathBuf> {
     let config_dir = resolve_config_dir()?;
     fs::create_dir_all(&config_dir)?;
     let config_path = config_dir.join(CONFIG_FILE_NAME);
@@ -155,8 +155,8 @@ fn update_runtime_values(kv: &mut BTreeMap<String, String>, request: &ScanReques
     kv.insert("run_count".to_string(), run_count.to_string());
 }
 
-fn resolve_config_dir() -> NetProbeResult<PathBuf> {
-    if let Some(custom) = env::var_os("NETPROBE_RS_CONFIG_HOME") {
+fn resolve_config_dir() -> NProbeResult<PathBuf> {
+    if let Some(custom) = env::var_os("NPROBE_RS_CONFIG_HOME") {
         return Ok(PathBuf::from(custom).join(CONFIG_DIR_NAME));
     }
 
@@ -164,7 +164,7 @@ fn resolve_config_dir() -> NetProbeResult<PathBuf> {
         return Ok(home.join(CONFIG_DIR_NAME));
     }
 
-    Err(NetProbeError::Config(
+    Err(NProbeError::Config(
         "could not resolve user home directory for config".to_string(),
     ))
 }
@@ -210,7 +210,7 @@ fn default_config_map() -> BTreeMap<String, String> {
     map
 }
 
-fn load_or_default_map() -> NetProbeResult<BTreeMap<String, String>> {
+fn load_or_default_map() -> NProbeResult<BTreeMap<String, String>> {
     let config_dir = resolve_config_dir()?;
     let config_path = config_dir.join(CONFIG_FILE_NAME);
     if config_path.exists() {
@@ -220,7 +220,7 @@ fn load_or_default_map() -> NetProbeResult<BTreeMap<String, String>> {
     }
 }
 
-fn load_ini_map(path: &Path) -> NetProbeResult<BTreeMap<String, String>> {
+fn load_ini_map(path: &Path) -> NProbeResult<BTreeMap<String, String>> {
     let content = fs::read_to_string(path)?;
     let mut map = BTreeMap::new();
     for line in content.lines() {
@@ -238,9 +238,9 @@ fn load_ini_map(path: &Path) -> NetProbeResult<BTreeMap<String, String>> {
     Ok(map)
 }
 
-fn write_ini_map(path: &Path, map: &BTreeMap<String, String>) -> NetProbeResult<()> {
+fn write_ini_map(path: &Path, map: &BTreeMap<String, String>) -> NProbeResult<()> {
     let mut body = String::new();
-    body.push_str("[netprobe-rs]\n");
+    body.push_str("[nprobe-rs]\n");
     for (k, v) in map {
         let val = sanitize_value(v);
         body.push_str(k);
@@ -250,7 +250,7 @@ fn write_ini_map(path: &Path, map: &BTreeMap<String, String>) -> NetProbeResult<
     }
 
     let parent = path.parent().ok_or_else(|| {
-        NetProbeError::Config("invalid config path without parent directory".to_string())
+        NProbeError::Config("invalid config path without parent directory".to_string())
     })?;
     let tmp_path = parent.join(format!("{}.tmp", CONFIG_FILE_NAME));
     fs::write(&tmp_path, body)?;
@@ -259,7 +259,7 @@ fn write_ini_map(path: &Path, map: &BTreeMap<String, String>) -> NetProbeResult<
     }
     fs::rename(&tmp_path, path).map_err(|err| {
         let _ = fs::remove_file(&tmp_path);
-        NetProbeError::Io(err)
+        NProbeError::Io(err)
     })?;
     Ok(())
 }

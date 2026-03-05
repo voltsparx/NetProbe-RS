@@ -518,7 +518,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "netprobe-rs"
+name = "nprobe-rs"
 version = "1.3.0"
 dependencies = [
  "chrono",
