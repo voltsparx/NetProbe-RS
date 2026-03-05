@@ -3,21 +3,29 @@
 //   read input -> process safely -> return deterministic output
 // this file is traffic control for the whole scanner.
 
-mod reporter;
 mod cli;
 mod config;
+mod core;
+mod engine_async;
+mod engine_intel;
+mod engine_parallel;
+mod engine_plugin;
+mod engine_probe;
+mod engine_report;
 mod engines;
 mod error;
 mod fingerprint_db;
 mod models;
 mod output;
+mod reporter;
 mod scheduler;
 mod service_db;
 mod tasks;
+mod utils;
 
-use std::ffi::OsString;
 #[cfg(unix)]
 use std::ffi::OsStr;
+use std::ffi::OsString;
 #[cfg(unix)]
 use std::path::Path;
 #[cfg(unix)]
@@ -59,7 +67,7 @@ async fn run() -> NProbeResult<()> {
     maybe_reexec_with_root(&request, &raw_args[1..])?;
 
     config::init_and_update(&request)?;
-    scheduler::run_scan(request).await?;
+    core::orchestrator::run_scan(request).await?;
     Ok(())
 }
 
@@ -109,8 +117,7 @@ fn maybe_reexec_with_root(request: &ScanRequest, raw_args: &[OsString]) -> NProb
     #[cfg(not(unix))]
     {
         Err(NProbeError::Safety(
-            "this scan mode requires elevated privileges. Re-run from an admin shell."
-                .to_string(),
+            "this scan mode requires elevated privileges. Re-run from an admin shell.".to_string(),
         ))
     }
 }
