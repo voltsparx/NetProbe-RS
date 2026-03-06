@@ -57,6 +57,42 @@ pub fn build_learning_notes(host: &HostResult) -> Vec<String> {
         }
     }
 
+    if let Some(device_class) = host.device_class.as_deref() {
+        match device_class {
+            "fragile-embedded" => {
+                notes.insert(
+                    "Learning: fragile embedded targets were scanned in a reduced-pressure mode to avoid disrupting low-power systems."
+                        .to_string(),
+                );
+            }
+            "printer-sensitive" => {
+                notes.insert(
+                    "Learning: printer-like targets can misbehave on legacy print ports, so nprobe-rs preserved safety by suppressing risky probes."
+                        .to_string(),
+                );
+            }
+            "enterprise" => {
+                notes.insert(
+                    "Learning: enterprise-class hardware tolerates broader discovery, but service exposure still needs human review."
+                        .to_string(),
+                );
+            }
+            _ => {
+                notes.insert(
+                    "Learning: the device profile remained generic, so the framework kept conservative assumptions."
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    if !host.safety_actions.is_empty() {
+        notes.insert(format!(
+            "Learning: safety automation applied {} runtime action(s) for this host.",
+            host.safety_actions.len()
+        ));
+    }
+
     notes.into_iter().collect()
 }
 

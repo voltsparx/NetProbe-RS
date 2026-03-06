@@ -101,6 +101,7 @@ pub struct RuntimeSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanRequest {
     pub target: String,
+    pub session_id: Option<String>,
     pub ports: Vec<u16>,
     pub top_ports: Option<usize>,
     pub include_udp: bool,
@@ -201,6 +202,11 @@ pub struct HostResult {
     pub target: String,
     pub ip: String,
     pub reverse_dns: Option<String>,
+    pub observed_mac: Option<String>,
+    pub device_class: Option<String>,
+    pub device_vendor: Option<String>,
+    #[serde(default)]
+    pub safety_actions: Vec<String>,
     pub warnings: Vec<String>,
     pub ports: Vec<PortFinding>,
     pub risk_score: u8,
@@ -217,7 +223,10 @@ pub struct EngineStats {
     pub thread_pool_tasks: usize,
     pub parallel_tasks: usize,
     pub lua_hooks_ran: bool,
+    pub framework_role: String,
+    pub teaching_mode: bool,
     pub execution_mode: String,
+    pub scan_persona: String,
     pub configured_rate_pps: u32,
     pub configured_burst_size: usize,
     pub max_retries: u8,
@@ -231,6 +240,11 @@ pub struct EngineStats {
     pub checkpoint_planned_units: usize,
     pub checkpoint_completed_units: usize,
     pub checkpoint_resumed_units: usize,
+    pub safety_envelope_active: bool,
+    pub public_target_policy_applied: bool,
+    pub profiled_hosts: usize,
+    pub fragile_hosts: usize,
+    pub safety_ports_suppressed: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -256,11 +270,13 @@ pub struct ScanRequestSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanMetadata {
+    pub session_id: Option<String>,
     pub started_at: DateTime<Utc>,
     pub finished_at: DateTime<Utc>,
     pub duration_ms: i64,
     pub engine_stats: EngineStats,
     pub knowledge: KnowledgeStats,
+    pub platform: PlatformStats,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -273,6 +289,18 @@ pub struct KnowledgeStats {
     pub fingerprint_rules_skipped: usize,
     pub nse_scripts_seen: usize,
     pub nselib_modules_seen: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlatformStats {
+    pub capability_total: usize,
+    pub implemented: usize,
+    pub partial: usize,
+    pub planned: usize,
+    pub intentionally_excluded: usize,
+    pub tool_families: Vec<String>,
+    pub capability_domains: Vec<String>,
+    pub guardrail_statement: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

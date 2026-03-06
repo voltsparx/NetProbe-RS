@@ -11,6 +11,9 @@ pub fn render(report: &ScanReport) -> String {
         env!("CARGO_PKG_VERSION"),
         report.metadata.started_at
     ));
+    if let Some(session_id) = &report.metadata.session_id {
+        out.push_str(&format!("Session: {session_id}\n"));
+    }
     let shard_display = report.metadata.engine_stats.shard_index.saturating_add(1);
     out.push_str(&format!(
         "Engine mode: {} | rate: {} pps (burst {}) | retries: {} | host parallelism: {} | shard: {}/{} ({})\n",
@@ -22,6 +25,38 @@ pub fn render(report: &ScanReport) -> String {
         shard_display,
         report.metadata.engine_stats.total_shards,
         report.metadata.engine_stats.shard_dimension
+    ));
+    out.push_str(&format!(
+        "Role: {} | teaching: {} | safety envelope: {} | public-target policy: {} | profiled hosts: {} | fragile hosts: {} | suppressed ports: {}\n",
+        report.metadata.engine_stats.framework_role,
+        if report.metadata.engine_stats.teaching_mode {
+            "on"
+        } else {
+            "off"
+        },
+        if report.metadata.engine_stats.safety_envelope_active {
+            "active"
+        } else {
+            "baseline"
+        },
+        if report.metadata.engine_stats.public_target_policy_applied {
+            "applied"
+        } else {
+            "not-needed"
+        },
+        report.metadata.engine_stats.profiled_hosts,
+        report.metadata.engine_stats.fragile_hosts,
+        report.metadata.engine_stats.safety_ports_suppressed
+    ));
+    out.push_str(&format!(
+        "Platform coverage: {} capabilities across {} tool families and {} domains (implemented {} | partial {} | planned {} | excluded {})\n",
+        report.metadata.platform.capability_total,
+        report.metadata.platform.tool_families.len(),
+        report.metadata.platform.capability_domains.len(),
+        report.metadata.platform.implemented,
+        report.metadata.platform.partial,
+        report.metadata.platform.planned,
+        report.metadata.platform.intentionally_excluded
     ));
 
     if let Some(seed) = report.metadata.engine_stats.scan_seed {
@@ -61,6 +96,14 @@ pub fn render(report: &ScanReport) -> String {
 
         if let Some(reverse) = &host.reverse_dns {
             out.push_str(&format!("rDNS: {}\n", reverse));
+        }
+        if host.device_class.is_some() || host.observed_mac.is_some() {
+            out.push_str(&format!(
+                "Device profile: class={} vendor={} mac={}\n",
+                host.device_class.as_deref().unwrap_or("unknown"),
+                host.device_vendor.as_deref().unwrap_or("unknown"),
+                host.observed_mac.as_deref().unwrap_or("unknown")
+            ));
         }
 
         let open_like: Vec<&PortFinding> = host
@@ -110,6 +153,12 @@ pub fn render(report: &ScanReport) -> String {
                     out.push_str(&format!("- {}\n", warning));
                 }
             }
+            if !host.safety_actions.is_empty() {
+                out.push_str("Safety Actions:\n");
+                for action in &host.safety_actions {
+                    out.push_str(&format!("- {}\n", action));
+                }
+            }
             if !host.insights.is_empty() {
                 out.push_str("Insights:\n");
                 for insight in &host.insights {
@@ -138,6 +187,11 @@ pub fn render(report: &ScanReport) -> String {
             out.push_str(&format!(
                 "Warnings: {} (use -v for detailed sections)\n",
                 host.warnings.len()
+            ));
+        } else if !host.safety_actions.is_empty() {
+            out.push_str(&format!(
+                "Safety actions: {} (use -v for detailed sections)\n",
+                host.safety_actions.len()
             ));
         }
     }

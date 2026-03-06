@@ -23,6 +23,13 @@ pub struct MultiStageProbeReport {
     pub notes: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct MultiStageProbePolicy {
+    pub max_concurrency: usize,
+    pub fragile_mode: bool,
+    pub safety_blacklist: Vec<u16>,
+}
+
 #[derive(Debug, Clone)]
 struct PortProbeUpdate {
     index: usize,
@@ -38,28 +45,50 @@ pub async fn run_multi_stage_tcp_probe_pipeline(
     findings: &mut [PortFinding],
     fingerprint_db: Arc<FingerprintDatabase>,
     timeout_budget: Duration,
-    max_concurrency: usize,
+    policy: MultiStageProbePolicy,
 ) -> MultiStageProbeReport {
     let mut report = MultiStageProbeReport::default();
-    let mut candidates = findings
-        .iter()
-        .enumerate()
-        .filter_map(|(index, finding)| {
-            if finding.protocol != "tcp" || !matches!(finding.state, PortState::Open) {
-                return None;
-            }
-            Some((index, finding.port))
-        })
-        .collect::<VecDeque<_>>();
+    let mut candidates = VecDeque::new();
+    let mut blacklisted_ports = Vec::new();
+
+    for (index, finding) in findings.iter().enumerate() {
+        if finding.protocol != "tcp" || !matches!(finding.state, PortState::Open) {
+            continue;
+        }
+        if policy.safety_blacklist.contains(&finding.port) {
+            blacklisted_ports.push(finding.port);
+            continue;
+        }
+        candidates.push_back((index, finding.port));
+    }
+
+    if !blacklisted_ports.is_empty() {
+        blacklisted_ports.sort_unstable();
+        blacklisted_ports.dedup();
+        report.notes.push(format!(
+            "stage2-intelligence safety skip: blocked ports {:?}",
+            blacklisted_ports
+        ));
+    }
+    if policy.fragile_mode {
+        report.notes.push(
+            "stage2-intelligence fragile-mode active: concurrency capped for low-power target"
+                .to_string(),
+        );
+    }
 
     if candidates.is_empty() {
         report
             .notes
-            .push("stage2-intelligence skipped: no open tcp ports".to_string());
+            .push("stage2-intelligence skipped: no eligible open tcp ports".to_string());
         return report;
     }
 
-    let concurrency = max_concurrency.clamp(1, 128).min(candidates.len().max(1));
+    let concurrency_cap = if policy.fragile_mode { 8 } else { 128 };
+    let concurrency = policy
+        .max_concurrency
+        .clamp(1, concurrency_cap)
+        .min(candidates.len().max(1));
     let mut in_flight = FuturesUnordered::new();
 
     while !candidates.is_empty() || !in_flight.is_empty() {
@@ -282,7 +311,7 @@ fn sanitize_banner(raw: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{run_multi_stage_tcp_probe_pipeline, MultiStageProbeReport};
+    use super::{run_multi_stage_tcp_probe_pipeline, MultiStageProbePolicy, MultiStageProbeReport};
     use crate::fingerprint_db::FingerprintDatabase;
     use crate::models::{PortFinding, PortState};
     use std::net::{IpAddr, Ipv4Addr};
@@ -325,7 +354,11 @@ mod tests {
             &mut findings,
             Arc::new(FingerprintDatabase::empty()),
             Duration::from_millis(650),
-            8,
+            MultiStageProbePolicy {
+                max_concurrency: 8,
+                fragile_mode: false,
+                safety_blacklist: Vec::new(),
+            },
         )
         .await;
 
@@ -360,7 +393,11 @@ mod tests {
             &mut findings,
             Arc::new(FingerprintDatabase::empty()),
             Duration::from_millis(400),
-            4,
+            MultiStageProbePolicy {
+                max_concurrency: 4,
+                fragile_mode: false,
+                safety_blacklist: Vec::new(),
+            },
         ));
         assert_eq!(report.tasks_spawned, 0);
         assert_eq!(report.services_identified, 0);

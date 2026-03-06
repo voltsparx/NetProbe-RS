@@ -22,9 +22,29 @@ impl ExecutionMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanPersona {
+    StealthSafe,
+    Discovery,
+    Audit,
+    MassScan,
+}
+
+impl ScanPersona {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScanPersona::StealthSafe => "stealth-safe",
+            ScanPersona::Discovery => "discovery",
+            ScanPersona::Audit => "audit",
+            ScanPersona::MassScan => "mass-scan",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ScanStrategy {
     pub mode: ExecutionMode,
+    pub persona: ScanPersona,
     pub rate_limit_pps: u32,
     pub burst_size: usize,
     pub max_retries: u8,
@@ -73,7 +93,20 @@ pub fn plan(request: &ScanRequest, host_count: usize, port_count: usize) -> Scan
         mode = ExecutionMode::Hybrid;
     }
 
-    let (rate_limit_pps, burst_size, max_retries) = match mode {
+    let persona = if matches!(request.profile, ScanProfile::Stealth)
+        || request.strict_safety
+        || request.lab_mode
+    {
+        ScanPersona::StealthSafe
+    } else if mode == ExecutionMode::PacketBlast && probe_volume >= 200_000 {
+        ScanPersona::MassScan
+    } else if request.service_detection && matches!(request.profile, ScanProfile::Aggressive) {
+        ScanPersona::Audit
+    } else {
+        ScanPersona::Discovery
+    };
+
+    let (mut rate_limit_pps, mut burst_size, mut max_retries) = match mode {
         ExecutionMode::Async => (1_500, 32, 1),
         ExecutionMode::Hybrid => (6_000, 96, 2),
         ExecutionMode::PacketBlast => (80_000, 1024, 1),
@@ -95,6 +128,33 @@ pub fn plan(request: &ScanRequest, host_count: usize, port_count: usize) -> Scan
         ExecutionMode::PacketBlast => Duration::from_millis(0),
     };
 
+    match persona {
+        ScanPersona::StealthSafe => {
+            rate_limit_pps = rate_limit_pps.min(2_000);
+            burst_size = burst_size.min(64);
+            max_retries = max_retries.max(2);
+            recommended_delay = recommended_delay.max(Duration::from_millis(10));
+            recommended_timeout = recommended_timeout.max(Duration::from_millis(1800));
+            recommended_concurrency = recommended_concurrency.min(64);
+        }
+        ScanPersona::Discovery => {
+            rate_limit_pps = rate_limit_pps.min(20_000);
+            burst_size = burst_size.min(256);
+            recommended_concurrency = recommended_concurrency.min(256);
+        }
+        ScanPersona::Audit => {
+            max_retries = max_retries.max(2);
+            recommended_timeout = recommended_timeout.max(Duration::from_millis(900));
+            recommended_concurrency = recommended_concurrency.min(512);
+        }
+        ScanPersona::MassScan => {
+            rate_limit_pps = rate_limit_pps.max(100_000);
+            burst_size = burst_size.max(1024);
+            max_retries = max_retries.min(1);
+            recommended_delay = Duration::ZERO;
+        }
+    }
+
     if matches!(request.profile, ScanProfile::Stealth) {
         recommended_concurrency = recommended_concurrency.min(48);
         recommended_timeout = recommended_timeout.max(Duration::from_millis(2200));
@@ -107,8 +167,9 @@ pub fn plan(request: &ScanRequest, host_count: usize, port_count: usize) -> Scan
 
     let notes = vec![
         format!(
-            "strategy selected: mode={} (estimated probes={})",
+            "strategy selected: mode={} persona={} (estimated probes={})",
             mode.as_str(),
+            persona.as_str(),
             probe_volume
         ),
         format!(
@@ -119,6 +180,7 @@ pub fn plan(request: &ScanRequest, host_count: usize, port_count: usize) -> Scan
 
     ScanStrategy {
         mode,
+        persona,
         rate_limit_pps,
         burst_size,
         max_retries,
@@ -163,6 +225,7 @@ mod tests {
     fn base_request() -> ScanRequest {
         ScanRequest {
             target: "127.0.0.1".to_string(),
+            session_id: None,
             ports: vec![22, 80, 443],
             top_ports: None,
             include_udp: false,

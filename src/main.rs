@@ -19,6 +19,7 @@ mod fetchers;
 mod fingerprint_db;
 mod models;
 mod output;
+mod platform;
 mod reporter;
 mod scheduler;
 mod service_db;
@@ -33,7 +34,7 @@ use std::path::Path;
 #[cfg(unix)]
 use std::process::{Command, ExitStatus};
 
-use crate::cli::Cli;
+use crate::cli::{Cli, CliAction, SessionCommand};
 use crate::error::{NProbeError, NProbeResult};
 use crate::models::ScanRequest;
 
@@ -46,6 +47,10 @@ async fn main() {
 }
 
 async fn run() -> NProbeResult<()> {
+    core::stop_signal::reset();
+    core::stop_signal::install_ctrlc_handler()
+        .map_err(|err| NProbeError::Config(format!("failed to install Ctrl+C handler: {err}")))?;
+
     if let Some(help_text) = cli::maybe_render_quick_help_mode() {
         println!("{help_text}");
         return Ok(());
@@ -61,16 +66,47 @@ async fn run() -> NProbeResult<()> {
         return Ok(());
     }
 
-    let raw_args: Vec<OsString> = std::env::args_os().collect();
     let cli = Cli::parse_normalized();
-    let mut request = cli.into_request()?;
-    config::apply_defaults(&mut request)?;
+    match cli.into_action()? {
+        CliAction::Sessions(SessionCommand::List { limit }) => {
+            let records = config::list_scan_sessions(limit)?;
+            println!("{}", cli::render_session_list(&records));
+            Ok(())
+        }
+        CliAction::Sessions(SessionCommand::Show { session_id }) => {
+            let Some(record) = config::load_scan_session(&session_id)? else {
+                return Err(NProbeError::Cli(format!(
+                    "session '{session_id}' was not found"
+                )));
+            };
+            println!("{}", cli::render_session_detail(&record));
+            Ok(())
+        }
+        CliAction::Scan(mut request) => {
+            let raw_args: Vec<OsString> = std::env::args_os().collect();
+            config::apply_defaults(&mut request)?;
 
-    maybe_reexec_with_root(&request, &raw_args[1..])?;
+            maybe_reexec_with_root(&request, &raw_args[1..])?;
 
-    config::init_and_update(&request)?;
-    core::orchestrator::run_scan(request).await?;
-    Ok(())
+            config::ensure_session_id(&mut request);
+            config::init_and_update(&request)?;
+            let mut session = config::start_scan_session(&request)?;
+            let request = *request;
+
+            match core::orchestrator::run_scan(request).await {
+                Ok(report) => {
+                    let interrupted = core::stop_signal::should_stop();
+                    config::complete_scan_session(&mut session, &report, interrupted)?;
+                    Ok(())
+                }
+                Err(err) => {
+                    let interrupted = core::stop_signal::should_stop();
+                    let _ = config::fail_scan_session(&mut session, &err, interrupted);
+                    Err(err)
+                }
+            }
+        }
+    }
 }
 
 fn maybe_reexec_with_root(request: &ScanRequest, raw_args: &[OsString]) -> NProbeResult<()> {

@@ -6,17 +6,20 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process;
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{NProbeError, NProbeResult};
-use crate::models::{ScanProfile, ScanRequest};
+use crate::models::{ScanProfile, ScanReport, ScanRequest};
 
 const CONFIG_DIR_NAME: &str = ".nprobe-rs-config";
 const CONFIG_FILE_NAME: &str = "config.ini";
 const CHECKPOINT_DIR_NAME: &str = "checkpoints";
+const SESSION_DIR_NAME: &str = "sessions";
 const SHARD_CHECKPOINT_VERSION: u8 = 1;
+const SCAN_SESSION_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardCheckpointState {
@@ -51,6 +54,53 @@ pub struct ShardCheckpointArgs {
     pub scan_seed: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanSessionStatus {
+    Running,
+    Completed,
+    Interrupted,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanSessionRecord {
+    pub version: u8,
+    pub session_id: String,
+    pub status: ScanSessionStatus,
+    pub target: String,
+    pub profile: String,
+    pub report_format: String,
+    pub started_at: String,
+    pub updated_at: String,
+    pub finished_at: Option<String>,
+    pub scan_seed: Option<u64>,
+    pub total_shards: Option<u16>,
+    pub shard_index: Option<u16>,
+    pub rate_limit_pps: Option<u32>,
+    pub burst_size: Option<usize>,
+    pub max_retries: Option<u8>,
+    pub output_path: Option<String>,
+    pub host_count: Option<usize>,
+    pub responded_hosts: Option<usize>,
+    pub duration_ms: Option<i64>,
+    pub failure_category: Option<String>,
+    pub recovery_hint: Option<String>,
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+impl ScanSessionStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ScanSessionStatus::Running => "running",
+            ScanSessionStatus::Completed => "completed",
+            ScanSessionStatus::Interrupted => "interrupted",
+            ScanSessionStatus::Failed => "failed",
+        }
+    }
+}
+
 impl ShardCheckpointState {
     pub fn new(args: ShardCheckpointArgs) -> Self {
         Self {
@@ -67,6 +117,42 @@ impl ShardCheckpointState {
             scan_seed: args.scan_seed,
             updated_at: Utc::now().to_rfc3339(),
         }
+    }
+}
+
+impl ScanSessionRecord {
+    fn from_request(request: &ScanRequest) -> NProbeResult<Self> {
+        let session_id = request.session_id.clone().ok_or_else(|| {
+            NProbeError::Config("missing session_id while creating session record".to_string())
+        })?;
+        let started_at = Utc::now().to_rfc3339();
+        Ok(Self {
+            version: SCAN_SESSION_VERSION,
+            session_id,
+            status: ScanSessionStatus::Running,
+            target: request.target.clone(),
+            profile: format!("{:?}", request.profile).to_ascii_lowercase(),
+            report_format: format!("{:?}", request.report_format).to_ascii_lowercase(),
+            started_at: started_at.clone(),
+            updated_at: started_at,
+            finished_at: None,
+            scan_seed: request.scan_seed,
+            total_shards: request.total_shards,
+            shard_index: request.shard_index,
+            rate_limit_pps: request.rate_limit_pps,
+            burst_size: request.burst_size,
+            max_retries: request.max_retries,
+            output_path: request
+                .output_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            host_count: None,
+            responded_hosts: None,
+            duration_ms: None,
+            failure_category: None,
+            recovery_hint: None,
+            notes: Vec::new(),
+        })
     }
 }
 
@@ -175,6 +261,135 @@ pub fn init_and_update(request: &ScanRequest) -> NProbeResult<PathBuf> {
     Ok(config_path)
 }
 
+pub fn ensure_session_id(request: &mut ScanRequest) {
+    if request.session_id.is_none() {
+        request.session_id = Some(generate_session_id(request));
+    }
+}
+
+pub fn start_scan_session(request: &ScanRequest) -> NProbeResult<ScanSessionRecord> {
+    let record = ScanSessionRecord::from_request(request)?;
+    save_scan_session(&record)?;
+    Ok(record)
+}
+
+pub fn list_scan_sessions(limit: usize) -> NProbeResult<Vec<ScanSessionRecord>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let session_dir = resolve_config_dir()?.join(SESSION_DIR_NAME);
+    if !session_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut records = Vec::new();
+    for entry in fs::read_dir(session_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !entry.file_type()?.is_file()
+            || path.extension().and_then(|value| value.to_str()) != Some("json")
+        {
+            continue;
+        }
+
+        let Ok(body) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_str::<ScanSessionRecord>(&body) else {
+            continue;
+        };
+        records.push(record);
+    }
+
+    records.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| right.session_id.cmp(&left.session_id))
+    });
+    records.truncate(limit);
+    Ok(records)
+}
+
+pub fn load_scan_session(session_id: &str) -> NProbeResult<Option<ScanSessionRecord>> {
+    let session_path = session_file_path(session_id)?;
+    if !session_path.exists() {
+        return Ok(None);
+    }
+
+    let body = fs::read_to_string(&session_path)?;
+    let record = serde_json::from_str::<ScanSessionRecord>(&body).map_err(|err| {
+        NProbeError::Config(format!(
+            "failed to parse session record '{}': {err}",
+            session_path.display()
+        ))
+    })?;
+    Ok(Some(record))
+}
+
+pub fn complete_scan_session(
+    record: &mut ScanSessionRecord,
+    report: &ScanReport,
+    interrupted: bool,
+) -> NProbeResult<PathBuf> {
+    let responded_hosts = report
+        .hosts
+        .iter()
+        .filter(|host| {
+            host.ports.iter().any(|port| {
+                matches!(
+                    port.state,
+                    crate::models::PortState::Open | crate::models::PortState::Closed
+                )
+            })
+        })
+        .count();
+    record.status = if interrupted {
+        ScanSessionStatus::Interrupted
+    } else {
+        ScanSessionStatus::Completed
+    };
+    record.updated_at = Utc::now().to_rfc3339();
+    record.finished_at = Some(report.metadata.finished_at.to_rfc3339());
+    record.host_count = Some(report.hosts.len());
+    record.responded_hosts = Some(responded_hosts);
+    record.duration_ms = Some(report.metadata.duration_ms);
+    record.failure_category = None;
+    record.recovery_hint = None;
+    record.notes.push(if interrupted {
+        "scan interrupted by stop signal; partial report persisted".to_string()
+    } else {
+        "scan completed successfully".to_string()
+    });
+    record.notes.sort_unstable();
+    record.notes.dedup();
+    save_scan_session(record)
+}
+
+pub fn fail_scan_session(
+    record: &mut ScanSessionRecord,
+    error: &NProbeError,
+    interrupted: bool,
+) -> NProbeResult<PathBuf> {
+    record.status = if interrupted {
+        ScanSessionStatus::Interrupted
+    } else {
+        ScanSessionStatus::Failed
+    };
+    record.updated_at = Utc::now().to_rfc3339();
+    record.finished_at = Some(record.updated_at.clone());
+    record.failure_category = Some(error.category().to_string());
+    record.recovery_hint = Some(error.recovery_hint().to_string());
+    record.notes.push(format!(
+        "terminal-status: {}",
+        sanitize_value(&error.to_string())
+    ));
+    record.notes.sort_unstable();
+    record.notes.dedup();
+    save_scan_session(record)
+}
+
 pub fn load_shard_checkpoint(signature: &str) -> NProbeResult<Option<ShardCheckpointState>> {
     let checkpoint_path = shard_checkpoint_path(signature)?;
     if !checkpoint_path.exists() {
@@ -233,6 +448,10 @@ fn update_runtime_values(kv: &mut BTreeMap<String, String>, request: &ScanReques
     kv.insert("config_version".to_string(), "1".to_string());
     kv.insert("last_run_utc".to_string(), Utc::now().to_rfc3339());
     kv.insert("last_target".to_string(), request.target.clone());
+    kv.insert(
+        "last_session_id".to_string(),
+        request.session_id.clone().unwrap_or_default(),
+    );
     kv.insert(
         "last_profile".to_string(),
         format!("{:?}", request.profile).to_ascii_lowercase(),
@@ -356,8 +575,18 @@ fn shard_checkpoint_path(signature: &str) -> NProbeResult<PathBuf> {
         .join(checkpoint_file_name(signature)))
 }
 
+fn session_file_path(session_id: &str) -> NProbeResult<PathBuf> {
+    Ok(resolve_config_dir()?
+        .join(SESSION_DIR_NAME)
+        .join(session_file_name(session_id)))
+}
+
 fn checkpoint_file_name(signature: &str) -> String {
     format!("shard-{signature}.json")
+}
+
+fn session_file_name(session_id: &str) -> String {
+    format!("session-{session_id}.json")
 }
 
 fn detect_home_dir() -> Option<PathBuf> {
@@ -460,6 +689,63 @@ fn write_ini_map(path: &Path, map: &BTreeMap<String, String>) -> NProbeResult<()
 
 fn sanitize_value(value: &str) -> String {
     value.replace(['\n', '\r'], " ")
+}
+
+fn generate_session_id(request: &ScanRequest) -> String {
+    let timestamp = Utc::now().format("%Y%m%d%H%M%S").to_string();
+    let mut seed_input = String::new();
+    seed_input.push_str(&request.target);
+    seed_input.push('|');
+    seed_input.push_str(&format!("{:?}", request.profile));
+    seed_input.push('|');
+    seed_input.push_str(
+        &request
+            .scan_seed
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+    );
+    seed_input.push('|');
+    seed_input.push_str(&process::id().to_string());
+    seed_input.push('|');
+    seed_input.push_str(&timestamp);
+
+    format!("scan-{timestamp}-{:016x}", fnv1a64(seed_input.as_bytes()))
+}
+
+fn save_scan_session(record: &ScanSessionRecord) -> NProbeResult<PathBuf> {
+    let session_path = session_file_path(&record.session_id)?;
+    let parent = session_path.parent().ok_or_else(|| {
+        NProbeError::Config("invalid session path without parent directory".to_string())
+    })?;
+    fs::create_dir_all(parent)?;
+
+    let tmp_path = parent.join(format!("{}.tmp", session_file_name(&record.session_id)));
+    let mut record_to_save = record.clone();
+    record_to_save.updated_at = Utc::now().to_rfc3339();
+    let body = serde_json::to_string_pretty(&record_to_save)?;
+    fs::write(&tmp_path, body)?;
+
+    if session_path.exists() {
+        let _ = fs::remove_file(&session_path);
+    }
+    fs::rename(&tmp_path, &session_path).map_err(|err| {
+        let _ = fs::remove_file(&tmp_path);
+        NProbeError::Io(err)
+    })?;
+
+    Ok(session_path)
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut hash = OFFSET_BASIS;
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
 }
 
 fn parse_profile(raw: &str) -> Option<ScanProfile> {

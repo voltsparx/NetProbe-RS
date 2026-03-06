@@ -25,4 +25,5 @@ pub mod scoring {
     pub use crate::reporter::scoring::*;
 }
 
+pub mod device_profile;
 pub mod strategy;

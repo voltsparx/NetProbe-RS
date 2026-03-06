@@ -13,6 +13,7 @@ use chrono::Utc;
 use futures::stream::{FuturesUnordered, StreamExt};
 
 use crate::config::{self, ShardCheckpointArgs, ShardCheckpointState};
+use crate::core::stop_signal;
 use crate::engine_async::port_scan as async_port_scan;
 use crate::engine_intel::{
     analysis,
@@ -29,6 +30,7 @@ use crate::models::{
     EngineStats, HostResult, KnowledgeStats, ScanMetadata, ScanProfile, ScanReport, ScanRequest,
     ScanRequestSummary,
 };
+use crate::platform::capability_registry;
 use crate::service_db::ServiceRegistry;
 
 const MAX_RESOLVED_HOSTS: usize = 16;
@@ -68,6 +70,8 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
     let mut global_warnings = Vec::new();
     let resolved = resolve_targets(&request, &mut global_warnings).await?;
     thread_pool_tasks += 1;
+    let public_target_policy_applied =
+        resolved.iter().any(|ip| !is_private_or_local(ip)) && request.allow_external;
 
     enforce_safety(&mut request, &resolved, &mut global_warnings)?;
     enforce_privileged_modes(&mut request, &mut global_warnings)?;
@@ -160,6 +164,9 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
     let mut lua_hooks_ran = false;
 
     while in_flight.len() < host_concurrency {
+        if stop_signal::should_stop() {
+            break;
+        }
         let Some(work_item) = host_queue.pop_front() else {
             break;
         };
@@ -175,6 +182,9 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
     }
 
     while let Some(result) = in_flight.next().await {
+        if stop_signal::should_stop() {
+            break;
+        }
         let execution = result?;
         async_tasks += execution.async_tasks;
         thread_pool_tasks += execution.thread_pool_tasks;
@@ -196,6 +206,9 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
         }
 
         if let Some(work_item) = host_queue.pop_front() {
+            if stop_signal::should_stop() {
+                break;
+            }
             in_flight.push(process_host(
                 request.clone(),
                 work_item,
@@ -211,6 +224,9 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
     if defer_host_enrichment {
         hosts = merge_hosts_by_ip(hosts);
         for host in &mut hosts {
+            if stop_signal::should_stop() {
+                break;
+            }
             let (extra_thread_pool_tasks, extra_parallel_tasks, extra_lua_hooks_ran) =
                 finalize_host(&request, host).await?;
             thread_pool_tasks += extra_thread_pool_tasks;
@@ -247,8 +263,32 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
 
     let finished = Utc::now();
     let fp_stats = fingerprint_db.stats();
+    let platform = capability_registry::summary();
+    let profiled_hosts = hosts
+        .iter()
+        .filter(|host| host.device_class.is_some())
+        .count();
+    let fragile_hosts = hosts
+        .iter()
+        .filter(|host| {
+            matches!(
+                host.device_class.as_deref(),
+                Some("fragile-embedded") | Some("printer-sensitive")
+            )
+        })
+        .count();
+    let safety_ports_suppressed = hosts
+        .iter()
+        .flat_map(|host| host.ports.iter())
+        .filter(|port| port.matched_by.as_deref() == Some("device-profile-safety"))
+        .count();
+    let safety_envelope_active = request.lab_mode
+        || request.strict_safety
+        || public_target_policy_applied
+        || fragile_hosts > 0;
     let report = ScanReport {
         metadata: ScanMetadata {
+            session_id: request.session_id.clone(),
             started_at: started,
             finished_at: finished,
             duration_ms: (finished - started).num_milliseconds(),
@@ -257,7 +297,10 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
                 thread_pool_tasks,
                 parallel_tasks,
                 lua_hooks_ran,
+                framework_role: "defensive-learning-platform".to_string(),
+                teaching_mode: request.explain || request.verbose,
                 execution_mode: strategy.mode.as_str().to_string(),
+                scan_persona: strategy.persona.as_str().to_string(),
                 configured_rate_pps: request.rate_limit_pps.unwrap_or(strategy.rate_limit_pps),
                 configured_burst_size: request.burst_size.unwrap_or(strategy.burst_size),
                 max_retries: request.max_retries.unwrap_or(strategy.max_retries),
@@ -271,6 +314,11 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
                 checkpoint_planned_units,
                 checkpoint_completed_units,
                 checkpoint_resumed_units,
+                safety_envelope_active,
+                public_target_policy_applied,
+                profiled_hosts,
+                fragile_hosts,
+                safety_ports_suppressed,
             },
             knowledge: KnowledgeStats {
                 services_loaded: service_registry.service_count(),
@@ -282,6 +330,7 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
                 nse_scripts_seen: fp_stats.nse_scripts,
                 nselib_modules_seen: fp_stats.nselib_modules,
             },
+            platform,
         },
         request: ScanRequestSummary {
             target: request.target.clone(),
@@ -485,6 +534,7 @@ fn merge_hosts_by_ip(hosts: Vec<HostResult>) -> Vec<HostResult> {
         if let Some(existing_idx) = index_by_ip.get(&host.ip).copied() {
             let existing = &mut merged[existing_idx];
             existing.ports.append(&mut host.ports);
+            existing.safety_actions.append(&mut host.safety_actions);
             existing.warnings.append(&mut host.warnings);
             existing.insights.append(&mut host.insights);
             existing.defensive_advice.append(&mut host.defensive_advice);
@@ -492,6 +542,15 @@ fn merge_hosts_by_ip(hosts: Vec<HostResult>) -> Vec<HostResult> {
             existing.lua_findings.append(&mut host.lua_findings);
             if existing.reverse_dns.is_none() {
                 existing.reverse_dns = host.reverse_dns.take();
+            }
+            if existing.observed_mac.is_none() {
+                existing.observed_mac = host.observed_mac.take();
+            }
+            if existing.device_class.is_none() {
+                existing.device_class = host.device_class.take();
+            }
+            if existing.device_vendor.is_none() {
+                existing.device_vendor = host.device_vendor.take();
             }
         } else {
             index_by_ip.insert(host.ip.clone(), merged.len());
@@ -507,6 +566,7 @@ fn merge_hosts_by_ip(hosts: Vec<HostResult>) -> Vec<HostResult> {
         });
         host.ports
             .dedup_by(|left, right| left.port == right.port && left.protocol == right.protocol);
+        dedupe_sort_strings(&mut host.safety_actions);
         dedupe_sort_strings(&mut host.warnings);
         dedupe_sort_strings(&mut host.insights);
         dedupe_sort_strings(&mut host.defensive_advice);
@@ -582,18 +642,17 @@ fn enforce_safety(
         );
 
         if !request.allow_external {
-            warnings.push(
-                "no --allow-external flag supplied: applying conservative network limits"
+            return Err(NProbeError::Safety(
+                "public target detected: pass --allow-external (alias: --force-internet) to continue"
                     .to_string(),
-            );
-            apply_conservative_limits(request);
-            if request.strict_safety {
-                return Err(NProbeError::Safety(
-                    "strict safety is enabled and external targets were detected without --allow-external"
-                        .to_string(),
-                ));
-            }
+            ));
         }
+
+        apply_conservative_limits(request);
+        warnings.push(
+            "public-target safety envelope active: conservative concurrency, delay, and timeout caps applied"
+                .to_string(),
+        );
     }
 
     if request.lab_mode {
@@ -1050,6 +1109,7 @@ mod tests {
     fn base_request() -> ScanRequest {
         ScanRequest {
             target: "127.0.0.1".to_string(),
+            session_id: None,
             ports: vec![22, 80, 443],
             top_ports: None,
             include_udp: false,

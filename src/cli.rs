@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+use crate::config::ScanSessionRecord;
 use crate::error::{NProbeError, NProbeResult};
 use crate::models::{ReportFormat, ScanProfile, ScanRequest};
 
@@ -37,7 +38,7 @@ impl FileType {
     name = "nprobe-rs",
     version,
     about = "NProbe-RS: Reverse-Engineered scanner in safe, explainable Rust",
-    override_usage = "nprobe-rs <target> [OPTIONS]\n       nprobe-rs scan <target> [OPTIONS]",
+    override_usage = "nprobe-rs <target> [OPTIONS]\n       nprobe-rs scan <target> [OPTIONS]\n       nprobe-rs sessions [OPTIONS]",
     after_help = "Nmap-style shortcuts supported: -sU, -sS, -A, -T0..-T5, -p-",
     arg_required_else_help = true
 )]
@@ -48,7 +49,20 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    Scan(ScanArgs),
+    Scan(Box<ScanArgs>),
+    Sessions(SessionArgs),
+}
+
+#[derive(Debug, Clone)]
+pub enum CliAction {
+    Scan(Box<ScanRequest>),
+    Sessions(SessionCommand),
+}
+
+#[derive(Debug, Clone)]
+pub enum SessionCommand {
+    List { limit: usize },
+    Show { session_id: String },
 }
 
 #[derive(Debug, Args)]
@@ -195,7 +209,7 @@ struct ScanArgs {
     #[arg(
         short = 'a',
         long = "allow-external",
-        visible_alias = "allow-public",
+        visible_aliases = ["allow-public", "force-internet"],
         help = "Acknowledge and allow scanning public IP targets"
     )]
     allow_external: bool,
@@ -281,15 +295,25 @@ struct ScanArgs {
     fresh_scan: bool,
 }
 
+#[derive(Debug, Args)]
+struct SessionArgs {
+    #[arg(long = "limit", default_value_t = 20, help = "Max sessions to list")]
+    limit: usize,
+
+    #[arg(long = "show", help = "Show a specific session by id")]
+    session_id: Option<String>,
+}
+
 impl Cli {
     pub fn parse_normalized() -> Self {
         let args: Vec<OsString> = std::env::args_os().collect();
         Self::parse_from(normalize_args(args))
     }
 
-    pub fn into_request(self) -> NProbeResult<ScanRequest> {
+    pub fn into_action(self) -> NProbeResult<CliAction> {
         match self.command {
-            Commands::Scan(scan) => scan.into_request(),
+            Commands::Scan(scan) => Ok(CliAction::Scan(Box::new(scan.into_request()?))),
+            Commands::Sessions(args) => args.into_action(),
         }
     }
 }
@@ -383,8 +407,34 @@ pub fn maybe_render_quick_help_mode() -> Option<String> {
     }
 
     Some(
-        "Usage:\n  nprobe-rs <target> [options]\n\nCommon options:\n  -p, --ports <list|range>   Select ports (example: -p 22,80,443)\n      --all-ports            Scan ports 1-65535 (Nmap: -p-)\n  -U, --udp                  Enable UDP probes (Nmap: -sU)\n  -S, --syn                  Enable privileged TCP probes (Nmap: -sS)\n      --arp                  Enable ARP neighbor discovery (local IPv4)\n  -A, --aggressive           Aggressive mode (Nmap: -A)\n  -w, --timeout-ms <ms>      Probe timeout in milliseconds\n      --rate-pps <num>       Dispatch rate target in packets per second\n      --burst-size <num>     Token-bucket burst limit\n      --max-retries <num>    Adaptive retries per probe (0..20)\n      --total-shards <num>   Total shard count for distributed scans\n      --shard-index <num>    Current shard index (requires total-shards)\n      --scan-seed <num>      Deterministic port shuffle seed\n      --resume               Resume from shard checkpoint\n      --fresh-scan           Ignore/reset shard checkpoint for this run\n  -r, --reverse-dns          Enable reverse DNS lookups\n  -n, --no-dns               Disable reverse DNS lookups\n  -e, --explain              Add concise per-port rationale in output\n  -v, --verbose              Show full output sections\n  -f, --file-type <type>     Export format: txt|json|html|csv\n  -o, --output <name>        Output filename\n  -L, --location <dir>       Output directory\n\nNmap-style shortcuts accepted:\n  -sU  -sS  -A  -T0..-T5  -p-\n\nFlag docs mode:\n  nprobe-rs --flag-help --scan\n  nprobe-rs --flag-help -sU\n  nprobe-rs --explain --scan   (legacy alias)\n\nCompatibility:\n  nprobe-rs scan <target> [options] still works.".to_string(),
+        "Usage:\n  nprobe-rs <target> [options]\n  nprobe-rs sessions [--limit N]\n  nprobe-rs sessions --show <session-id>\n\nCommon options:\n  -p, --ports <list|range>   Select ports (example: -p 22,80,443)\n      --all-ports            Scan ports 1-65535 (Nmap: -p-)\n  -U, --udp                  Enable UDP probes (Nmap: -sU)\n  -S, --syn                  Enable privileged TCP probes (Nmap: -sS)\n      --arp                  Enable ARP neighbor discovery (local IPv4)\n  -A, --aggressive           Aggressive mode (Nmap: -A)\n  -w, --timeout-ms <ms>      Probe timeout in milliseconds\n      --rate-pps <num>       Dispatch rate target in packets per second\n      --burst-size <num>     Token-bucket burst limit\n      --max-retries <num>    Adaptive retries per probe (0..20)\n      --total-shards <num>   Total shard count for distributed scans\n      --shard-index <num>    Current shard index (requires total-shards)\n      --scan-seed <num>      Deterministic port shuffle seed\n      --resume               Resume from shard checkpoint\n      --fresh-scan           Ignore/reset shard checkpoint for this run\n  -r, --reverse-dns          Enable reverse DNS lookups\n  -n, --no-dns               Disable reverse DNS lookups\n  -e, --explain              Add concise per-port rationale in output\n  -v, --verbose              Show full output sections\n  -f, --file-type <type>     Export format: txt|json|html|csv\n  -o, --output <name>        Output filename\n  -L, --location <dir>       Output directory\n\nSession history:\n  nprobe-rs sessions --limit 20\n  nprobe-rs sessions --show <session-id>\n\nNmap-style shortcuts accepted:\n  -sU  -sS  -A  -T0..-T5  -p-\n\nFlag docs mode:\n  nprobe-rs --flag-help --scan\n  nprobe-rs --flag-help -sU\n  nprobe-rs --explain --scan   (legacy alias)\n\nCompatibility:\n  nprobe-rs scan <target> [options] still works.".to_string(),
     )
+}
+
+impl SessionArgs {
+    fn into_action(self) -> NProbeResult<CliAction> {
+        if self.limit == 0 {
+            return Err(NProbeError::Cli(
+                "--limit must be greater than 0".to_string(),
+            ));
+        }
+
+        if let Some(session_id) = self.session_id {
+            let trimmed = session_id.trim();
+            if trimmed.is_empty() {
+                return Err(NProbeError::Cli(
+                    "--show requires a non-empty session id".to_string(),
+                ));
+            }
+            return Ok(CliAction::Sessions(SessionCommand::Show {
+                session_id: trimmed.to_string(),
+            }));
+        }
+
+        Ok(CliAction::Sessions(SessionCommand::List {
+            limit: self.limit,
+        }))
+    }
 }
 
 fn render_flag_explain(raw_query: Option<&str>) -> String {
@@ -591,6 +641,7 @@ impl ScanArgs {
 
         Ok(ScanRequest {
             target: self.target,
+            session_id: None,
             ports,
             top_ports,
             include_udp: self.udp || effective_aggressive_root,
@@ -691,8 +742,144 @@ fn should_inject_scan(mapped: &[OsString]) -> bool {
     let first = mapped[0].to_string_lossy();
     !matches!(
         first.as_ref(),
-        "scan" | "-h" | "--help" | "-V" | "--version"
+        "scan" | "sessions" | "-h" | "--help" | "-V" | "--version"
     )
+}
+
+pub fn render_session_list(records: &[ScanSessionRecord]) -> String {
+    let mut out = String::new();
+    out.push_str("nprobe-rs session history\n");
+    if records.is_empty() {
+        out.push_str("No persisted sessions found.\n");
+        return out;
+    }
+
+    out.push_str(&format!(
+        "{:<33} {:<12} {:<25} {}\n",
+        "SESSION ID", "STATUS", "UPDATED", "TARGET"
+    ));
+    out.push_str(&format!(
+        "{:-<33} {:-<12} {:-<25} {:-<20}\n",
+        "", "", "", ""
+    ));
+
+    for record in records {
+        out.push_str(&format!(
+            "{:<33} {:<12} {:<25} {}\n",
+            truncate_cell(&record.session_id, 33),
+            record.status.as_str(),
+            truncate_cell(&record.updated_at, 25),
+            record.target
+        ));
+        if let Some(category) = &record.failure_category {
+            out.push_str(&format!("  failure_category={category}\n"));
+        }
+    }
+
+    out
+}
+
+pub fn render_session_detail(record: &ScanSessionRecord) -> String {
+    let mut out = String::new();
+    out.push_str("nprobe-rs session detail\n");
+    out.push_str(&format!("session_id={}\n", record.session_id));
+    out.push_str(&format!("status={}\n", record.status.as_str()));
+    out.push_str(&format!("target={}\n", record.target));
+    out.push_str(&format!("profile={}\n", record.profile));
+    out.push_str(&format!("report_format={}\n", record.report_format));
+    out.push_str(&format!("started_at={}\n", record.started_at));
+    out.push_str(&format!("updated_at={}\n", record.updated_at));
+    out.push_str(&format!(
+        "finished_at={}\n",
+        record.finished_at.as_deref().unwrap_or("n/a")
+    ));
+    out.push_str(&format!(
+        "scan_seed={}\n",
+        record
+            .scan_seed
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "n/a".to_string())
+    ));
+    out.push_str(&format!(
+        "shards={}/{}\n",
+        record
+            .shard_index
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "n/a".to_string()),
+        record
+            .total_shards
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "n/a".to_string())
+    ));
+    out.push_str(&format!(
+        "rate_limit_pps={}\n",
+        record
+            .rate_limit_pps
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "n/a".to_string())
+    ));
+    out.push_str(&format!(
+        "burst_size={}\n",
+        record
+            .burst_size
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "n/a".to_string())
+    ));
+    out.push_str(&format!(
+        "max_retries={}\n",
+        record
+            .max_retries
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "n/a".to_string())
+    ));
+    out.push_str(&format!(
+        "output_path={}\n",
+        record.output_path.as_deref().unwrap_or("n/a")
+    ));
+    out.push_str(&format!(
+        "host_count={}\n",
+        record
+            .host_count
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "n/a".to_string())
+    ));
+    out.push_str(&format!(
+        "responded_hosts={}\n",
+        record
+            .responded_hosts
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "n/a".to_string())
+    ));
+    out.push_str(&format!(
+        "duration_ms={}\n",
+        record
+            .duration_ms
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "n/a".to_string())
+    ));
+    if let Some(category) = &record.failure_category {
+        out.push_str(&format!("failure_category={category}\n"));
+    }
+    if let Some(hint) = &record.recovery_hint {
+        out.push_str(&format!("recovery_hint={hint}\n"));
+    }
+    if !record.notes.is_empty() {
+        out.push_str("notes:\n");
+        for note in &record.notes {
+            out.push_str(&format!("- {note}\n"));
+        }
+    }
+    out
+}
+
+fn truncate_cell(value: &str, width: usize) -> String {
+    let mut chars = value.chars();
+    let truncated: String = chars.by_ref().take(width.saturating_sub(1)).collect();
+    if chars.next().is_some() && width > 1 {
+        format!("{truncated}~")
+    } else {
+        value.to_string()
+    }
 }
 
 fn map_timing_to_profile(level: &str) -> Option<&'static str> {

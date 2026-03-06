@@ -29,6 +29,12 @@ pub fn render(report: &ScanReport) -> String {
 
     html.push_str("<div class=\"card\">");
     html.push_str("<h1>NProbe-RS Report</h1>");
+    if let Some(session_id) = &report.metadata.session_id {
+        html.push_str(&format!(
+            "<div class=\"meta\">Session: {}</div>",
+            esc(session_id)
+        ));
+    }
     html.push_str(&format!(
         "<div class=\"meta\">Started: {}<br>Finished: {}<br>Duration: {} ms</div>",
         report.metadata.started_at, report.metadata.finished_at, report.metadata.duration_ms
@@ -39,6 +45,26 @@ pub fn render(report: &ScanReport) -> String {
         report.metadata.engine_stats.thread_pool_tasks,
         report.metadata.engine_stats.parallel_tasks,
         report.metadata.engine_stats.lua_hooks_ran
+    ));
+    html.push_str(&format!(
+        "<div class=\"meta\">Role: {} | Teaching: {} | Safety envelope: {} | Public target policy: {} | Profiled hosts: {} | Fragile hosts: {} | Suppressed ports: {}</div>",
+        esc(&report.metadata.engine_stats.framework_role),
+        report.metadata.engine_stats.teaching_mode,
+        report.metadata.engine_stats.safety_envelope_active,
+        report.metadata.engine_stats.public_target_policy_applied,
+        report.metadata.engine_stats.profiled_hosts,
+        report.metadata.engine_stats.fragile_hosts,
+        report.metadata.engine_stats.safety_ports_suppressed
+    ));
+    html.push_str(&format!(
+        "<div class=\"meta\">Platform coverage: {} capabilities | tool families {} | domains {} | implemented {} | partial {} | planned {} | excluded {}</div>",
+        report.metadata.platform.capability_total,
+        report.metadata.platform.tool_families.len(),
+        report.metadata.platform.capability_domains.len(),
+        report.metadata.platform.implemented,
+        report.metadata.platform.partial,
+        report.metadata.platform.planned,
+        report.metadata.platform.intentionally_excluded
     ));
     html.push_str(&format!(
         "<div class=\"meta\">Knowledge: services {} | top ports {} | payloads {} | rules {}/{} (skipped {}) | NSE scripts {} | NSE libs {}</div>",
@@ -67,11 +93,26 @@ pub fn render(report: &ScanReport) -> String {
                 esc(reverse)
             ));
         }
+        if host.device_class.is_some() || host.observed_mac.is_some() {
+            html.push_str(&format!(
+                "<div class=\"meta\">Device profile: class={} | vendor={} | mac={}</div>",
+                esc(host.device_class.as_deref().unwrap_or("unknown")),
+                esc(host.device_vendor.as_deref().unwrap_or("unknown")),
+                esc(host.observed_mac.as_deref().unwrap_or("unknown"))
+            ));
+        }
         for warning in &host.warnings {
             html.push_str(&format!(
                 "<div class=\"meta warn\">Warning: {}</div>",
                 esc(warning)
             ));
+        }
+        if !host.safety_actions.is_empty() {
+            html.push_str("<h3>Safety Actions</h3><ul>");
+            for action in &host.safety_actions {
+                html.push_str(&format!("<li>{}</li>", esc(action)));
+            }
+            html.push_str("</ul>");
         }
 
         html.push_str("<table><thead><tr><th>Port</th><th>Proto</th><th>State</th><th>Service</th><th>Reason</th><th>Banner</th><th>Fingerprint</th><th>Learn</th></tr></thead><tbody>");

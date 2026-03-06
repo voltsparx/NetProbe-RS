@@ -32,3 +32,8 @@ own-architecture-notes.txt
 some-safety-notes-so-i-can-implement-later.txt
 my-2023-07-08-ideas.txt
 wireshark-captured-scan-data-summerize.txt
+
+#----------------------
+# Temporarily just in gitignore
+#----------------------
+docs/

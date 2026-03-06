@@ -6,11 +6,13 @@ use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::engine_intel::device_profile::{classify_mac, DeviceClass, DeviceProfile};
 use crate::engine_intel::strategy::ScanStrategy;
 use crate::engine_packet::afxdp_backend::open_afxdp_backends;
+use crate::engine_packet::arp as packet_arp;
 use crate::engine_packet::datalink_backend::open_layer2_backends;
 use crate::engine_packet::intelligence_pipeline::{
-    run_multi_stage_tcp_probe_pipeline, MultiStageProbeReport,
+    run_multi_stage_tcp_probe_pipeline, MultiStageProbePolicy, MultiStageProbeReport,
 };
 use crate::engine_packet::socket_backend::{RawSocketRx, RawSocketTx};
 use crate::engine_packet::syn_scanner::{
@@ -74,7 +76,13 @@ pub async fn run(
         ))
     })?;
 
-    let rate_pps = request.rate_limit_pps.unwrap_or(strategy.rate_limit_pps) as u64;
+    let mut warnings = Vec::<String>::new();
+    let mut safety_actions = Vec::<String>::new();
+    let mut observed_mac = None::<String>;
+    let mut device_class = None::<String>;
+    let mut device_vendor = None::<String>;
+    let base_rate_pps = request.rate_limit_pps.unwrap_or(strategy.rate_limit_pps) as u64;
+    let mut rate_pps = base_rate_pps;
     let burst_size = request.burst_size.unwrap_or(strategy.burst_size);
     let seed = request.scan_seed.unwrap_or(0x4e50_5253_5241_5753_u64);
     let source_port = source_port_from_seed(seed);
@@ -84,9 +92,63 @@ pub async fn run(
         .unwrap_or(strategy.recommended_timeout)
         .clamp(Duration::from_millis(150), Duration::from_secs(10));
 
+    let mut device_profile = None::<DeviceProfile>;
+    if packet_arp::is_lan_ipv4(target_v4) {
+        match packet_arp::resolve_neighbor_mac(target_v4, Duration::from_millis(120)) {
+            Ok(Some(mac)) => {
+                let profile = classify_mac(&mac);
+                observed_mac = Some(mac.clone());
+                device_class = Some(profile.class.to_string());
+                device_vendor = profile.vendor.map(str::to_string);
+                if let Some(max_pps) = profile.max_pps {
+                    rate_pps = rate_pps.min(max_pps as u64);
+                }
+                warnings.push(format!(
+                    "device-profile active: mac={} {}",
+                    mac,
+                    profile.describe()
+                ));
+                safety_actions.push(format!("device-profile:{}", profile.class));
+                if rate_pps < base_rate_pps {
+                    warnings.push(format!(
+                        "device-profile throttle applied: rate reduced from {}pps to {}pps",
+                        base_rate_pps, rate_pps
+                    ));
+                    safety_actions.push(format!("rate-capped:{}->{}pps", base_rate_pps, rate_pps));
+                }
+                device_profile = Some(profile);
+            }
+            Ok(None) => {
+                warnings.push(
+                    "device-profile skipped: no neighbor MAC resolved for LAN target".to_string(),
+                );
+            }
+            Err(err) => {
+                warnings.push(format!("device-profile skipped: arp lookup failed: {err}"));
+            }
+        }
+    }
+
+    let safety_blacklist = device_profile
+        .map(|profile| profile.safety_blacklist.to_vec())
+        .unwrap_or_default();
+    let blocked_ports = ports
+        .iter()
+        .copied()
+        .filter(|port| safety_blacklist.contains(port))
+        .collect::<Vec<_>>();
+    if !blocked_ports.is_empty() {
+        warnings.push(format!(
+            "device-profile safety blacklist applied: skipping ports {:?}",
+            blocked_ports
+        ));
+        safety_actions.push(format!("ports-skipped:{blocked_ports:?}"));
+    }
+
     let scan_targets = ports
         .iter()
         .copied()
+        .filter(|port| !safety_blacklist.contains(port))
         .map(|port| (target_v4, port))
         .collect::<Vec<_>>();
     let mut fusion_engine = FusionEngine::default();
@@ -180,6 +242,20 @@ pub async fn run(
         index_by_port.insert(finding.port, idx);
     }
 
+    for port in &blocked_ports {
+        if let Some(idx) = index_by_port.get(port).copied() {
+            let entry = &mut final_findings[idx];
+            entry.state = PortState::Filtered;
+            entry.reason = "skipped by device-profile safety blacklist".to_string();
+            entry.matched_by = Some("device-profile-safety".to_string());
+            entry.confidence = Some(1.0);
+            entry.educational_note = Some(
+                "safety policy suppressed active probing on this port for the detected device class"
+                    .to_string(),
+            );
+        }
+    }
+
     for finding in findings {
         if let Some(idx) = index_by_port.get(&finding.port).copied() {
             let entry = &mut final_findings[idx];
@@ -212,15 +288,35 @@ pub async fn run(
     // Stage 2/3: async intelligence pipeline for open TCP ports only.
     let mut stage2_report = MultiStageProbeReport::default();
     if request.service_detection {
-        let stage2_concurrency = request.runtime_settings().concurrency.clamp(1, 128);
+        let stage2_concurrency = match device_profile.map(|profile| profile.class) {
+            Some(DeviceClass::FragileEmbedded) => request.runtime_settings().concurrency.min(4),
+            Some(DeviceClass::PrinterSensitive) => request.runtime_settings().concurrency.min(8),
+            _ => request.runtime_settings().concurrency,
+        };
         stage2_report = run_multi_stage_tcp_probe_pipeline(
             target,
             &mut final_findings,
             Arc::clone(&fingerprint_db),
             scan_timeout,
-            stage2_concurrency,
+            MultiStageProbePolicy {
+                max_concurrency: stage2_concurrency,
+                fragile_mode: matches!(
+                    device_profile.map(|profile| profile.class),
+                    Some(DeviceClass::FragileEmbedded) | Some(DeviceClass::PrinterSensitive)
+                ),
+                safety_blacklist: safety_blacklist.clone(),
+            },
         )
         .await;
+        if matches!(
+            device_profile.map(|profile| profile.class),
+            Some(DeviceClass::FragileEmbedded) | Some(DeviceClass::PrinterSensitive)
+        ) {
+            safety_actions.push(format!(
+                "fragile-mode:stage2-concurrency={}",
+                stage2_concurrency
+            ));
+        }
     } else {
         stage2_report
             .notes
@@ -237,7 +333,6 @@ pub async fn run(
     } else {
         responsive as f64 / scanned as f64
     };
-    let mut warnings = Vec::with_capacity(chunk_notes.len() + 2);
     warnings.push(backend_mode.unwrap_or_else(|| "packet-blast backend: unavailable".to_string()));
     warnings.push(format!(
         "fusion-engine adaptive: chunks={} avg-rate={}pps responsive={}/{} ({:.2}%) final-drop={:.2}% final-timeout-pressure={:.2}% crafters={}",
@@ -263,6 +358,10 @@ pub async fn run(
         target: request.target.clone(),
         ip: target.to_string(),
         reverse_dns: None,
+        observed_mac,
+        device_class,
+        device_vendor,
+        safety_actions,
         warnings,
         ports: final_findings,
         risk_score: 0,
