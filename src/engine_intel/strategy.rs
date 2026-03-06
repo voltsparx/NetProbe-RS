@@ -60,11 +60,14 @@ pub fn plan(request: &ScanRequest, host_count: usize, port_count: usize) -> Scan
         .max(1)
         .saturating_mul(port_count.max(1))
         .saturating_mul(protocol_multiplier);
+    let packet_blast_allowed = request.effective_privileged_probes()
+        && !request.strict_safety
+        && !request.service_detection;
 
     let mut mode = match request.profile {
         ScanProfile::Stealth => ExecutionMode::Async,
         ScanProfile::Balanced => {
-            if probe_volume >= 40_000 {
+            if packet_blast_allowed && probe_volume >= 40_000 {
                 ExecutionMode::PacketBlast
             } else if probe_volume >= 6_000 {
                 ExecutionMode::Hybrid
@@ -73,15 +76,21 @@ pub fn plan(request: &ScanRequest, host_count: usize, port_count: usize) -> Scan
             }
         }
         ScanProfile::Turbo => {
-            if probe_volume >= 22_000 {
+            if packet_blast_allowed && probe_volume >= 22_000 {
                 ExecutionMode::PacketBlast
             } else {
                 ExecutionMode::Hybrid
             }
         }
-        ScanProfile::Aggressive => ExecutionMode::PacketBlast,
+        ScanProfile::Aggressive => {
+            if packet_blast_allowed {
+                ExecutionMode::PacketBlast
+            } else {
+                ExecutionMode::Hybrid
+            }
+        }
         ScanProfile::RootOnly => {
-            if probe_volume >= 14_000 {
+            if packet_blast_allowed && probe_volume >= 14_000 {
                 ExecutionMode::PacketBlast
             } else {
                 ExecutionMode::Hybrid
@@ -98,7 +107,7 @@ pub fn plan(request: &ScanRequest, host_count: usize, port_count: usize) -> Scan
         || request.lab_mode
     {
         ScanPersona::StealthSafe
-    } else if mode == ExecutionMode::PacketBlast && probe_volume >= 200_000 {
+    } else if request.lab_mode && mode == ExecutionMode::PacketBlast && probe_volume >= 200_000 {
         ScanPersona::MassScan
     } else if request.service_detection && matches!(request.profile, ScanProfile::Aggressive) {
         ScanPersona::Audit
@@ -171,6 +180,13 @@ pub fn plan(request: &ScanRequest, host_count: usize, port_count: usize) -> Scan
             mode.as_str(),
             persona.as_str(),
             probe_volume
+        ),
+        format!(
+            "packet-blast allowed={} (privileged={} strict-safety={} service-detection={})",
+            packet_blast_allowed,
+            request.effective_privileged_probes(),
+            request.strict_safety,
+            request.service_detection
         ),
         format!(
             "rate target={}pps burst={} retries={}",
@@ -260,9 +276,19 @@ mod tests {
     }
 
     #[test]
-    fn large_volume_prefers_packet_blast() {
+    fn large_volume_without_privileged_raw_path_prefers_hybrid() {
         let request = base_request();
         let strategy = plan(&request, 128, 512);
+        assert_eq!(strategy.mode, ExecutionMode::Hybrid);
+    }
+
+    #[test]
+    fn packet_blast_requires_privileged_low_impact_shape() {
+        let mut request = base_request();
+        request.privileged_probes = true;
+        request.service_detection = false;
+        request.profile = ScanProfile::Aggressive;
+        let strategy = plan(&request, 256, 1024);
         assert_eq!(strategy.mode, ExecutionMode::PacketBlast);
     }
 
