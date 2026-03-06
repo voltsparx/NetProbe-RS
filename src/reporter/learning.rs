@@ -91,6 +91,16 @@ pub fn build_learning_notes(host: &HostResult) -> Vec<String> {
             "Learning: safety automation applied {} runtime action(s) for this host.",
             host.safety_actions.len()
         ));
+        if host
+            .safety_actions
+            .iter()
+            .any(|action| action.contains("passive"))
+        {
+            notes.insert(
+                "Learning: deeper active fingerprinting was intentionally withheld until the host looked resilient enough for safe follow-up."
+                    .to_string(),
+            );
+        }
     }
 
     notes.into_iter().collect()

@@ -34,6 +34,5 @@ my-2023-07-08-ideas.txt
 wireshark-captured-scan-data-summerize.txt
 
 #----------------------
-# Temporarily just in gitignore
+# Versioned documentation
 #----------------------
-docs/

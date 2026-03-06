@@ -680,6 +680,8 @@ fn enforce_defensive_scope(
     warnings: &mut Vec<String>,
 ) -> NProbeResult<()> {
     let has_public_targets = resolved_ips.iter().any(|ip| !is_private_or_local(ip));
+    let concept_profile = request.profile.is_low_impact_concept();
+    let profile_name = format!("{:?}", request.profile).to_ascii_lowercase();
 
     if has_public_targets && resolved_ips.len() > MAX_PUBLIC_HOSTS {
         return Err(NProbeError::Safety(format!(
@@ -696,7 +698,14 @@ fn enforce_defensive_scope(
         ));
     }
 
-    if request.strict_safety && request.profile != ScanProfile::Stealth {
+    if concept_profile && !request.strict_safety {
+        request.strict_safety = true;
+        warnings.push(format!(
+            "{profile_name} profile automatically enabled strict-safety for minimal-impact execution"
+        ));
+    }
+
+    if request.strict_safety && request.profile != ScanProfile::Stealth && !concept_profile {
         warnings.push(format!(
             "strict-safety active: forcing profile {} -> stealth",
             format!("{:?}", request.profile).to_ascii_lowercase()
@@ -704,12 +713,42 @@ fn enforce_defensive_scope(
         request.profile = ScanProfile::Stealth;
     }
 
-    if has_public_targets && request.profile != ScanProfile::Stealth {
+    if has_public_targets && request.profile != ScanProfile::Stealth && !concept_profile {
         warnings.push(format!(
             "public-target defensive guard: forcing profile {} -> stealth",
             format!("{:?}", request.profile).to_ascii_lowercase()
         ));
         request.profile = ScanProfile::Stealth;
+    }
+
+    if concept_profile {
+        if request.include_udp {
+            request.include_udp = false;
+            warnings.push(format!(
+                "{profile_name} profile disables UDP probing to keep first-contact behavior low-impact"
+            ));
+        }
+
+        if request.aggressive_root {
+            request.aggressive_root = false;
+            warnings.push(format!(
+                "{profile_name} profile disabled aggressive-root extensions; raw high-pressure probing is outside this concept"
+            ));
+        }
+
+        if request.privileged_probes {
+            request.privileged_probes = false;
+            warnings.push(format!(
+                "{profile_name} profile disabled privileged raw probes; the concept stays in user-space defensive paths"
+            ));
+        }
+
+        if request.service_detection {
+            request.service_detection = false;
+            warnings.push(format!(
+                "{profile_name} profile deferred deeper service fingerprinting until later resilience evidence exists"
+            ));
+        }
     }
 
     if request.strict_safety || has_public_targets {
@@ -739,21 +778,29 @@ fn enforce_defensive_scope(
     }
 
     if request.strict_safety {
-        request.service_detection = false;
-        warnings.push(
-            "strict-safety active: deeper service fingerprinting deferred unless host evidence later proves resilience"
-                .to_string(),
-        );
+        if request.service_detection {
+            request.service_detection = false;
+            warnings.push(
+                "strict-safety active: deeper service fingerprinting deferred unless host evidence later proves resilience"
+                    .to_string(),
+            );
+        }
         apply_safe_mode_limits(request);
     }
 
     if has_public_targets {
-        request.service_detection = false;
-        warnings.push(
-            "public-target defensive guard: service detection downgraded to port-state discovery only"
-                .to_string(),
-        );
+        if request.service_detection {
+            request.service_detection = false;
+            warnings.push(
+                "public-target defensive guard: service detection downgraded to port-state discovery only"
+                    .to_string(),
+            );
+        }
         apply_public_defensive_limits(request);
+    }
+
+    if concept_profile {
+        apply_low_impact_concept_limits(request, warnings);
     }
 
     Ok(())
@@ -833,6 +880,47 @@ fn apply_safe_mode_limits(request: &mut ScanRequest) {
     request.max_retries = Some(request.max_retries.unwrap_or(2).max(2));
 }
 
+fn apply_low_impact_concept_limits(request: &mut ScanRequest, warnings: &mut Vec<String>) {
+    let Some(port_budget) = request.profile.concept_port_budget() else {
+        return;
+    };
+
+    let (max_concurrency, min_delay, min_timeout, max_rate_pps, max_burst, max_retries) =
+        match request.profile {
+            ScanProfile::Phantom => (4usize, 120u64, 2_600u64, 96u32, 1usize, 1u8),
+            ScanProfile::Sar => (6usize, 80u64, 2_400u64, 144u32, 2usize, 1u8),
+            ScanProfile::Kis => (4usize, 150u64, 3_200u64, 72u32, 1usize, 1u8),
+            _ => return,
+        };
+
+    let defaults = request.profile.defaults();
+    let base_concurrency = request.concurrency.unwrap_or(defaults.concurrency);
+    let base_delay = request.delay_ms.unwrap_or(defaults.delay_ms);
+    let base_timeout = request.timeout_ms.unwrap_or(defaults.timeout_ms);
+    let base_rate_pps = request.rate_limit_pps.unwrap_or(max_rate_pps);
+    let base_burst = request.burst_size.unwrap_or(max_burst);
+    let base_retries = request.max_retries.unwrap_or(max_retries);
+
+    request.concurrency = Some(base_concurrency.min(max_concurrency));
+    request.delay_ms = Some(base_delay.max(min_delay));
+    request.timeout_ms = Some(base_timeout.max(min_timeout));
+    request.rate_limit_pps = Some(base_rate_pps.min(max_rate_pps));
+    request.burst_size = Some(base_burst.min(max_burst));
+    request.max_retries = Some(base_retries.min(max_retries));
+
+    warnings.push(format!(
+        "{} profile active: low-impact budget enforced (ports<= {}, concurrency<= {}, delay>= {}ms, timeout>= {}ms, rate<= {}pps, burst<= {}, retries<= {})",
+        format!("{:?}", request.profile).to_ascii_lowercase(),
+        port_budget,
+        max_concurrency,
+        min_delay,
+        min_timeout,
+        max_rate_pps,
+        max_burst,
+        max_retries
+    ));
+}
+
 fn apply_defensive_port_policy(
     request: &ScanRequest,
     has_public_targets: bool,
@@ -868,6 +956,19 @@ fn apply_defensive_port_policy(
             "defensive guard reduced active port scope from {} to {} ports",
             previous, max_ports
         ));
+    }
+
+    if let Some(profile_budget) = request.profile.concept_port_budget() {
+        if selected_ports.len() > profile_budget {
+            let previous = selected_ports.len();
+            selected_ports.truncate(profile_budget);
+            warnings.push(format!(
+                "{} profile reduced active port scope from {} to {} ports",
+                format!("{:?}", request.profile).to_ascii_lowercase(),
+                previous,
+                profile_budget
+            ));
+        }
     }
 
     if selected_ports.is_empty() {
@@ -1264,6 +1365,9 @@ fn shard_slice<T>(items: Vec<T>, total_shards: u16, shard_index: u16) -> Vec<T> 
 fn host_parallelism(profile: ScanProfile, mode: ExecutionMode, host_count: usize) -> usize {
     let base = match profile {
         ScanProfile::Stealth => 1,
+        ScanProfile::Phantom => 1,
+        ScanProfile::Sar => 1,
+        ScanProfile::Kis => 1,
         ScanProfile::Balanced => 2,
         ScanProfile::Turbo => 4,
         ScanProfile::Aggressive => 6,
@@ -1279,8 +1383,12 @@ fn host_parallelism(profile: ScanProfile, mode: ExecutionMode, host_count: usize
 
 #[cfg(test)]
 mod tests {
-    use super::{checkpoint_signature, shard_slice};
+    use super::{
+        apply_defensive_port_policy, checkpoint_signature, enforce_defensive_scope, shard_slice,
+    };
+    use crate::error::NProbeError;
     use crate::models::{ReportFormat, ScanProfile, ScanRequest};
+    use std::net::{IpAddr, Ipv4Addr};
 
     fn base_request() -> ScanRequest {
         ScanRequest {
@@ -1340,5 +1448,56 @@ mod tests {
         let sig_b = checkpoint_signature(&request, &hosts, &ports, 4, 2, "hosts");
 
         assert_ne!(sig_a, sig_b);
+    }
+
+    #[test]
+    fn defensive_scope_blocks_broad_public_scans() {
+        let mut request = base_request();
+        request.allow_external = true;
+        let mut warnings = Vec::new();
+        let public_targets = (1..=40)
+            .map(|octet| IpAddr::V4(Ipv4Addr::new(198, 51, 100, octet)))
+            .collect::<Vec<_>>();
+
+        let err = enforce_defensive_scope(&mut request, &public_targets, &mut warnings)
+            .expect_err("public scope should be blocked");
+        assert!(matches!(err, NProbeError::Safety(_)));
+    }
+
+    #[test]
+    fn defensive_port_policy_skips_protected_ports_in_safe_mode() {
+        let mut request = base_request();
+        request.strict_safety = true;
+        let mut warnings = Vec::new();
+        let mut ports = vec![22, 80, 9100];
+
+        apply_defensive_port_policy(&request, false, &mut ports, &mut warnings)
+            .expect("port policy should succeed");
+        assert_eq!(ports, vec![22, 80]);
+        assert!(!warnings.is_empty());
+    }
+
+    #[test]
+    fn phantom_profile_forces_minimal_impact_shape() {
+        let mut request = base_request();
+        request.profile = ScanProfile::Phantom;
+        request.include_udp = true;
+        request.service_detection = true;
+        request.aggressive_root = true;
+        request.privileged_probes = true;
+        let mut warnings = Vec::new();
+        let private_targets = vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7))];
+
+        enforce_defensive_scope(&mut request, &private_targets, &mut warnings)
+            .expect("phantom profile should remain allowed");
+        assert!(request.strict_safety);
+        assert!(!request.include_udp);
+        assert!(!request.service_detection);
+        assert!(!request.aggressive_root);
+        assert!(!request.privileged_probes);
+        assert_eq!(request.concurrency, Some(4));
+        assert_eq!(request.burst_size, Some(1));
+        assert_eq!(request.max_retries, Some(1));
+        assert!(!warnings.is_empty());
     }
 }

@@ -42,10 +42,13 @@ impl ReportFormat {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum ScanProfile {
     Stealth,
+    Phantom,
+    Sar,
+    Kis,
     Balanced,
     Turbo,
     Aggressive,
@@ -60,12 +63,43 @@ pub struct ProfileDefaults {
 }
 
 impl ScanProfile {
+    pub fn is_low_impact_concept(self) -> bool {
+        matches!(
+            self,
+            ScanProfile::Phantom | ScanProfile::Sar | ScanProfile::Kis
+        )
+    }
+
+    pub fn concept_port_budget(self) -> Option<usize> {
+        match self {
+            ScanProfile::Phantom => Some(24),
+            ScanProfile::Sar => Some(32),
+            ScanProfile::Kis => Some(16),
+            _ => None,
+        }
+    }
+
     pub fn defaults(self) -> ProfileDefaults {
         match self {
             ScanProfile::Stealth => ProfileDefaults {
                 concurrency: 32,
                 timeout_ms: 3000,
                 delay_ms: 30,
+            },
+            ScanProfile::Phantom => ProfileDefaults {
+                concurrency: 8,
+                timeout_ms: 2600,
+                delay_ms: 120,
+            },
+            ScanProfile::Sar => ProfileDefaults {
+                concurrency: 10,
+                timeout_ms: 2400,
+                delay_ms: 80,
+            },
+            ScanProfile::Kis => ProfileDefaults {
+                concurrency: 6,
+                timeout_ms: 3200,
+                delay_ms: 150,
             },
             ScanProfile::Balanced => ProfileDefaults {
                 concurrency: 128,

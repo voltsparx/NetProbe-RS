@@ -41,13 +41,6 @@ impl DeviceProfile {
         )
     }
 
-    pub fn is_fragile(self) -> bool {
-        matches!(
-            self.class,
-            DeviceClass::FragileEmbedded | DeviceClass::PrinterSensitive
-        )
-    }
-
     pub fn async_concurrency_cap(self) -> Option<usize> {
         match self.class {
             DeviceClass::FragileEmbedded => Some(4),

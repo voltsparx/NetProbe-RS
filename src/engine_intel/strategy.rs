@@ -25,6 +25,9 @@ impl ExecutionMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanPersona {
     StealthSafe,
+    PhantomMinimal,
+    SarObserve,
+    KisObserve,
     Discovery,
     Audit,
     MassScan,
@@ -34,6 +37,9 @@ impl ScanPersona {
     pub fn as_str(self) -> &'static str {
         match self {
             ScanPersona::StealthSafe => "stealth-safe",
+            ScanPersona::PhantomMinimal => "phantom-minimal",
+            ScanPersona::SarObserve => "sar-observe",
+            ScanPersona::KisObserve => "kis-observe",
             ScanPersona::Discovery => "discovery",
             ScanPersona::Audit => "audit",
             ScanPersona::MassScan => "mass-scan",
@@ -66,6 +72,7 @@ pub fn plan(request: &ScanRequest, host_count: usize, port_count: usize) -> Scan
 
     let mut mode = match request.profile {
         ScanProfile::Stealth => ExecutionMode::Async,
+        ScanProfile::Phantom | ScanProfile::Sar | ScanProfile::Kis => ExecutionMode::Async,
         ScanProfile::Balanced => {
             if packet_blast_allowed && probe_volume >= 40_000 {
                 ExecutionMode::PacketBlast
@@ -102,17 +109,29 @@ pub fn plan(request: &ScanRequest, host_count: usize, port_count: usize) -> Scan
         mode = ExecutionMode::Hybrid;
     }
 
-    let persona = if matches!(request.profile, ScanProfile::Stealth)
-        || request.strict_safety
-        || request.lab_mode
-    {
-        ScanPersona::StealthSafe
-    } else if request.lab_mode && mode == ExecutionMode::PacketBlast && probe_volume >= 200_000 {
-        ScanPersona::MassScan
-    } else if request.service_detection && matches!(request.profile, ScanProfile::Aggressive) {
-        ScanPersona::Audit
-    } else {
-        ScanPersona::Discovery
+    let persona = match request.profile {
+        ScanProfile::Phantom => ScanPersona::PhantomMinimal,
+        ScanProfile::Sar => ScanPersona::SarObserve,
+        ScanProfile::Kis => ScanPersona::KisObserve,
+        _ => {
+            if matches!(request.profile, ScanProfile::Stealth)
+                || request.strict_safety
+                || request.lab_mode
+            {
+                ScanPersona::StealthSafe
+            } else if request.lab_mode
+                && mode == ExecutionMode::PacketBlast
+                && probe_volume >= 200_000
+            {
+                ScanPersona::MassScan
+            } else if request.service_detection
+                && matches!(request.profile, ScanProfile::Aggressive)
+            {
+                ScanPersona::Audit
+            } else {
+                ScanPersona::Discovery
+            }
+        }
     };
 
     let (mut rate_limit_pps, mut burst_size, mut max_retries) = match mode {
@@ -145,6 +164,30 @@ pub fn plan(request: &ScanRequest, host_count: usize, port_count: usize) -> Scan
             recommended_delay = recommended_delay.max(Duration::from_millis(10));
             recommended_timeout = recommended_timeout.max(Duration::from_millis(1800));
             recommended_concurrency = recommended_concurrency.min(64);
+        }
+        ScanPersona::PhantomMinimal => {
+            rate_limit_pps = 96;
+            burst_size = 1;
+            max_retries = 1;
+            recommended_delay = Duration::from_millis(120);
+            recommended_timeout = Duration::from_millis(2600);
+            recommended_concurrency = 4;
+        }
+        ScanPersona::SarObserve => {
+            rate_limit_pps = 144;
+            burst_size = 2;
+            max_retries = 1;
+            recommended_delay = Duration::from_millis(80);
+            recommended_timeout = Duration::from_millis(2400);
+            recommended_concurrency = 6;
+        }
+        ScanPersona::KisObserve => {
+            rate_limit_pps = 72;
+            burst_size = 1;
+            max_retries = 1;
+            recommended_delay = Duration::from_millis(150);
+            recommended_timeout = Duration::from_millis(3200);
+            recommended_concurrency = 4;
         }
         ScanPersona::Discovery => {
             rate_limit_pps = rate_limit_pps.min(20_000);
@@ -290,6 +333,17 @@ mod tests {
         request.profile = ScanProfile::Aggressive;
         let strategy = plan(&request, 256, 1024);
         assert_eq!(strategy.mode, ExecutionMode::PacketBlast);
+    }
+
+    #[test]
+    fn phantom_profile_stays_async_and_low_impact() {
+        let mut request = base_request();
+        request.profile = ScanProfile::Phantom;
+        let strategy = plan(&request, 64, 128);
+        assert_eq!(strategy.mode, ExecutionMode::Async);
+        assert_eq!(strategy.persona, ScanPersona::PhantomMinimal);
+        assert_eq!(strategy.burst_size, 1);
+        assert_eq!(strategy.max_retries, 1);
     }
 
     #[test]

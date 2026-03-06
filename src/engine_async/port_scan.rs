@@ -134,7 +134,10 @@ pub async fn run(
                 "strict-safety unknown-device cap applied: reduced concurrency from {} to {}",
                 previous, runtime.concurrency
             ));
-            safety_actions.push(format!("concurrency-capped:{}->{}", previous, runtime.concurrency));
+            safety_actions.push(format!(
+                "concurrency-capped:{}->{}",
+                previous, runtime.concurrency
+            ));
         }
         if rate_limit_pps > 250 {
             warnings.push(format!(

@@ -751,10 +751,29 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 fn parse_profile(raw: &str) -> Option<ScanProfile> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "stealth" => Some(ScanProfile::Stealth),
+        "phantom" | "phantom-scan" | "phantom_scan" => Some(ScanProfile::Phantom),
+        "sar" | "sar-scan" | "sar_scan" => Some(ScanProfile::Sar),
+        "kis" | "kis-scan" | "kis_scan" => Some(ScanProfile::Kis),
         "balanced" => Some(ScanProfile::Balanced),
         "turbo" => Some(ScanProfile::Turbo),
         "aggressive" => Some(ScanProfile::Aggressive),
         "root-only" | "root_only" | "rootonly" => Some(ScanProfile::RootOnly),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_profile;
+    use crate::models::ScanProfile;
+
+    #[test]
+    fn parse_profile_accepts_low_impact_concepts() {
+        assert!(matches!(
+            parse_profile("phantom"),
+            Some(ScanProfile::Phantom)
+        ));
+        assert!(matches!(parse_profile("sar-scan"), Some(ScanProfile::Sar)));
+        assert!(matches!(parse_profile("kis_scan"), Some(ScanProfile::Kis)));
     }
 }

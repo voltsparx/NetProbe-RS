@@ -132,15 +132,14 @@ pub async fn run(
     if !matches!(
         device_profile.map(|profile| profile.class),
         Some(DeviceClass::Enterprise)
-    ) {
-        if rate_pps > 500 {
-            warnings.push(format!(
-                "defensive guard applied conservative raw rate cap: {}pps -> 500pps",
-                rate_pps
-            ));
-            safety_actions.push(format!("rate-capped:{}->500pps", rate_pps));
-            rate_pps = 500;
-        }
+    ) && rate_pps > 500
+    {
+        warnings.push(format!(
+            "defensive guard applied conservative raw rate cap: {}pps -> 500pps",
+            rate_pps
+        ));
+        safety_actions.push(format!("rate-capped:{}->500pps", rate_pps));
+        rate_pps = 500;
     }
 
     let safety_blacklist = device_profile
