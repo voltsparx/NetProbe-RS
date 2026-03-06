@@ -36,7 +36,7 @@ impl FileType {
 #[command(
     name = "nprobe-rs",
     version,
-    about = "NProbe-RS: Nmap-inspired scanner in safe, explainable Rust",
+    about = "NProbe-RS: Reverse-Engineered scanner in safe, explainable Rust",
     override_usage = "nprobe-rs <target> [OPTIONS]\n       nprobe-rs scan <target> [OPTIONS]",
     after_help = "Nmap-style shortcuts supported: -sU, -sS, -A, -T0..-T5, -p-",
     arg_required_else_help = true
