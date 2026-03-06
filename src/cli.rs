@@ -90,6 +90,12 @@ struct ScanArgs {
     syn: bool,
 
     #[arg(
+        long = "arp",
+        help = "Enable ARP neighbor discovery for local IPv4 targets"
+    )]
+    arp: bool,
+
+    #[arg(
         short = 'r',
         long = "reverse-dns",
         help = "Enable PTR reverse DNS lookups"
@@ -377,7 +383,7 @@ pub fn maybe_render_quick_help_mode() -> Option<String> {
     }
 
     Some(
-        "Usage:\n  nprobe-rs <target> [options]\n\nCommon options:\n  -p, --ports <list|range>   Select ports (example: -p 22,80,443)\n      --all-ports            Scan ports 1-65535 (Nmap: -p-)\n  -U, --udp                  Enable UDP probes (Nmap: -sU)\n  -S, --syn                  Enable privileged TCP probes (Nmap: -sS)\n  -A, --aggressive           Aggressive mode (Nmap: -A)\n  -w, --timeout-ms <ms>      Probe timeout in milliseconds\n      --rate-pps <num>       Dispatch rate target in packets per second\n      --burst-size <num>     Token-bucket burst limit\n      --max-retries <num>    Adaptive retries per probe (0..20)\n      --total-shards <num>   Total shard count for distributed scans\n      --shard-index <num>    Current shard index (requires total-shards)\n      --scan-seed <num>      Deterministic port shuffle seed\n      --resume               Resume from shard checkpoint\n      --fresh-scan           Ignore/reset shard checkpoint for this run\n  -r, --reverse-dns          Enable reverse DNS lookups\n  -n, --no-dns               Disable reverse DNS lookups\n  -e, --explain              Add concise per-port rationale in output\n  -v, --verbose              Show full output sections\n  -f, --file-type <type>     Export format: txt|json|html|csv\n  -o, --output <name>        Output filename\n  -L, --location <dir>       Output directory\n\nNmap-style shortcuts accepted:\n  -sU  -sS  -A  -T0..-T5  -p-\n\nFlag docs mode:\n  nprobe-rs --flag-help --scan\n  nprobe-rs --flag-help -sU\n  nprobe-rs --explain --scan   (legacy alias)\n\nCompatibility:\n  nprobe-rs scan <target> [options] still works.".to_string(),
+        "Usage:\n  nprobe-rs <target> [options]\n\nCommon options:\n  -p, --ports <list|range>   Select ports (example: -p 22,80,443)\n      --all-ports            Scan ports 1-65535 (Nmap: -p-)\n  -U, --udp                  Enable UDP probes (Nmap: -sU)\n  -S, --syn                  Enable privileged TCP probes (Nmap: -sS)\n      --arp                  Enable ARP neighbor discovery (local IPv4)\n  -A, --aggressive           Aggressive mode (Nmap: -A)\n  -w, --timeout-ms <ms>      Probe timeout in milliseconds\n      --rate-pps <num>       Dispatch rate target in packets per second\n      --burst-size <num>     Token-bucket burst limit\n      --max-retries <num>    Adaptive retries per probe (0..20)\n      --total-shards <num>   Total shard count for distributed scans\n      --shard-index <num>    Current shard index (requires total-shards)\n      --scan-seed <num>      Deterministic port shuffle seed\n      --resume               Resume from shard checkpoint\n      --fresh-scan           Ignore/reset shard checkpoint for this run\n  -r, --reverse-dns          Enable reverse DNS lookups\n  -n, --no-dns               Disable reverse DNS lookups\n  -e, --explain              Add concise per-port rationale in output\n  -v, --verbose              Show full output sections\n  -f, --file-type <type>     Export format: txt|json|html|csv\n  -o, --output <name>        Output filename\n  -L, --location <dir>       Output directory\n\nNmap-style shortcuts accepted:\n  -sU  -sS  -A  -T0..-T5  -p-\n\nFlag docs mode:\n  nprobe-rs --flag-help --scan\n  nprobe-rs --flag-help -sU\n  nprobe-rs --explain --scan   (legacy alias)\n\nCompatibility:\n  nprobe-rs scan <target> [options] still works.".to_string(),
     )
 }
 
@@ -395,6 +401,7 @@ fn render_flag_explain(raw_query: Option<&str>) -> String {
         "ss" | "syn" => {
             "Enable privileged TCP probing (`-sS` or `--syn`). If needed, the tool re-runs with sudo/su."
         }
+        "arp" => "Enable ARP neighbor discovery for local IPv4 targets (`--arp`).",
         "a" | "aggressive" => {
             "Aggressive mode (`-A`): enables deeper detection and root-required probe paths."
         }
@@ -599,6 +606,7 @@ impl ScanArgs {
             root_only,
             aggressive_root: effective_aggressive_root,
             privileged_probes: effective_privileged_probes,
+            arp_discovery: self.arp,
             lab_mode: self.lab_mode,
             allow_external: self.allow_external,
             strict_safety: self.strict_safety,

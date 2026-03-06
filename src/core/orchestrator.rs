@@ -7,16 +7,18 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 #[cfg(unix)]
 use std::process::Command;
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::Utc;
 use futures::stream::{FuturesUnordered, StreamExt};
 
-use crate::config::{self, ShardCheckpointState};
-use crate::engine_async::port_scan;
+use crate::config::{self, ShardCheckpointArgs, ShardCheckpointState};
+use crate::engine_async::port_scan as async_port_scan;
 use crate::engine_intel::{
     analysis,
     strategy::{self, ExecutionMode, ScanStrategy},
 };
+use crate::engine_packet::{arp as packet_arp, port_scan as packet_port_scan};
 use crate::engine_parallel::dns;
 use crate::engine_plugin::lua;
 use crate::engine_report::reporting;
@@ -29,6 +31,7 @@ use crate::models::{
 use crate::service_db::ServiceRegistry;
 
 const MAX_RESOLVED_HOSTS: usize = 16;
+const MAX_CIDR_HOSTS: usize = 4096;
 const PORT_BATCH_SIZE: usize = 256;
 
 struct ScanWorkItem {
@@ -54,15 +57,17 @@ struct ShardCheckpointRuntime {
     resumed_units: usize,
 }
 
+type ShardingSelection = (Vec<IpAddr>, Vec<u16>, &'static str, u16, u16);
+
 pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
     let started = Utc::now();
     let mut thread_pool_tasks = 0usize;
 
     let service_registry = Arc::new(ServiceRegistry::load());
-    let resolved = dns::resolve(&request.target).await?;
+    let mut global_warnings = Vec::new();
+    let resolved = resolve_targets(&request, &mut global_warnings).await?;
     thread_pool_tasks += 1;
 
-    let mut global_warnings = Vec::new();
     enforce_safety(&mut request, &resolved, &mut global_warnings)?;
     enforce_privileged_modes(&mut request, &mut global_warnings)?;
 
@@ -87,13 +92,18 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
         Arc::new(FingerprintDatabase::empty())
     };
 
-    let host_targets: Vec<IpAddr> = if resolved.len() > MAX_RESOLVED_HOSTS {
+    let max_resolved_hosts = if packet_arp::parse_ipv4_cidr(&request.target).is_some() {
+        MAX_CIDR_HOSTS
+    } else {
+        MAX_RESOLVED_HOSTS
+    };
+    let host_targets: Vec<IpAddr> = if resolved.len() > max_resolved_hosts {
         global_warnings.push(format!(
             "resolved {} addresses; scanning first {}",
             resolved.len(),
-            MAX_RESOLVED_HOSTS
+            max_resolved_hosts
         ));
-        resolved.into_iter().take(MAX_RESOLVED_HOSTS).collect()
+        resolved.into_iter().take(max_resolved_hosts).collect()
     } else {
         resolved
     };
@@ -288,6 +298,7 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
             root_only: request.root_only,
             aggressive_root: request.aggressive_root,
             privileged_probes: request.effective_privileged_probes(),
+            arp_discovery: request.arp_discovery,
             report_format: request.report_format,
             lab_mode: request.lab_mode,
             total_shards: request.total_shards,
@@ -308,6 +319,75 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
     Ok(report)
 }
 
+async fn resolve_targets(
+    request: &ScanRequest,
+    warnings: &mut Vec<String>,
+) -> NProbeResult<Vec<IpAddr>> {
+    if let Some(cidr) = packet_arp::parse_ipv4_cidr(&request.target) {
+        let (fallback_hosts, truncated) = cidr.expand_hosts(MAX_CIDR_HOSTS);
+        if fallback_hosts.is_empty() {
+            return Err(NProbeError::Parse(format!(
+                "cidr target '{}' resolved to zero hosts",
+                request.target
+            )));
+        }
+        if truncated {
+            warnings.push(format!(
+                "cidr target {} exceeds {} hosts; limiting scan scope",
+                request.target, MAX_CIDR_HOSTS
+            ));
+        }
+
+        if request.arp_discovery {
+            if !packet_arp::is_lan_ipv4(cidr.network()) {
+                warnings.push(
+                    "arp sweep skipped: target cidr is not private/link-local ipv4".to_string(),
+                );
+            } else {
+                let sweep = tokio::task::spawn_blocking(move || {
+                    packet_arp::sweep_ipv4_cidr(cidr, Duration::from_millis(220), MAX_CIDR_HOSTS)
+                })
+                .await
+                .map_err(NProbeError::Join)?
+                .map_err(NProbeError::Io)?;
+
+                warnings.push(format!(
+                    "arp sweep: {} responsive hosts from {} probed addresses (cidr host budget={})",
+                    sweep.discovered_hosts.len(),
+                    sweep.attempted_hosts,
+                    sweep.requested_hosts
+                ));
+                if sweep.truncated {
+                    warnings.push(format!(
+                        "arp sweep truncated host list to {} addresses",
+                        sweep.attempted_hosts
+                    ));
+                }
+
+                if !sweep.discovered_hosts.is_empty() {
+                    return Ok(sweep
+                        .discovered_hosts
+                        .into_iter()
+                        .map(IpAddr::V4)
+                        .collect::<Vec<_>>());
+                }
+
+                warnings.push(
+                    "arp sweep found no live neighbors; falling back to expanded cidr target list"
+                        .to_string(),
+                );
+            }
+        }
+
+        return Ok(fallback_hosts
+            .into_iter()
+            .map(IpAddr::V4)
+            .collect::<Vec<_>>());
+    }
+
+    dns::resolve(&request.target).await
+}
+
 async fn process_host(
     request: ScanRequest,
     work_item: ScanWorkItem,
@@ -318,16 +398,47 @@ async fn process_host(
     defer_enrichment: bool,
 ) -> NProbeResult<HostExecution> {
     let ip = work_item.ip;
-    let (mut host, async_tasks) = port_scan::run(
-        &request,
-        ip,
-        work_item.ports,
-        service_registry,
-        fingerprint_db,
-        &strategy,
-    )
-    .await?;
+    let (mut host, async_tasks) =
+        if matches!(strategy.mode, ExecutionMode::PacketBlast) && !request.include_udp {
+            match packet_port_scan::run(
+                &request,
+                ip,
+                work_item.ports.clone(),
+                service_registry.clone(),
+                &strategy,
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(raw_err) => {
+                    let (mut fallback_host, fallback_tasks) = async_port_scan::run(
+                        &request,
+                        ip,
+                        work_item.ports,
+                        service_registry,
+                        fingerprint_db,
+                        &strategy,
+                    )
+                    .await?;
+                    fallback_host.warnings.push(format!(
+                        "packet-blast raw backend unavailable, fallback to async engine: {raw_err}"
+                    ));
+                    (fallback_host, fallback_tasks)
+                }
+            }
+        } else {
+            async_port_scan::run(
+                &request,
+                ip,
+                work_item.ports,
+                service_registry,
+                fingerprint_db,
+                &strategy,
+            )
+            .await?
+        };
     host.warnings.extend(global_warnings);
+    append_arp_intel(&request, ip, &mut host).await;
 
     let mut thread_pool_tasks = 0usize;
     let mut parallel_tasks = 0usize;
@@ -361,6 +472,58 @@ async fn process_host(
         parallel_tasks,
         lua_hooks_ran,
     })
+}
+
+async fn append_arp_intel(request: &ScanRequest, ip: IpAddr, host: &mut HostResult) {
+    if !request.arp_discovery {
+        return;
+    }
+    if packet_arp::parse_ipv4_cidr(&request.target).is_some() {
+        return;
+    }
+
+    let target_v4 = match ip {
+        IpAddr::V4(value) => value,
+        IpAddr::V6(_) => {
+            if request.verbose {
+                host.warnings
+                    .push("arp discovery skipped: IPv6 target".to_string());
+            }
+            return;
+        }
+    };
+
+    if !packet_arp::is_lan_ipv4(target_v4) {
+        return;
+    }
+
+    let settle_timeout = Duration::from_millis(180);
+    let result = tokio::task::spawn_blocking(move || {
+        packet_arp::resolve_neighbor_mac(target_v4, settle_timeout)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(Some(mac))) => host.warnings.push(format!(
+            "arp neighbor detected: {} is at {}",
+            target_v4, mac
+        )),
+        Ok(Ok(None)) => {}
+        Ok(Err(err)) => {
+            if request.verbose {
+                host.warnings.push(format!(
+                    "arp discovery probe failed for {}: {}",
+                    target_v4, err
+                ));
+            }
+        }
+        Err(_) => {
+            if request.verbose {
+                host.warnings
+                    .push(format!("arp discovery worker failed for {}", target_v4));
+            }
+        }
+    }
 }
 
 fn merge_hosts_by_ip(hosts: Vec<HostResult>) -> Vec<HostResult> {
@@ -617,7 +780,7 @@ fn apply_sharding(
     selected_ports: Vec<u16>,
     request: &ScanRequest,
     warnings: &mut Vec<String>,
-) -> NProbeResult<(Vec<IpAddr>, Vec<u16>, &'static str, u16, u16)> {
+) -> NProbeResult<ShardingSelection> {
     let Some(total) = request.total_shards else {
         return Ok((host_targets, selected_ports, "none", 1, 0));
     };
@@ -873,18 +1036,18 @@ fn persist_shard_checkpoint_state(
 ) -> NProbeResult<()> {
     let mut completed_units: Vec<String> = runtime.completed_units.iter().cloned().collect();
     completed_units.sort_unstable();
-    let state = ShardCheckpointState::new(
-        runtime.signature.clone(),
-        request.target.clone(),
+    let state = ShardCheckpointState::new(ShardCheckpointArgs {
+        signature: runtime.signature.clone(),
+        target: request.target.clone(),
         total_shards,
         shard_index,
-        shard_dimension,
-        &runtime.unit_label,
-        runtime.planned_units.clone(),
+        shard_dimension: shard_dimension.to_string(),
+        unit_kind: runtime.unit_label.clone(),
+        planned_units: runtime.planned_units.clone(),
         completed_units,
         port_count,
-        request.scan_seed,
-    );
+        scan_seed: request.scan_seed,
+    });
     config::save_shard_checkpoint(&state)?;
     Ok(())
 }
@@ -942,6 +1105,7 @@ mod tests {
             root_only: false,
             aggressive_root: false,
             privileged_probes: false,
+            arp_discovery: false,
             lab_mode: false,
             allow_external: false,
             strict_safety: false,

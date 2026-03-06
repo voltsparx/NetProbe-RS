@@ -82,6 +82,29 @@ struct ProbeContext {
     ports: Vec<u16>,
 }
 
+#[derive(Debug, Clone)]
+struct RuleRelevanceBudget {
+    generic_tcp_rules: usize,
+    generic_udp_rules: usize,
+    tcp_port_rule_counts: HashMap<u16, usize>,
+    udp_port_rule_counts: HashMap<u16, usize>,
+    generic_cap: usize,
+    per_port_cap: usize,
+}
+
+impl RuleRelevanceBudget {
+    fn new(generic_cap: usize, per_port_cap: usize) -> Self {
+        Self {
+            generic_tcp_rules: 0,
+            generic_udp_rules: 0,
+            tcp_port_rule_counts: HashMap::new(),
+            udp_port_rule_counts: HashMap::new(),
+            generic_cap,
+            per_port_cap,
+        }
+    }
+}
+
 impl FingerprintDatabase {
     pub fn load_for_ports(focus_ports: &[u16], include_udp: bool) -> Self {
         let probes_path = Path::new("temp/nmap/nmap-service-probes");
@@ -202,10 +225,8 @@ impl FingerprintDatabase {
         let mut rules_skipped = 0usize;
         let mut payloads_loaded = 0usize;
         let mut current_probe: Option<ProbeContext> = None;
-        let mut generic_tcp_rules = 0usize;
-        let mut generic_udp_rules = 0usize;
-        let mut tcp_port_rule_counts = HashMap::<u16, usize>::new();
-        let mut udp_port_rule_counts = HashMap::<u16, usize>::new();
+        let mut rule_budget =
+            RuleRelevanceBudget::new(MAX_GENERIC_RULES_PER_PROTOCOL, MAX_RULES_PER_PORT_PROTOCOL);
 
         for line in content.lines() {
             let trimmed = line.trim();
@@ -245,17 +266,7 @@ impl FingerprintDatabase {
             if trimmed.starts_with("match ") || trimmed.starts_with("softmatch ") {
                 rules_loaded += 1;
                 if let Some(rule) = parse_match_line(trimmed, current_probe.as_ref()) {
-                    if !rule_relevant(
-                        &rule,
-                        focus_ports,
-                        include_udp,
-                        &mut generic_tcp_rules,
-                        &mut generic_udp_rules,
-                        &mut tcp_port_rule_counts,
-                        &mut udp_port_rule_counts,
-                        MAX_GENERIC_RULES_PER_PROTOCOL,
-                        MAX_RULES_PER_PORT_PROTOCOL,
-                    ) {
+                    if !rule_relevant(&rule, focus_ports, include_udp, &mut rule_budget) {
                         continue;
                     }
                     rules_compiled += 1;
@@ -334,12 +345,7 @@ fn rule_relevant(
     rule: &FingerprintRule,
     focus_ports: &HashSet<u16>,
     include_udp: bool,
-    generic_tcp_rules: &mut usize,
-    generic_udp_rules: &mut usize,
-    tcp_port_rule_counts: &mut HashMap<u16, usize>,
-    udp_port_rule_counts: &mut HashMap<u16, usize>,
-    generic_cap: usize,
-    per_port_cap: usize,
+    budget: &mut RuleRelevanceBudget,
 ) -> bool {
     if !include_udp && matches!(rule.protocol, Some(ProbeProtocol::Udp)) {
         return false;
@@ -360,13 +366,13 @@ fn rule_relevant(
         matched_ports.dedup();
 
         let counts = match rule.protocol {
-            Some(ProbeProtocol::Udp) => udp_port_rule_counts,
-            _ => tcp_port_rule_counts,
+            Some(ProbeProtocol::Udp) => &mut budget.udp_port_rule_counts,
+            _ => &mut budget.tcp_port_rule_counts,
         };
 
         for port in matched_ports {
             let counter = counts.entry(port).or_insert(0);
-            if *counter < per_port_cap {
+            if *counter < budget.per_port_cap {
                 *counter += 1;
                 return true;
             }
@@ -377,24 +383,24 @@ fn rule_relevant(
     if should_filter && rule.ports.is_empty() {
         match rule.protocol {
             Some(ProbeProtocol::Tcp) => {
-                if *generic_tcp_rules >= generic_cap {
+                if budget.generic_tcp_rules >= budget.generic_cap {
                     return false;
                 }
-                *generic_tcp_rules += 1;
+                budget.generic_tcp_rules += 1;
                 true
             }
             Some(ProbeProtocol::Udp) => {
-                if *generic_udp_rules >= generic_cap {
+                if budget.generic_udp_rules >= budget.generic_cap {
                     return false;
                 }
-                *generic_udp_rules += 1;
+                budget.generic_udp_rules += 1;
                 true
             }
             None => {
-                if *generic_tcp_rules >= generic_cap {
+                if budget.generic_tcp_rules >= budget.generic_cap {
                     return false;
                 }
-                *generic_tcp_rules += 1;
+                budget.generic_tcp_rules += 1;
                 true
             }
         }

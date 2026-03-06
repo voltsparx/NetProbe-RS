@@ -40,6 +40,30 @@ pub struct AsyncScanConfig {
 }
 
 #[derive(Debug, Clone)]
+struct ProbeSharedContext {
+    target: IpAddr,
+    timeout_value: Duration,
+    aggressive_root: bool,
+    privileged_probes: bool,
+    max_retries: u8,
+    services: Arc<ServiceRegistry>,
+    fingerprint_db: Arc<FingerprintDatabase>,
+}
+
+#[derive(Debug, Clone)]
+struct TcpProbeRequest {
+    port: u16,
+    service_detection: bool,
+    shared: ProbeSharedContext,
+}
+
+#[derive(Debug, Clone)]
+struct UdpProbeRequest {
+    port: u16,
+    shared: ProbeSharedContext,
+}
+
+#[derive(Debug, Clone)]
 struct DetectionEvidence {
     banner: Option<String>,
     service: Option<String>,
@@ -347,41 +371,32 @@ async fn scan_tcp(config: &AsyncScanConfig, services: Arc<ServiceRegistry>) -> V
             };
             governor.wait_for_slot().await;
 
-            let service_registry = services.clone();
-            let target = config.target;
-            let service_detection = config.service_detection;
-            let aggressive_root = config.aggressive_root;
-            let privileged_probes = config.privileged_probes;
-            let fingerprint_db = config.fingerprint_db.clone();
-            let max_retries = config.max_retries;
-
-            in_flight.push(tokio::spawn(async move {
-                scan_one_tcp(
-                    target,
-                    port,
+            let request = TcpProbeRequest {
+                port,
+                service_detection: config.service_detection,
+                shared: ProbeSharedContext {
+                    target: config.target,
                     timeout_value,
-                    service_detection,
-                    aggressive_root,
-                    privileged_probes,
-                    max_retries,
-                    service_registry,
-                    fingerprint_db,
-                )
-                .await
-            }));
+                    aggressive_root: config.aggressive_root,
+                    privileged_probes: config.privileged_probes,
+                    max_retries: config.max_retries,
+                    services: services.clone(),
+                    fingerprint_db: config.fingerprint_db.clone(),
+                },
+            };
+
+            in_flight.push(tokio::spawn(async move { scan_one_tcp(request).await }));
 
             if !dispatch_delay.is_zero() {
                 tokio::time::sleep(dispatch_delay).await;
             }
         }
 
-        if let Some(joined) = in_flight.next().await {
-            if let Ok(finding) = joined {
-                let feedback = classify_feedback(&finding);
-                control.lock().await.observe(feedback);
-                governor.observe(feedback);
-                findings.push(finding);
-            }
+        if let Some(Ok(finding)) = in_flight.next().await {
+            let feedback = classify_feedback(&finding);
+            control.lock().await.observe(feedback);
+            governor.observe(feedback);
+            findings.push(finding);
         }
     }
 
@@ -417,39 +432,31 @@ async fn scan_udp(config: &AsyncScanConfig, services: Arc<ServiceRegistry>) -> V
             };
             governor.wait_for_slot().await;
 
-            let service_registry = services.clone();
-            let target = config.target;
-            let aggressive_root = config.aggressive_root;
-            let privileged_probes = config.privileged_probes;
-            let fingerprint_db = config.fingerprint_db.clone();
-            let max_retries = config.max_retries;
-
-            in_flight.push(tokio::spawn(async move {
-                scan_one_udp(
-                    target,
-                    port,
+            let request = UdpProbeRequest {
+                port,
+                shared: ProbeSharedContext {
+                    target: config.target,
                     timeout_value,
-                    aggressive_root,
-                    privileged_probes,
-                    max_retries,
-                    service_registry,
-                    fingerprint_db,
-                )
-                .await
-            }));
+                    aggressive_root: config.aggressive_root,
+                    privileged_probes: config.privileged_probes,
+                    max_retries: config.max_retries,
+                    services: services.clone(),
+                    fingerprint_db: config.fingerprint_db.clone(),
+                },
+            };
+
+            in_flight.push(tokio::spawn(async move { scan_one_udp(request).await }));
 
             if !dispatch_delay.is_zero() {
                 tokio::time::sleep(dispatch_delay).await;
             }
         }
 
-        if let Some(joined) = in_flight.next().await {
-            if let Ok(finding) = joined {
-                let feedback = classify_feedback(&finding);
-                control.lock().await.observe(feedback);
-                governor.observe(feedback);
-                findings.push(finding);
-            }
+        if let Some(Ok(finding)) = in_flight.next().await {
+            let feedback = classify_feedback(&finding);
+            control.lock().await.observe(feedback);
+            governor.observe(feedback);
+            findings.push(finding);
         }
     }
 
@@ -538,17 +545,22 @@ fn protocol_seed(target: IpAddr, marker: u64, custom_seed: Option<u64>) -> u64 {
     seed ^ custom_seed.unwrap_or(0)
 }
 
-async fn scan_one_tcp(
-    target: IpAddr,
-    port: u16,
-    timeout_value: Duration,
-    service_detection: bool,
-    aggressive_root: bool,
-    privileged_probes: bool,
-    max_retries: u8,
-    services: Arc<ServiceRegistry>,
-    fingerprint_db: Arc<FingerprintDatabase>,
-) -> PortFinding {
+async fn scan_one_tcp(request: TcpProbeRequest) -> PortFinding {
+    let TcpProbeRequest {
+        port,
+        service_detection,
+        shared,
+    } = request;
+    let ProbeSharedContext {
+        target,
+        timeout_value,
+        aggressive_root,
+        privileged_probes,
+        max_retries,
+        services,
+        fingerprint_db,
+    } = shared;
+
     let initial_service = services.lookup(port, "tcp").map(ToOwned::to_owned);
     let mut finding = PortFinding {
         port,
@@ -676,16 +688,18 @@ async fn scan_one_tcp(
     finding
 }
 
-async fn scan_one_udp(
-    target: IpAddr,
-    port: u16,
-    timeout_value: Duration,
-    aggressive_root: bool,
-    privileged_probes: bool,
-    max_retries: u8,
-    services: Arc<ServiceRegistry>,
-    fingerprint_db: Arc<FingerprintDatabase>,
-) -> PortFinding {
+async fn scan_one_udp(request: UdpProbeRequest) -> PortFinding {
+    let UdpProbeRequest { port, shared } = request;
+    let ProbeSharedContext {
+        target,
+        timeout_value,
+        aggressive_root,
+        privileged_probes,
+        max_retries,
+        services,
+        fingerprint_db,
+    } = shared;
+
     let initial_service = services.lookup(port, "udp").map(ToOwned::to_owned);
     let mut finding = PortFinding {
         port,

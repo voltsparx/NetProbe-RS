@@ -37,31 +37,34 @@ pub struct ShardCheckpointState {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ShardCheckpointArgs {
+    pub signature: String,
+    pub target: String,
+    pub total_shards: u16,
+    pub shard_index: u16,
+    pub shard_dimension: String,
+    pub unit_kind: String,
+    pub planned_units: Vec<String>,
+    pub completed_units: Vec<String>,
+    pub port_count: usize,
+    pub scan_seed: Option<u64>,
+}
+
 impl ShardCheckpointState {
-    pub fn new(
-        signature: String,
-        target: String,
-        total_shards: u16,
-        shard_index: u16,
-        shard_dimension: &str,
-        unit_kind: &str,
-        planned_units: Vec<String>,
-        completed_units: Vec<String>,
-        port_count: usize,
-        scan_seed: Option<u64>,
-    ) -> Self {
+    pub fn new(args: ShardCheckpointArgs) -> Self {
         Self {
             version: SHARD_CHECKPOINT_VERSION,
-            signature,
-            target,
-            total_shards,
-            shard_index,
-            shard_dimension: shard_dimension.to_string(),
-            unit_kind: unit_kind.to_string(),
-            planned_units,
-            completed_units,
-            port_count,
-            scan_seed,
+            signature: args.signature,
+            target: args.target,
+            total_shards: args.total_shards,
+            shard_index: args.shard_index,
+            shard_dimension: args.shard_dimension,
+            unit_kind: args.unit_kind,
+            planned_units: args.planned_units,
+            completed_units: args.completed_units,
+            port_count: args.port_count,
+            scan_seed: args.scan_seed,
             updated_at: Utc::now().to_rfc3339(),
         }
     }
@@ -75,7 +78,7 @@ pub fn apply_defaults(request: &mut ScanRequest) -> NProbeResult<()> {
     let kv = load_or_default_map()?;
 
     if !request.profile_explicit {
-        if let Some(profile) = kv.get("default_profile").and_then(parse_profile) {
+        if let Some(profile) = kv.get("default_profile").and_then(|raw| parse_profile(raw)) {
             request.profile = profile;
         }
     }
@@ -456,10 +459,10 @@ fn write_ini_map(path: &Path, map: &BTreeMap<String, String>) -> NProbeResult<()
 }
 
 fn sanitize_value(value: &str) -> String {
-    value.replace('\n', " ").replace('\r', " ")
+    value.replace(['\n', '\r'], " ")
 }
 
-fn parse_profile(raw: &String) -> Option<ScanProfile> {
+fn parse_profile(raw: &str) -> Option<ScanProfile> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "stealth" => Some(ScanProfile::Stealth),
         "balanced" => Some(ScanProfile::Balanced),

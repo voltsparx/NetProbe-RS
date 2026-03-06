@@ -176,6 +176,7 @@ mod tests {
             root_only: false,
             aggressive_root: false,
             privileged_probes: false,
+            arp_discovery: false,
             lab_mode: false,
             allow_external: false,
             strict_safety: false,
