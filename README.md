@@ -121,6 +121,7 @@ Guidance: Use key-based authentication and disable password login.
 
 - Architecture study and reimplementation inspired by Nmap's design principles  
 - Async scanning engine with adaptive concurrency  
+- Multi-stage intelligence pipeline: raw discovery -> async probe narrowing -> targeted fingerprint matching  
 - Service and port mapping with built-in defaults and optional local data loading  
 - Fingerprint and probe parsing where supported  
 - Modular design for extensibility and scripting  
@@ -137,6 +138,7 @@ Guidance: Use key-based authentication and disable password login.
 - `nprobe-rs scan <target>` is still supported for compatibility, but `nprobe-rs <target>` is preferred.  
 - Timeout short flag is `-w` (`--timeout-ms`), while Nmap-style timing shortcuts use `-T0..-T5`.  
 - Root-required scan modes auto-attempt elevation on Unix-like systems when possible.  
+- Linux zero-copy path can be enabled with `cargo build --release --features afxdp` (AF_XDP scaffold currently falls back automatically when unavailable).  
 
 ### 📱 Termux / Mobile Presets
 
@@ -206,6 +208,7 @@ Always obtain proper authorization before scanning networks you do not own or ma
 - 🗺️ Network topology visualization  
 - 🔄 Baseline comparison & drift detection  
 - 🧠 Adaptive scan intelligence  
+- 🚀 AF_XDP zero-copy packet backend (Linux, kernel-bypass path)  
 - 📦 Prebuilt binaries for major platforms  
 
 ---

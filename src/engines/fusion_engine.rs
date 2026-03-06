@@ -10,6 +10,9 @@ pub struct PacketFusionInput {
     pub target_count: usize,
     pub packet_drop_ratio: f64,
     pub timeout_pressure: f64,
+    pub response_ratio: f64,
+    pub queue_pressure: f64,
+    pub retry_pressure: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -17,6 +20,9 @@ pub struct PacketFusionPlan {
     pub effective_rate_pps: u64,
     pub tx_workers: usize,
     pub tx_batch_size: usize,
+    pub window_size: usize,
+    pub rate_multiplier: f64,
+    pub situation: &'static str,
     pub active_crafters: usize,
 }
 
@@ -46,11 +52,17 @@ impl FusionEngine {
             target_count: input.target_count,
             packet_drop_ratio: input.packet_drop_ratio,
             timeout_pressure: input.timeout_pressure,
+            response_ratio: input.response_ratio,
+            queue_pressure: input.queue_pressure,
+            retry_pressure: input.retry_pressure,
         });
 
-        let effective_rate_pps = self
-            .stabilizer
-            .stabilize_rate(input.requested_rate_pps, decision.rate_multiplier);
+        let effective_rate_pps = self.stabilizer.stabilize_rate_with_feedback(
+            input.requested_rate_pps,
+            decision.rate_multiplier,
+            input.packet_drop_ratio,
+            input.timeout_pressure,
+        );
 
         let ParallelThreadsPlan {
             tx_workers,
@@ -62,11 +74,19 @@ impl FusionEngine {
             decision.worker_bias,
             decision.batch_bias,
         );
+        let window_size = tx_workers
+            .saturating_mul(tx_batch_size)
+            .saturating_mul(4)
+            .clamp(64, 4096)
+            .min(input.target_count.max(1));
 
         PacketFusionPlan {
             effective_rate_pps,
             tx_workers,
             tx_batch_size,
+            window_size,
+            rate_multiplier: decision.rate_multiplier,
+            situation: decision.situation.as_str(),
             active_crafters: self.crafters.active_count(),
         }
     }

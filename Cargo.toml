@@ -6,6 +6,10 @@ authors = ["voltsparx"]
 description = "Nmap-inspired network recon scanner in Rust with explainable output."
 license = "MIT"
 
+[features]
+default = []
+afxdp = []
+
 [dependencies]
 chrono = { version = "0.4", features = ["clock", "serde"] }
 clap = { version = "4.5", features = ["derive"] }

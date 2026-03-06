@@ -400,6 +400,7 @@ async fn process_host(
                 ip,
                 work_item.ports.clone(),
                 service_registry.clone(),
+                fingerprint_db.clone(),
                 &strategy,
             )
             .await

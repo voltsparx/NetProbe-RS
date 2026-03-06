@@ -4,17 +4,22 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::engine_intel::strategy::ScanStrategy;
+use crate::engine_packet::afxdp_backend::open_afxdp_backends;
 use crate::engine_packet::datalink_backend::open_layer2_backends;
+use crate::engine_packet::intelligence_pipeline::{
+    run_multi_stage_tcp_probe_pipeline, MultiStageProbeReport,
+};
 use crate::engine_packet::socket_backend::{RawSocketRx, RawSocketTx};
 use crate::engine_packet::syn_scanner::{
     RawPortState, RawSynScanner, RawSynScannerConfig, RawTxBackend,
 };
 use crate::engines::async_engine::AsyncPacketEngine;
-use crate::engines::fusion_engine::{FusionEngine, PacketFusionInput};
+use crate::engines::fusion_engine::{FusionEngine, PacketFusionInput, PacketFusionPlan};
 use crate::error::{NProbeError, NProbeResult};
+use crate::fingerprint_db::FingerprintDatabase;
 use crate::models::{HostResult, PortFinding, PortState, ScanRequest};
 use crate::service_db::ServiceRegistry;
 
@@ -24,11 +29,21 @@ struct BackendRunResult {
     backend_mode: String,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct AdaptiveFusionFeedback {
+    packet_drop_ratio: f64,
+    timeout_pressure: f64,
+    response_ratio: f64,
+    queue_pressure: f64,
+    retry_pressure: f64,
+}
+
 pub async fn run(
     request: &ScanRequest,
     target: IpAddr,
     ports: Vec<u16>,
     services: Arc<ServiceRegistry>,
+    fingerprint_db: Arc<FingerprintDatabase>,
     strategy: &ScanStrategy,
 ) -> NProbeResult<(HostResult, usize)> {
     if ports.is_empty() {
@@ -75,32 +90,89 @@ pub async fn run(
         .map(|port| (target_v4, port))
         .collect::<Vec<_>>();
     let mut fusion_engine = FusionEngine::default();
-    let fusion_plan = fusion_engine.plan(PacketFusionInput {
-        requested_rate_pps: rate_pps.max(1),
-        burst_size,
-        target_count: scan_targets.len(),
-        packet_drop_ratio: 0.0,
-        timeout_pressure: 0.0,
-    });
+    let mut feedback = AdaptiveFusionFeedback::default();
+    let mut findings = Vec::<crate::engine_packet::syn_scanner::RawSynResult>::new();
+    let mut chunk_notes = Vec::<String>::new();
+    let mut backend_mode = None::<String>;
+    let mut last_fusion_plan = None::<PacketFusionPlan>;
+    let mut scanned = 0usize;
+    let mut responsive = 0usize;
+    let mut chunk_count = 0usize;
+    let mut rate_sum_pps = 0u64;
 
-    let config = RawSynScannerConfig {
-        source_ip,
-        source_port,
-        rate_pps: fusion_plan.effective_rate_pps,
-        burst_size,
-        tx_workers: fusion_plan.tx_workers,
-        tx_batch_size: fusion_plan.tx_batch_size,
-        rx_grace: scan_timeout,
-        scan_seed: seed,
-    };
+    while scanned < scan_targets.len() {
+        let remaining = scan_targets.len().saturating_sub(scanned);
+        let fusion_plan = fusion_engine.plan(PacketFusionInput {
+            requested_rate_pps: rate_pps.max(1),
+            burst_size,
+            target_count: remaining,
+            packet_drop_ratio: feedback.packet_drop_ratio,
+            timeout_pressure: feedback.timeout_pressure,
+            response_ratio: feedback.response_ratio,
+            queue_pressure: feedback.queue_pressure,
+            retry_pressure: feedback.retry_pressure,
+        });
+        last_fusion_plan = Some(fusion_plan);
 
-    let backend_result = AsyncPacketEngine::run_blocking("packet-blast", move || {
-        let scanner = RawSynScanner::new(config);
-        run_with_preferred_backend(scanner, source_ip, target_v4, &scan_targets)
-    })
-    .await
-    .map_err(NProbeError::Io)?;
-    let findings = backend_result.findings;
+        let window_size = fusion_plan.window_size.min(remaining).max(1);
+        let chunk_targets = scan_targets[scanned..scanned + window_size].to_vec();
+        let config = RawSynScannerConfig {
+            source_ip,
+            source_port,
+            rate_pps: fusion_plan.effective_rate_pps,
+            burst_size,
+            tx_workers: fusion_plan.tx_workers,
+            tx_batch_size: fusion_plan.tx_batch_size,
+            rx_grace: scan_timeout,
+            scan_seed: seed,
+        };
+
+        let chunk_started = Instant::now();
+        let backend_result = AsyncPacketEngine::run_blocking("packet-blast", move || {
+            let scanner = RawSynScanner::new(config);
+            run_with_preferred_backend(scanner, source_ip, target_v4, &chunk_targets)
+        })
+        .await
+        .map_err(NProbeError::Io)?;
+        let chunk_elapsed = chunk_started.elapsed();
+
+        if backend_mode.is_none() {
+            backend_mode = Some(backend_result.backend_mode.clone());
+        }
+
+        let chunk_responsive = backend_result.findings.len().min(window_size);
+        findings.extend(backend_result.findings);
+        feedback = derive_feedback(
+            window_size,
+            chunk_responsive,
+            chunk_elapsed,
+            fusion_plan.effective_rate_pps,
+            scan_timeout,
+            fusion_plan.tx_workers,
+            fusion_plan.tx_batch_size,
+        );
+
+        scanned = scanned.saturating_add(window_size);
+        responsive = responsive.saturating_add(chunk_responsive);
+        chunk_count = chunk_count.saturating_add(1);
+        rate_sum_pps = rate_sum_pps.saturating_add(fusion_plan.effective_rate_pps);
+
+        if chunk_notes.len() < 5 || scanned >= scan_targets.len() {
+            chunk_notes.push(format!(
+                "fusion-stage {}: situation={} rate={}pps workers={} batch={} window={} multiplier={:.3} response={:.2}% drop={:.2}% timeout-pressure={:.2}%",
+                chunk_count,
+                fusion_plan.situation,
+                fusion_plan.effective_rate_pps,
+                fusion_plan.tx_workers,
+                fusion_plan.tx_batch_size,
+                window_size,
+                fusion_plan.rate_multiplier,
+                feedback.response_ratio * 100.0,
+                feedback.packet_drop_ratio * 100.0,
+                feedback.timeout_pressure * 100.0
+            ));
+        }
+    }
 
     let mut final_findings = build_default_findings(&ports, &services);
     let mut index_by_port = HashMap::<u16, usize>::with_capacity(final_findings.len());
@@ -137,20 +209,61 @@ pub async fn run(
         }
     }
 
+    // Stage 2/3: async intelligence pipeline for open TCP ports only.
+    let mut stage2_report = MultiStageProbeReport::default();
+    if request.service_detection {
+        let stage2_concurrency = request.runtime_settings().concurrency.clamp(1, 128);
+        stage2_report = run_multi_stage_tcp_probe_pipeline(
+            target,
+            &mut final_findings,
+            Arc::clone(&fingerprint_db),
+            scan_timeout,
+            stage2_concurrency,
+        )
+        .await;
+    } else {
+        stage2_report
+            .notes
+            .push("stage2-intelligence skipped: service detection disabled".to_string());
+    }
+
+    let avg_rate_pps = if chunk_count == 0 {
+        0
+    } else {
+        rate_sum_pps / chunk_count as u64
+    };
+    let responsive_ratio = if scanned == 0 {
+        0.0
+    } else {
+        responsive as f64 / scanned as f64
+    };
+    let mut warnings = Vec::with_capacity(chunk_notes.len() + 2);
+    warnings.push(backend_mode.unwrap_or_else(|| "packet-blast backend: unavailable".to_string()));
+    warnings.push(format!(
+        "fusion-engine adaptive: chunks={} avg-rate={}pps responsive={}/{} ({:.2}%) final-drop={:.2}% final-timeout-pressure={:.2}% crafters={}",
+        chunk_count,
+        avg_rate_pps,
+        responsive,
+        scanned,
+        responsive_ratio * 100.0,
+        feedback.packet_drop_ratio * 100.0,
+        feedback.timeout_pressure * 100.0,
+        last_fusion_plan
+            .map(|plan| plan.active_crafters)
+            .unwrap_or_default()
+    ));
+    warnings.push(format!(
+        "multi-stage pipeline: stage2-tasks={} service-identifications={}",
+        stage2_report.tasks_spawned, stage2_report.services_identified
+    ));
+    warnings.extend(stage2_report.notes.into_iter().take(3));
+    warnings.extend(chunk_notes);
+
     let host = HostResult {
         target: request.target.clone(),
         ip: target.to_string(),
         reverse_dns: None,
-        warnings: vec![
-            backend_result.backend_mode,
-            format!(
-                "fusion-engine: effective-rate={}pps tx-workers={} batch={} crafters={}",
-                fusion_plan.effective_rate_pps,
-                fusion_plan.tx_workers,
-                fusion_plan.tx_batch_size,
-                fusion_plan.active_crafters
-            ),
-        ],
+        warnings,
         ports: final_findings,
         risk_score: 0,
         insights: Vec::new(),
@@ -159,7 +272,10 @@ pub async fn run(
         lua_findings: Vec::new(),
     };
 
-    Ok((host, ports.len()))
+    Ok((
+        host,
+        ports.len().saturating_add(stage2_report.tasks_spawned),
+    ))
 }
 
 fn run_with_preferred_backend(
@@ -168,9 +284,39 @@ fn run_with_preferred_backend(
     target_ip: Ipv4Addr,
     scan_targets: &[(Ipv4Addr, u16)],
 ) -> io::Result<BackendRunResult> {
+    let worker_count = scanner.effective_tx_workers(scan_targets.len());
+
+    let afxdp_err = match open_afxdp_backends(source_ip, target_ip) {
+        Ok((tx, rx)) => {
+            let mut first_tx = Some(tx);
+            let findings = scanner.run_with_tx_factory(
+                move |worker_id| {
+                    if worker_id == 0 {
+                        let primary = first_tx.take().ok_or_else(|| {
+                            io::Error::other("primary af_xdp tx backend already consumed")
+                        })?;
+                        return Ok(Box::new(primary) as Box<dyn RawTxBackend>);
+                    }
+
+                    let (extra_tx, _extra_rx) = open_afxdp_backends(source_ip, target_ip)?;
+                    Ok(Box::new(extra_tx) as Box<dyn RawTxBackend>)
+                },
+                rx,
+                scan_targets,
+            )?;
+            return Ok(BackendRunResult {
+                findings,
+                backend_mode: format!(
+                    "packet-blast backend: AF_XDP zero-copy path (tx-workers={})",
+                    worker_count
+                ),
+            });
+        }
+        Err(err) => err,
+    };
+
     match open_layer2_backends(source_ip, target_ip) {
         Ok((tx, rx)) => {
-            let worker_count = scanner.effective_tx_workers(scan_targets.len());
             let mut first_tx = Some(tx);
             let findings = scanner.run_with_tx_factory(
                 move |worker_id| {
@@ -190,13 +336,12 @@ fn run_with_preferred_backend(
             Ok(BackendRunResult {
                 findings,
                 backend_mode: format!(
-                    "packet-blast backend: direct L2 crafted frames (kernel TCP stack bypass, tx-workers={})",
-                    worker_count
+                    "packet-blast backend: direct L2 crafted frames (kernel TCP stack bypass, tx-workers={}; af_xdp unavailable: {})",
+                    worker_count, afxdp_err
                 ),
             })
         }
         Err(l2_err) => {
-            let worker_count = scanner.effective_tx_workers(scan_targets.len());
             let rx = RawSocketRx::new(source_ip)?;
             let findings = scanner.run_with_tx_factory(
                 move |_| Ok(Box::new(RawSocketTx::new(source_ip)?) as Box<dyn RawTxBackend>),
@@ -206,8 +351,8 @@ fn run_with_preferred_backend(
             Ok(BackendRunResult {
                 findings,
                 backend_mode: format!(
-                    "packet-blast backend fallback: raw sockets (L2 unavailable: {}, tx-workers={})",
-                    l2_err, worker_count
+                    "packet-blast backend fallback: raw sockets (af_xdp unavailable: {}; L2 unavailable: {}; tx-workers={})",
+                    afxdp_err, l2_err, worker_count
                 ),
             })
         }
@@ -251,4 +396,77 @@ fn source_port_from_seed(seed: u64) -> u16 {
     let span = 65_535u32 - 40_000u32;
     let mapped = ((seed as u32) % span) + 40_000u32;
     mapped as u16
+}
+
+fn derive_feedback(
+    attempted: usize,
+    responsive: usize,
+    elapsed: Duration,
+    effective_rate_pps: u64,
+    rx_grace: Duration,
+    tx_workers: usize,
+    tx_batch_size: usize,
+) -> AdaptiveFusionFeedback {
+    let attempts = attempted.max(1) as f64;
+    let response_ratio = (responsive as f64 / attempts).clamp(0.0, 1.0);
+    let packet_drop_ratio = (1.0 - response_ratio).clamp(0.0, 1.0);
+
+    // Include configured RX grace in baseline expectation to avoid false timeout pressure.
+    let expected_dispatch_secs = attempts / effective_rate_pps.max(1) as f64;
+    let expected_total_secs = expected_dispatch_secs + (rx_grace.as_secs_f64() * 0.70);
+    let observed_secs = elapsed.as_secs_f64();
+    let timeout_pressure = if expected_total_secs <= 0.0 {
+        0.0
+    } else {
+        ((observed_secs - expected_total_secs) / expected_total_secs).clamp(0.0, 1.0)
+    };
+
+    let density = (tx_workers.saturating_mul(tx_batch_size) as f64 / attempts).clamp(0.0, 1.0);
+    let queue_pressure = (packet_drop_ratio * 0.60 + density * 0.40).clamp(0.0, 1.0);
+    let retry_pressure = (timeout_pressure * 0.65 + packet_drop_ratio * 0.35).clamp(0.0, 1.0);
+
+    AdaptiveFusionFeedback {
+        packet_drop_ratio,
+        timeout_pressure,
+        response_ratio,
+        queue_pressure,
+        retry_pressure,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::derive_feedback;
+    use std::time::Duration;
+
+    #[test]
+    fn derive_feedback_flags_drop_and_timeout_pressure() {
+        let feedback = derive_feedback(
+            512,
+            64,
+            Duration::from_secs(2),
+            100_000,
+            Duration::from_millis(500),
+            4,
+            64,
+        );
+        assert!(feedback.packet_drop_ratio > 0.80);
+        assert!(feedback.timeout_pressure >= 0.0);
+        assert!(feedback.retry_pressure > 0.0);
+    }
+
+    #[test]
+    fn derive_feedback_for_healthy_chunk_stays_low_pressure() {
+        let feedback = derive_feedback(
+            512,
+            460,
+            Duration::from_millis(650),
+            80_000,
+            Duration::from_millis(600),
+            2,
+            32,
+        );
+        assert!(feedback.packet_drop_ratio < 0.20);
+        assert!(feedback.response_ratio > 0.75);
+    }
 }
