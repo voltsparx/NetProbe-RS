@@ -2,6 +2,8 @@
 
 pub mod arp;
 pub mod blackrock;
+pub mod datalink_backend;
+pub mod packet_crafter;
 pub mod port_scan;
 pub mod rate_limiter;
 pub mod socket_backend;

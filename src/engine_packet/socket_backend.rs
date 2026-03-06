@@ -18,12 +18,15 @@ pub struct RawSocketTx {
 #[derive(Debug)]
 pub struct RawSocketRx {
     socket: Socket,
+    buffer: Vec<MaybeUninit<u8>>,
+    read_timeout: Option<Duration>,
 }
 
 impl RawSocketTx {
     pub fn new(source_ip: Ipv4Addr) -> io::Result<Self> {
         let socket = Socket::new(Domain::IPV4, Type::from(3), Some(Protocol::TCP))?;
         socket.bind(&SockAddr::from(SocketAddrV4::new(source_ip, 0)))?;
+        let _ = socket.set_send_buffer_size(8 * 1024 * 1024);
         Ok(Self { socket })
     }
 }
@@ -40,29 +43,32 @@ impl RawSocketRx {
     pub fn new(bind_ip: Ipv4Addr) -> io::Result<Self> {
         let socket = Socket::new(Domain::IPV4, Type::from(3), Some(Protocol::TCP))?;
         socket.bind(&SockAddr::from(SocketAddrV4::new(bind_ip, 0)))?;
-        Ok(Self { socket })
+        let _ = socket.set_recv_buffer_size(16 * 1024 * 1024);
+        Ok(Self {
+            socket,
+            buffer: vec![MaybeUninit::<u8>::uninit(); 65_535],
+            read_timeout: None,
+        })
     }
 }
 
 impl RawRxBackend for RawSocketRx {
-    fn recv_ipv4(&mut self, timeout: Duration) -> io::Result<Option<Vec<u8>>> {
-        self.socket.set_read_timeout(Some(timeout))?;
-        let mut buffer = vec![MaybeUninit::<u8>::uninit(); 65_535];
-        match self.socket.recv(&mut buffer) {
+    fn recv_ipv4(&mut self, timeout: Duration) -> io::Result<Option<&[u8]>> {
+        if self.read_timeout != Some(timeout) {
+            self.socket.set_read_timeout(Some(timeout))?;
+            self.read_timeout = Some(timeout);
+        }
+
+        match self.socket.recv(&mut self.buffer) {
             Ok(read) => {
                 if read == 0 {
                     Ok(None)
                 } else {
-                    let mut out = vec![0u8; read];
-                    // recv initialized the first `read` bytes.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            buffer.as_ptr() as *const u8,
-                            out.as_mut_ptr(),
-                            read,
-                        );
-                    }
-                    Ok(Some(out))
+                    // SAFETY: `recv` initialized the first `read` bytes in `self.buffer`.
+                    let frame = unsafe {
+                        std::slice::from_raw_parts(self.buffer.as_ptr() as *const u8, read)
+                    };
+                    Ok(Some(frame))
                 }
             }
             Err(err)

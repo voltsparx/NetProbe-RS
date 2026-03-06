@@ -5,6 +5,8 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
+use std::{collections::BTreeMap, fmt::Write as _};
 
 use mlua::{Lua, LuaSerdeExt, Value};
 
@@ -12,6 +14,11 @@ use crate::error::{NProbeError, NProbeResult};
 use crate::models::HostResult;
 
 const DEFAULT_LUA_RULES: &str = include_str!("../../lua/default_rules.lua");
+static LUA_KB: OnceLock<Mutex<BTreeMap<String, String>>> = OnceLock::new();
+
+fn kb() -> &'static Mutex<BTreeMap<String, String>> {
+    LUA_KB.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
 
 pub fn run(host: &HostResult, script_path: Option<&Path>) -> NProbeResult<Vec<String>> {
     let script = if let Some(path) = script_path {
@@ -21,6 +28,48 @@ pub fn run(host: &HostResult, script_path: Option<&Path>) -> NProbeResult<Vec<St
     };
 
     let lua = Lua::new();
+    let globals = lua.globals();
+    globals.set(
+        "kb_get",
+        lua.create_function(|_, key: String| {
+            let guard = kb()
+                .lock()
+                .map_err(|_| mlua::Error::external("lua kb mutex poisoned"))?;
+            Ok(guard.get(&key).cloned())
+        })?,
+    )?;
+    globals.set(
+        "kb_set",
+        lua.create_function(|_, (key, value): (String, String)| {
+            let mut guard = kb()
+                .lock()
+                .map_err(|_| mlua::Error::external("lua kb mutex poisoned"))?;
+            guard.insert(key, value);
+            Ok(())
+        })?,
+    )?;
+    globals.set(
+        "kb_keys",
+        lua.create_function(|_, ()| {
+            let guard = kb()
+                .lock()
+                .map_err(|_| mlua::Error::external("lua kb mutex poisoned"))?;
+            Ok(guard.keys().cloned().collect::<Vec<String>>())
+        })?,
+    )?;
+    globals.set(
+        "kb_dump",
+        lua.create_function(|_, ()| {
+            let guard = kb()
+                .lock()
+                .map_err(|_| mlua::Error::external("lua kb mutex poisoned"))?;
+            let mut out = String::new();
+            for (key, value) in guard.iter() {
+                let _ = writeln!(&mut out, "{key}={value}");
+            }
+            Ok(out)
+        })?,
+    )?;
     lua.load(&script).set_name("nprobe_rules").exec()?;
     let analyze = lua
         .globals()

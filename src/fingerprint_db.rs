@@ -321,16 +321,47 @@ impl FingerprintDatabase {
         payloads_tcp_by_port.insert(110, vec![b"CAPA\r\n".to_vec()]);
         payloads_tcp_by_port.insert(143, vec![b"A1 CAPABILITY\r\n".to_vec()]);
         payloads_tcp_by_port.insert(6379, vec![b"PING\r\n".to_vec()]);
+        let mut payloads_udp_by_port = HashMap::new();
+        // DNS standard query: A record for root label.
+        payloads_udp_by_port.insert(
+            53,
+            vec![vec![
+                0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x01, 0x00, 0x01,
+            ]],
+        );
+        // Minimal SNMPv1 GetRequest for sysDescr.0 using community "public".
+        payloads_udp_by_port.insert(
+            161,
+            vec![vec![
+                0x30, 0x26, 0x02, 0x01, 0x00, 0x04, 0x06, b'p', b'u', b'b', b'l', b'i', b'c', 0xa0,
+                0x19, 0x02, 0x04, 0x70, 0x71, 0x72, 0x73, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x30,
+                0x0b, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x06, 0x01, 0x02, 0x01, 0x05, 0x00,
+            ]],
+        );
+        // NTP client mode request.
+        payloads_udp_by_port.insert(
+            123,
+            vec![{
+                let mut ntp = vec![0u8; 48];
+                ntp[0] = 0x1b;
+                ntp
+            }],
+        );
+        payloads_udp_by_port.insert(
+            1900,
+            vec![b"M-SEARCH * HTTP/1.1\r\nHOST:239.255.255.250:1900\r\nMAN:\"ssdp:discover\"\r\nMX:1\r\nST:ssdp:all\r\n\r\n".to_vec()],
+        );
 
         Self {
             payloads_tcp_by_port,
-            payloads_udp_by_port: HashMap::new(),
+            payloads_udp_by_port,
             payloads_tcp_generic: vec![b"\r\n".to_vec()],
             payloads_udp_generic: vec![vec![0x00]],
             hard_rules: Vec::new(),
             soft_rules: Vec::new(),
             stats: FingerprintStats {
-                payloads_loaded: 7,
+                payloads_loaded: 11,
                 rules_loaded: 0,
                 rules_compiled: 0,
                 rules_skipped: 0,

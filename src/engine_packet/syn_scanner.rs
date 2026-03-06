@@ -1,6 +1,6 @@
 // Raw SYN scanner foundation: TX/RX split, token-bucket pacing, and IPv4 TCP packet craft/parse.
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::io;
 use std::net::Ipv4Addr;
 use std::sync::{
@@ -10,16 +10,28 @@ use std::sync::{
 use std::thread;
 use std::time::Duration;
 
-use crossbeam_channel::bounded;
+use crossbeam_queue::ArrayQueue;
 use pnet_packet::ip::IpNextHeaderProtocols;
-use pnet_packet::ipv4::{self, Ipv4Packet, MutableIpv4Packet};
-use pnet_packet::tcp::{ipv4_checksum, MutableTcpPacket, TcpFlags, TcpPacket};
-use pnet_packet::{MutablePacket, Packet};
+use pnet_packet::ipv4::Ipv4Packet;
+use pnet_packet::tcp::{TcpFlags, TcpPacket};
+use pnet_packet::Packet;
+
+#[cfg(test)]
+use pnet_packet::ipv4::{self, MutableIpv4Packet};
+#[cfg(test)]
+use pnet_packet::tcp::{ipv4_checksum, MutableTcpPacket};
+#[cfg(test)]
+use pnet_packet::MutablePacket;
 
 use crate::engine_packet::blackrock::BlackrockPermutation;
-use crate::engine_packet::rate_limiter::TokenBucket;
+use crate::engine_packet::rate_limiter::{AdaptiveThrottler, TokenBucket};
+use crate::engines::packet_crafter::tcp_syn_crafter::{
+    stateless_syn_cookie_ack_expected, stateless_syn_cookie_sequence, TcpSynCrafter,
+};
 
+#[cfg(test)]
 const IPV4_HEADER_LEN: usize = 20;
+#[cfg(test)]
 const TCP_HEADER_LEN: usize = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +57,8 @@ pub struct RawSynScannerConfig {
     pub source_port: u16,
     pub rate_pps: u64,
     pub burst_size: usize,
+    pub tx_workers: usize,
+    pub tx_batch_size: usize,
     pub rx_grace: Duration,
     pub scan_seed: u64,
 }
@@ -56,6 +70,8 @@ impl Default for RawSynScannerConfig {
             source_port: 40000,
             rate_pps: 10_000,
             burst_size: 256,
+            tx_workers: 1,
+            tx_batch_size: 32,
             rx_grace: Duration::from_millis(250),
             scan_seed: 0x4e50_5253_5343_414e,
         }
@@ -67,7 +83,7 @@ pub trait RawTxBackend: Send + 'static {
 }
 
 pub trait RawRxBackend: Send + 'static {
-    fn recv_ipv4(&mut self, timeout: Duration) -> io::Result<Option<Vec<u8>>>;
+    fn recv_ipv4(&mut self, timeout: Duration) -> io::Result<Option<&[u8]>>;
 }
 
 #[derive(Debug, Clone)]
@@ -80,101 +96,188 @@ impl RawSynScanner {
         Self { config }
     }
 
+    pub fn effective_tx_workers(&self, target_count: usize) -> usize {
+        let mut workers = self.config.tx_workers.max(1).min(target_count.max(1));
+        if self.config.rate_pps > 0 {
+            workers = workers.min(self.config.rate_pps as usize);
+        }
+        workers.max(1)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn run_with_backends<TX, RX>(
         &self,
-        mut tx_backend: TX,
-        mut rx_backend: RX,
+        tx_backend: TX,
+        rx_backend: RX,
         targets: &[(Ipv4Addr, u16)],
     ) -> io::Result<Vec<RawSynResult>>
     where
         TX: RawTxBackend,
         RX: RawRxBackend,
     {
+        self.run_with_tx_backends(vec![Box::new(tx_backend)], rx_backend, targets)
+    }
+
+    pub fn run_with_tx_factory<RX, F>(
+        &self,
+        mut tx_factory: F,
+        rx_backend: RX,
+        targets: &[(Ipv4Addr, u16)],
+    ) -> io::Result<Vec<RawSynResult>>
+    where
+        RX: RawRxBackend,
+        F: FnMut(usize) -> io::Result<Box<dyn RawTxBackend>>,
+    {
         if targets.is_empty() {
             return Ok(Vec::new());
+        }
+
+        let workers = self.effective_tx_workers(targets.len());
+        let mut tx_backends = Vec::<Box<dyn RawTxBackend>>::with_capacity(workers);
+        for worker_id in 0..workers {
+            tx_backends.push(tx_factory(worker_id)?);
+        }
+
+        self.run_with_tx_backends(tx_backends, rx_backend, targets)
+    }
+
+    fn run_with_tx_backends<RX>(
+        &self,
+        tx_backends: Vec<Box<dyn RawTxBackend>>,
+        mut rx_backend: RX,
+        targets: &[(Ipv4Addr, u16)],
+    ) -> io::Result<Vec<RawSynResult>>
+    where
+        RX: RawRxBackend,
+    {
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
+        if tx_backends.is_empty() {
+            return Err(io::Error::other("no tx backends provided"));
         }
 
         let expected_source_port = self.config.source_port;
         let scan_seed = self.config.scan_seed;
         let source_ip = self.config.source_ip;
         let rate_pps = self.config.rate_pps;
-        let burst_size = self.config.burst_size;
-        let tx_targets = targets.to_vec();
+        let burst_size = self.config.burst_size.max(1);
+        let tx_batch_size = self.config.tx_batch_size.max(1) as u64;
+        let worker_count = tx_backends.len().min(targets.len().max(1));
+        let tx_targets = Arc::new(targets.to_vec());
+        let permutation = Arc::new(BlackrockPermutation::new(tx_targets.len(), scan_seed));
 
-        let (result_tx, result_rx) = bounded::<RawSynResult>(targets.len().max(64));
-        let (error_tx, error_rx) = bounded::<io::Error>(4);
+        let result_capacity = targets.len().saturating_mul(2).clamp(256, 262_144);
+        let result_queue = Arc::new(ArrayQueue::<RawSynResult>::new(result_capacity));
+        let error_queue = Arc::new(ArrayQueue::<io::Error>::new(worker_count.saturating_add(8)));
         let stop = Arc::new(AtomicBool::new(false));
-        let tx_stop = Arc::clone(&stop);
         let rx_stop = Arc::clone(&stop);
-        let tx_error = error_tx.clone();
-        let rx_error = error_tx;
-
-        let tx_thread = thread::spawn(move || {
-            let mut limiter = TokenBucket::new(rate_pps, burst_size);
-            let permutation = BlackrockPermutation::new(tx_targets.len(), scan_seed);
-
-            for idx in permutation {
-                if tx_stop.load(Ordering::Relaxed) {
-                    break;
-                }
-
-                let (target_ip, target_port) = tx_targets[idx];
-                limiter.acquire_blocking(1);
-
-                let sequence = sequence_for(target_ip, target_port, scan_seed);
-                match build_syn_ipv4_packet(
-                    source_ip,
-                    target_ip,
-                    expected_source_port,
-                    target_port,
-                    sequence,
-                ) {
-                    Ok(packet) => {
-                        if let Err(err) = tx_backend.send_ipv4(&packet, target_ip) {
-                            let _ = tx_error.send(err);
-                            break;
-                        }
-                    }
-                    Err(err) => {
-                        let _ = tx_error.send(err);
-                        break;
-                    }
-                }
-            }
-        });
+        let rx_result_queue = Arc::clone(&result_queue);
+        let rx_error_queue = Arc::clone(&error_queue);
 
         let rx_thread = thread::spawn(move || {
             while !rx_stop.load(Ordering::Relaxed) {
                 match rx_backend.recv_ipv4(Duration::from_millis(50)) {
                     Ok(Some(frame)) => {
-                        if let Some(parsed) = parse_syn_response(&frame, expected_source_port) {
-                            let _ = result_tx.send(parsed);
+                        if let Some(parsed) =
+                            parse_syn_response_with_cookie(frame, expected_source_port, scan_seed)
+                        {
+                            let _ = push_lock_free(&rx_result_queue, parsed, &rx_stop);
                         }
                     }
                     Ok(None) => {}
                     Err(err) => {
-                        let _ = rx_error.send(err);
+                        let _ = push_lock_free(&rx_error_queue, err, &rx_stop);
                         break;
                     }
                 }
             }
         });
 
-        tx_thread
-            .join()
-            .map_err(|_| io::Error::other("raw tx thread panicked"))?;
+        let mut tx_threads = Vec::with_capacity(worker_count);
+        for (worker_id, mut tx_backend) in tx_backends.into_iter().enumerate() {
+            let tx_stop = Arc::clone(&stop);
+            let tx_error_queue = Arc::clone(&error_queue);
+            let tx_targets = Arc::clone(&tx_targets);
+            let permutation = Arc::clone(&permutation);
+            let worker_rate = split_u64(rate_pps, worker_count, worker_id);
+            let worker_burst = split_usize(burst_size, worker_count, worker_id).max(1);
+
+            let handle = thread::spawn(move || {
+                let mut limiter = TokenBucket::new(worker_rate, worker_burst);
+                let mut throttler = AdaptiveThrottler::new(worker_rate);
+                let max_batch = tx_batch_size.max(1);
+                let mut crafter = match TcpSynCrafter::new(source_ip, expected_source_port) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        tx_stop.store(true, Ordering::Relaxed);
+                        let _ = push_lock_free(&tx_error_queue, err, &tx_stop);
+                        return;
+                    }
+                };
+
+                let mut logical_index = worker_id;
+                let mut sent_packets = 0u64;
+                while logical_index < tx_targets.len() {
+                    if tx_stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    let adaptive_batch = throttler.next_batch(sent_packets, max_batch);
+                    let permits = limiter.acquire_batch_blocking(adaptive_batch);
+                    let mut dispatched = 0u64;
+                    while dispatched < permits {
+                        if logical_index >= tx_targets.len() || tx_stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+
+                        let permuted = permutation.at(logical_index);
+                        logical_index = logical_index.saturating_add(worker_count);
+                        let (target_ip, target_port) = tx_targets[permuted];
+                        let sequence =
+                            stateless_syn_cookie_sequence(target_ip, target_port, scan_seed);
+
+                        match crafter.craft_syn(target_ip, target_port, sequence) {
+                            Ok(packet) => {
+                                if let Err(err) = tx_backend.send_ipv4(packet, target_ip) {
+                                    tx_stop.store(true, Ordering::Relaxed);
+                                    let _ = push_lock_free(&tx_error_queue, err, &tx_stop);
+                                    return;
+                                }
+                            }
+                            Err(err) => {
+                                tx_stop.store(true, Ordering::Relaxed);
+                                let _ = push_lock_free(&tx_error_queue, err, &tx_stop);
+                                return;
+                            }
+                        }
+
+                        dispatched += 1;
+                        sent_packets = sent_packets.saturating_add(1);
+                    }
+                }
+            });
+            tx_threads.push(handle);
+        }
+
+        for handle in tx_threads {
+            handle
+                .join()
+                .map_err(|_| io::Error::other("raw tx thread panicked"))?;
+        }
+
         thread::sleep(self.config.rx_grace);
         stop.store(true, Ordering::Relaxed);
         rx_thread
             .join()
             .map_err(|_| io::Error::other("raw rx thread panicked"))?;
 
-        if let Ok(err) = error_rx.try_recv() {
+        if let Some(err) = error_queue.pop() {
             return Err(err);
         }
 
-        let mut dedup = BTreeMap::<(Ipv4Addr, u16), RawSynResult>::new();
-        for result in result_rx.try_iter() {
+        let mut dedup = HashMap::<(Ipv4Addr, u16), RawSynResult>::with_capacity(targets.len());
+        while let Some(result) = result_queue.pop() {
             let key = (result.ip, result.port);
             dedup
                 .entry(key)
@@ -185,10 +288,49 @@ impl RawSynScanner {
                 })
                 .or_insert(result);
         }
-        Ok(dedup.into_values().collect())
+        let mut values = dedup.into_values().collect::<Vec<_>>();
+        values.sort_unstable_by_key(|value| (u32::from(value.ip), value.port));
+        Ok(values)
     }
 }
 
+fn split_u64(total: u64, workers: usize, worker_idx: usize) -> u64 {
+    if workers <= 1 {
+        return total;
+    }
+
+    let base = total / workers as u64;
+    let extra = (worker_idx < (total % workers as u64) as usize) as u64;
+    base + extra
+}
+
+fn split_usize(total: usize, workers: usize, worker_idx: usize) -> usize {
+    if workers <= 1 {
+        return total;
+    }
+
+    let base = total / workers;
+    let extra = usize::from(worker_idx < (total % workers));
+    base + extra
+}
+
+fn push_lock_free<T>(queue: &ArrayQueue<T>, item: T, stop: &AtomicBool) -> bool {
+    let mut pending = item;
+    loop {
+        match queue.push(pending) {
+            Ok(()) => return true,
+            Err(value) => {
+                if stop.load(Ordering::Relaxed) {
+                    return false;
+                }
+                pending = value;
+                thread::yield_now();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 pub fn build_syn_ipv4_packet(
     source_ip: Ipv4Addr,
     target_ip: Ipv4Addr,
@@ -207,7 +349,24 @@ pub fn build_syn_ipv4_packet(
     )
 }
 
+#[cfg(test)]
 pub fn parse_syn_response(frame: &[u8], expected_source_port: u16) -> Option<RawSynResult> {
+    parse_syn_response_impl(frame, expected_source_port, None)
+}
+
+pub fn parse_syn_response_with_cookie(
+    frame: &[u8],
+    expected_source_port: u16,
+    scan_seed: u64,
+) -> Option<RawSynResult> {
+    parse_syn_response_impl(frame, expected_source_port, Some(scan_seed))
+}
+
+fn parse_syn_response_impl(
+    frame: &[u8],
+    expected_source_port: u16,
+    scan_seed: Option<u64>,
+) -> Option<RawSynResult> {
     let ipv4_packet = Ipv4Packet::new(frame)?;
     if ipv4_packet.get_next_level_protocol() != IpNextHeaderProtocols::Tcp {
         return None;
@@ -219,6 +378,22 @@ pub fn parse_syn_response(frame: &[u8], expected_source_port: u16) -> Option<Raw
     }
 
     let flags = tcp_packet.get_flags();
+    if let Some(seed) = scan_seed {
+        if flags & TcpFlags::ACK == TcpFlags::ACK {
+            let expected_ack = stateless_syn_cookie_ack_expected(
+                ipv4_packet.get_source(),
+                tcp_packet.get_source(),
+                seed,
+            );
+            if tcp_packet.get_acknowledgement() != expected_ack {
+                return None;
+            }
+        } else if flags & (TcpFlags::SYN | TcpFlags::RST) != 0 {
+            // If this looks like a reply to SYN but has no ACK, ignore as unrelated/noisy traffic.
+            return None;
+        }
+    }
+
     let state = if flags & (TcpFlags::SYN | TcpFlags::ACK) == (TcpFlags::SYN | TcpFlags::ACK) {
         RawPortState::Open
     } else if flags & TcpFlags::RST == TcpFlags::RST {
@@ -236,6 +411,7 @@ pub fn parse_syn_response(frame: &[u8], expected_source_port: u16) -> Option<Raw
     })
 }
 
+#[cfg(test)]
 fn build_tcp_ipv4_packet(
     source_ip: Ipv4Addr,
     target_ip: Ipv4Addr,
@@ -276,17 +452,6 @@ fn build_tcp_ipv4_packet(
     ipv4_packet.set_checksum(checksum);
 
     Ok(buffer)
-}
-
-fn sequence_for(target_ip: Ipv4Addr, target_port: u16, seed: u64) -> u32 {
-    let mut value = seed ^ 0xcbf2_9ce4_8422_2325;
-    for byte in target_ip.octets() {
-        value ^= byte as u64;
-        value = value.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    value ^= target_port as u64;
-    value = value.wrapping_mul(0x0000_0100_0000_01b3);
-    (value as u32).wrapping_add(((value >> 32) as u32).rotate_left(13))
 }
 
 #[cfg(test)]
@@ -335,10 +500,11 @@ mod tests {
     #[derive(Clone)]
     struct MockRxBackend {
         responses: Arc<Mutex<VecDeque<Vec<u8>>>>,
+        current_frame: Option<Vec<u8>>,
     }
 
     impl RawRxBackend for MockRxBackend {
-        fn recv_ipv4(&mut self, timeout: Duration) -> io::Result<Option<Vec<u8>>> {
+        fn recv_ipv4(&mut self, timeout: Duration) -> io::Result<Option<&[u8]>> {
             let started = Instant::now();
             loop {
                 if let Some(frame) = self
@@ -347,7 +513,8 @@ mod tests {
                     .map_err(|_| io::Error::other("response queue poisoned"))?
                     .pop_front()
                 {
-                    return Ok(Some(frame));
+                    self.current_frame = Some(frame);
+                    return Ok(self.current_frame.as_deref());
                 }
 
                 if started.elapsed() >= timeout {
@@ -404,18 +571,56 @@ mod tests {
     }
 
     #[test]
+    fn parse_response_with_cookie_rejects_bad_ack() {
+        let seed = 12345;
+        let src = Ipv4Addr::new(8, 8, 8, 8);
+        let dst = Ipv4Addr::new(10, 0, 0, 7);
+        let port = 443;
+        let expected_ack = stateless_syn_cookie_ack_expected(src, port, seed);
+
+        let valid = build_tcp_ipv4_packet(
+            src,
+            dst,
+            port,
+            40000,
+            1,
+            expected_ack,
+            TcpFlags::SYN | TcpFlags::ACK,
+        )
+        .expect("valid packet");
+        let invalid = build_tcp_ipv4_packet(
+            src,
+            dst,
+            port,
+            40000,
+            1,
+            expected_ack.wrapping_add(5),
+            TcpFlags::SYN | TcpFlags::ACK,
+        )
+        .expect("invalid packet");
+
+        assert!(parse_syn_response_with_cookie(&valid, 40000, seed).is_some());
+        assert!(parse_syn_response_with_cookie(&invalid, 40000, seed).is_none());
+    }
+
+    #[test]
     fn tx_rx_split_returns_deduped_results() {
         let responses = Arc::new(Mutex::new(VecDeque::new()));
         let tx = MockTxBackend {
             responses: Arc::clone(&responses),
         };
-        let rx = MockRxBackend { responses };
+        let rx = MockRxBackend {
+            responses,
+            current_frame: None,
+        };
 
         let scanner = RawSynScanner::new(RawSynScannerConfig {
             source_ip: Ipv4Addr::new(10, 0, 0, 5),
             source_port: 40000,
             rate_pps: 1000,
             burst_size: 16,
+            tx_workers: 1,
+            tx_batch_size: 8,
             rx_grace: Duration::from_millis(40),
             scan_seed: 123,
         });
@@ -443,5 +648,52 @@ mod tests {
             .count();
         assert!(open_count >= 2);
         assert!(closed_count >= 1);
+    }
+
+    #[test]
+    fn tx_factory_parallel_workers_return_results() {
+        let responses = Arc::new(Mutex::new(VecDeque::new()));
+        let rx = MockRxBackend {
+            responses: Arc::clone(&responses),
+            current_frame: None,
+        };
+        let tx_responses = Arc::clone(&responses);
+
+        let scanner = RawSynScanner::new(RawSynScannerConfig {
+            source_ip: Ipv4Addr::new(10, 0, 0, 5),
+            source_port: 40000,
+            rate_pps: 8000,
+            burst_size: 64,
+            tx_workers: 4,
+            tx_batch_size: 16,
+            rx_grace: Duration::from_millis(40),
+            scan_seed: 321,
+        });
+
+        let results = scanner
+            .run_with_tx_factory(
+                move |_| {
+                    Ok(Box::new(MockTxBackend {
+                        responses: Arc::clone(&tx_responses),
+                    }) as Box<dyn RawTxBackend>)
+                },
+                rx,
+                &[
+                    (Ipv4Addr::new(10, 0, 0, 10), 80),
+                    (Ipv4Addr::new(10, 0, 0, 10), 81),
+                    (Ipv4Addr::new(10, 0, 0, 10), 82),
+                    (Ipv4Addr::new(10, 0, 0, 10), 83),
+                    (Ipv4Addr::new(10, 0, 0, 10), 84),
+                    (Ipv4Addr::new(10, 0, 0, 10), 85),
+                ],
+            )
+            .expect("scan should succeed");
+
+        assert!(results
+            .iter()
+            .any(|value| value.state == RawPortState::Open));
+        assert!(results
+            .iter()
+            .any(|value| value.state == RawPortState::Closed));
     }
 }

@@ -24,6 +24,24 @@ impl BlackrockPermutation {
             offset,
         }
     }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.size as usize
+    }
+
+    pub fn at(&self, index: usize) -> usize {
+        if self.size <= 1 {
+            return 0;
+        }
+
+        let mapped = (self
+            .multiplier
+            .wrapping_mul(index as u64)
+            .wrapping_add(self.offset))
+            % self.size;
+        mapped as usize
+    }
 }
 
 impl Iterator for BlackrockPermutation {
@@ -34,17 +52,9 @@ impl Iterator for BlackrockPermutation {
             return None;
         }
 
-        let mapped = if self.size <= 1 {
-            0
-        } else {
-            (self
-                .multiplier
-                .wrapping_mul(self.index)
-                .wrapping_add(self.offset))
-                % self.size
-        };
+        let mapped = self.at(self.index as usize);
         self.index += 1;
-        Some(mapped as usize)
+        Some(mapped)
     }
 }
 
@@ -102,5 +112,15 @@ mod tests {
         order.sort_unstable();
         let expected: Vec<usize> = (0..257).collect();
         assert_eq!(order, expected);
+    }
+
+    #[test]
+    fn direct_index_mapping_matches_iterator() {
+        let permutation = BlackrockPermutation::new(129, 9);
+        let iter_values: Vec<usize> = permutation.clone().collect();
+        let indexed_values: Vec<usize> = (0..permutation.len())
+            .map(|idx| permutation.at(idx))
+            .collect();
+        assert_eq!(iter_values, indexed_values);
     }
 }

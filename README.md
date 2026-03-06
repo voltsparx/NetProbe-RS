@@ -226,4 +226,4 @@ NProbe-RS draws inspiration from the design principles of Nmap while reimplement
 
 ## 📜 License
 
-**MIT**
+**SPDX-License-Identifier**

@@ -1,0 +1,36 @@
+──────────────────────────────────────────────
+     SPDX-License-Identifier: Proprietary
+──────────────────────────────────────────────
+
+Copyright (c) 2026 Voltsparx
+All rights reserved.
+
+Permission is hereby granted, free of charge, to use NProbe-RS solely for personal, educational, or internal security purposes 
+on systems you own or are authorized to monitor. 
+
+Any other use, including but not limited to modification, distribution, commercial use, rebranding, or sublicensing, 
+requires explicit written permission from the copyright holder (Voltsparx).
+
+You may not:
+
+1. Remove, alter, or obscure any copyright, license, or attribution notices.
+2. Claim authorship or ownership of NProbe-RS or derivative works.
+3. Redistribute NProbe-RS, in whole or in part, in source or binary form, without prior written permission.
+4. Use NProbe-RS for unauthorized penetration testing, hacking, or any illegal activity.
+
+Attribution must be retained in any permitted use:
+
+    "NProbe-RS v3.0+ © 2026 Voltsparx. All rights reserved. 
+    Original project: https://github.com/voltsparx/NProbe-RS"
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE 
+WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, OR NON-INFRINGEMENT. IN NO EVENT SHALL THE AUTHOR BE 
+LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, 
+OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+For permissions beyond personal/internal use, contact:
+
+Voltsparx  
+Email: voltsparx@gmail.com, voltsparx303@gmail.com  
+Original project: https://github.com/voltsparx/NProbe-RS
+────────────────────────────────────────────────────────

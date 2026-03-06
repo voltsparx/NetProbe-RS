@@ -1,16 +1,28 @@
 // Packet-blast runner for raw SYN scanning with async-engine-compatible output shape.
 
 use std::collections::HashMap;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::engine_intel::strategy::ScanStrategy;
+use crate::engine_packet::datalink_backend::open_layer2_backends;
 use crate::engine_packet::socket_backend::{RawSocketRx, RawSocketTx};
-use crate::engine_packet::syn_scanner::{RawPortState, RawSynScanner, RawSynScannerConfig};
+use crate::engine_packet::syn_scanner::{
+    RawPortState, RawSynScanner, RawSynScannerConfig, RawTxBackend,
+};
+use crate::engines::async_engine::AsyncPacketEngine;
+use crate::engines::fusion_engine::{FusionEngine, PacketFusionInput};
 use crate::error::{NProbeError, NProbeResult};
 use crate::models::{HostResult, PortFinding, PortState, ScanRequest};
 use crate::service_db::ServiceRegistry;
+
+#[derive(Debug)]
+struct BackendRunResult {
+    findings: Vec<crate::engine_packet::syn_scanner::RawSynResult>,
+    backend_mode: String,
+}
 
 pub async fn run(
     request: &ScanRequest,
@@ -62,24 +74,33 @@ pub async fn run(
         .copied()
         .map(|port| (target_v4, port))
         .collect::<Vec<_>>();
+    let mut fusion_engine = FusionEngine::default();
+    let fusion_plan = fusion_engine.plan(PacketFusionInput {
+        requested_rate_pps: rate_pps.max(1),
+        burst_size,
+        target_count: scan_targets.len(),
+        packet_drop_ratio: 0.0,
+        timeout_pressure: 0.0,
+    });
+
     let config = RawSynScannerConfig {
         source_ip,
         source_port,
-        rate_pps,
+        rate_pps: fusion_plan.effective_rate_pps,
         burst_size,
+        tx_workers: fusion_plan.tx_workers,
+        tx_batch_size: fusion_plan.tx_batch_size,
         rx_grace: scan_timeout,
         scan_seed: seed,
     };
 
-    let findings = tokio::task::spawn_blocking(move || {
-        let tx = RawSocketTx::new(source_ip)?;
-        let rx = RawSocketRx::new(source_ip)?;
+    let backend_result = AsyncPacketEngine::run_blocking("packet-blast", move || {
         let scanner = RawSynScanner::new(config);
-        scanner.run_with_backends(tx, rx, &scan_targets)
+        run_with_preferred_backend(scanner, source_ip, target_v4, &scan_targets)
     })
     .await
-    .map_err(NProbeError::Join)?
     .map_err(NProbeError::Io)?;
+    let findings = backend_result.findings;
 
     let mut final_findings = build_default_findings(&ports, &services);
     let mut index_by_port = HashMap::<u16, usize>::with_capacity(final_findings.len());
@@ -120,7 +141,16 @@ pub async fn run(
         target: request.target.clone(),
         ip: target.to_string(),
         reverse_dns: None,
-        warnings: Vec::new(),
+        warnings: vec![
+            backend_result.backend_mode,
+            format!(
+                "fusion-engine: effective-rate={}pps tx-workers={} batch={} crafters={}",
+                fusion_plan.effective_rate_pps,
+                fusion_plan.tx_workers,
+                fusion_plan.tx_batch_size,
+                fusion_plan.active_crafters
+            ),
+        ],
         ports: final_findings,
         risk_score: 0,
         insights: Vec::new(),
@@ -130,6 +160,58 @@ pub async fn run(
     };
 
     Ok((host, ports.len()))
+}
+
+fn run_with_preferred_backend(
+    scanner: RawSynScanner,
+    source_ip: Ipv4Addr,
+    target_ip: Ipv4Addr,
+    scan_targets: &[(Ipv4Addr, u16)],
+) -> io::Result<BackendRunResult> {
+    match open_layer2_backends(source_ip, target_ip) {
+        Ok((tx, rx)) => {
+            let worker_count = scanner.effective_tx_workers(scan_targets.len());
+            let mut first_tx = Some(tx);
+            let findings = scanner.run_with_tx_factory(
+                move |worker_id| {
+                    if worker_id == 0 {
+                        let primary = first_tx.take().ok_or_else(|| {
+                            io::Error::other("primary layer-2 tx backend already consumed")
+                        })?;
+                        return Ok(Box::new(primary) as Box<dyn RawTxBackend>);
+                    }
+
+                    let (extra_tx, _extra_rx) = open_layer2_backends(source_ip, target_ip)?;
+                    Ok(Box::new(extra_tx) as Box<dyn RawTxBackend>)
+                },
+                rx,
+                scan_targets,
+            )?;
+            Ok(BackendRunResult {
+                findings,
+                backend_mode: format!(
+                    "packet-blast backend: direct L2 crafted frames (kernel TCP stack bypass, tx-workers={})",
+                    worker_count
+                ),
+            })
+        }
+        Err(l2_err) => {
+            let worker_count = scanner.effective_tx_workers(scan_targets.len());
+            let rx = RawSocketRx::new(source_ip)?;
+            let findings = scanner.run_with_tx_factory(
+                move |_| Ok(Box::new(RawSocketTx::new(source_ip)?) as Box<dyn RawTxBackend>),
+                rx,
+                scan_targets,
+            )?;
+            Ok(BackendRunResult {
+                findings,
+                backend_mode: format!(
+                    "packet-blast backend fallback: raw sockets (L2 unavailable: {}, tx-workers={})",
+                    l2_err, worker_count
+                ),
+            })
+        }
+    }
 }
 
 fn build_default_findings(ports: &[u16], services: &ServiceRegistry) -> Vec<PortFinding> {

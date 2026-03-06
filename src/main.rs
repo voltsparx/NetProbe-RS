@@ -15,6 +15,7 @@ mod engine_probe;
 mod engine_report;
 mod engines;
 mod error;
+mod fetchers;
 mod fingerprint_db;
 mod models;
 mod output;

@@ -76,7 +76,7 @@ pub fn plan(request: &ScanRequest, host_count: usize, port_count: usize) -> Scan
     let (rate_limit_pps, burst_size, max_retries) = match mode {
         ExecutionMode::Async => (1_500, 32, 1),
         ExecutionMode::Hybrid => (6_000, 96, 2),
-        ExecutionMode::PacketBlast => (20_000, 256, 1),
+        ExecutionMode::PacketBlast => (80_000, 1024, 1),
     };
 
     let mut recommended_concurrency = match mode {

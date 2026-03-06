@@ -23,6 +23,7 @@ use crate::engine_parallel::dns;
 use crate::engine_plugin::lua;
 use crate::engine_report::reporting;
 use crate::error::{NProbeError, NProbeResult};
+use crate::fetchers;
 use crate::fingerprint_db::FingerprintDatabase;
 use crate::models::{
     EngineStats, HostResult, KnowledgeStats, ScanMetadata, ScanProfile, ScanReport, ScanRequest,
@@ -211,13 +212,7 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
         hosts = merge_hosts_by_ip(hosts);
         for host in &mut hosts {
             let (extra_thread_pool_tasks, extra_parallel_tasks, extra_lua_hooks_ran) =
-                finalize_host(
-                    request.lua_script.as_deref(),
-                    request.explain,
-                    request.reverse_dns,
-                    host,
-                )
-                .await?;
+                finalize_host(&request, host).await?;
             thread_pool_tasks += extra_thread_pool_tasks;
             parallel_tasks += extra_parallel_tasks;
             lua_hooks_ran = lua_hooks_ran || extra_lua_hooks_ran;
@@ -438,7 +433,6 @@ async fn process_host(
             .await?
         };
     host.warnings.extend(global_warnings);
-    append_arp_intel(&request, ip, &mut host).await;
 
     let mut thread_pool_tasks = 0usize;
     let mut parallel_tasks = 0usize;
@@ -453,6 +447,14 @@ async fn process_host(
         }
 
         parallel_tasks = analysis::run(&mut host, request.explain);
+        let fetcher_report = fetchers::run(&request, &host).await;
+        parallel_tasks += fetcher_report.parallel_tasks;
+        host.warnings.extend(fetcher_report.warnings);
+        host.insights.extend(fetcher_report.insights);
+        host.learning_notes.extend(fetcher_report.learning_notes);
+        dedupe_sort_strings(&mut host.warnings);
+        dedupe_sort_strings(&mut host.insights);
+        dedupe_sort_strings(&mut host.learning_notes);
         let lua_findings = lua::run(&host, request.lua_script.as_deref())?;
         host.lua_findings = lua_findings;
         if !host.lua_findings.is_empty() {
@@ -472,58 +474,6 @@ async fn process_host(
         parallel_tasks,
         lua_hooks_ran,
     })
-}
-
-async fn append_arp_intel(request: &ScanRequest, ip: IpAddr, host: &mut HostResult) {
-    if !request.arp_discovery {
-        return;
-    }
-    if packet_arp::parse_ipv4_cidr(&request.target).is_some() {
-        return;
-    }
-
-    let target_v4 = match ip {
-        IpAddr::V4(value) => value,
-        IpAddr::V6(_) => {
-            if request.verbose {
-                host.warnings
-                    .push("arp discovery skipped: IPv6 target".to_string());
-            }
-            return;
-        }
-    };
-
-    if !packet_arp::is_lan_ipv4(target_v4) {
-        return;
-    }
-
-    let settle_timeout = Duration::from_millis(180);
-    let result = tokio::task::spawn_blocking(move || {
-        packet_arp::resolve_neighbor_mac(target_v4, settle_timeout)
-    })
-    .await;
-
-    match result {
-        Ok(Ok(Some(mac))) => host.warnings.push(format!(
-            "arp neighbor detected: {} is at {}",
-            target_v4, mac
-        )),
-        Ok(Ok(None)) => {}
-        Ok(Err(err)) => {
-            if request.verbose {
-                host.warnings.push(format!(
-                    "arp discovery probe failed for {}: {}",
-                    target_v4, err
-                ));
-            }
-        }
-        Err(_) => {
-            if request.verbose {
-                host.warnings
-                    .push(format!("arp discovery worker failed for {}", target_v4));
-            }
-        }
-    }
 }
 
 fn merge_hosts_by_ip(hosts: Vec<HostResult>) -> Vec<HostResult> {
@@ -572,13 +522,11 @@ fn dedupe_sort_strings(values: &mut Vec<String>) {
 }
 
 async fn finalize_host(
-    lua_script: Option<&std::path::Path>,
-    explain: bool,
-    reverse_dns_enabled: bool,
+    request: &ScanRequest,
     host: &mut HostResult,
 ) -> NProbeResult<(usize, usize, bool)> {
     let mut thread_pool_tasks = 0usize;
-    if reverse_dns_enabled {
+    if request.reverse_dns {
         if let Ok(ip) = host.ip.parse::<IpAddr>() {
             if let Some(reverse_dns) = dns::reverse(ip).await {
                 host.reverse_dns = Some(reverse_dns);
@@ -593,8 +541,17 @@ async fn finalize_host(
     host.learning_notes.clear();
     host.lua_findings.clear();
 
-    let parallel_tasks = analysis::run(host, explain);
-    let lua_findings = lua::run(host, lua_script)?;
+    let mut parallel_tasks = analysis::run(host, request.explain);
+    let fetcher_report = fetchers::run(request, host).await;
+    parallel_tasks += fetcher_report.parallel_tasks;
+    host.warnings.extend(fetcher_report.warnings);
+    host.insights.extend(fetcher_report.insights);
+    host.learning_notes.extend(fetcher_report.learning_notes);
+    dedupe_sort_strings(&mut host.warnings);
+    dedupe_sort_strings(&mut host.insights);
+    dedupe_sort_strings(&mut host.learning_notes);
+
+    let lua_findings = lua::run(host, request.lua_script.as_deref())?;
     host.lua_findings = lua_findings;
     if !host.lua_findings.is_empty() {
         host.insights.push(format!(
