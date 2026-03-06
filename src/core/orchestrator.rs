@@ -36,6 +36,10 @@ use crate::service_db::ServiceRegistry;
 const MAX_RESOLVED_HOSTS: usize = 16;
 const MAX_CIDR_HOSTS: usize = 4096;
 const PORT_BATCH_SIZE: usize = 256;
+const MAX_PUBLIC_HOSTS: usize = 32;
+const MAX_PUBLIC_PORTS: usize = 128;
+const MAX_DEFENSIVE_PORTS: usize = 512;
+const UNIVERSAL_PROTECTED_PORTS: &[u16] = &[9100];
 
 struct ScanWorkItem {
     checkpoint_unit: String,
@@ -70,18 +74,25 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
     let mut global_warnings = Vec::new();
     let resolved = resolve_targets(&request, &mut global_warnings).await?;
     thread_pool_tasks += 1;
-    let public_target_policy_applied =
-        resolved.iter().any(|ip| !is_private_or_local(ip)) && request.allow_external;
+    let has_public_targets = resolved.iter().any(|ip| !is_private_or_local(ip));
+    let public_target_policy_applied = has_public_targets && request.allow_external;
 
     enforce_safety(&mut request, &resolved, &mut global_warnings)?;
+    enforce_defensive_scope(&mut request, &resolved, &mut global_warnings)?;
     enforce_privileged_modes(&mut request, &mut global_warnings)?;
 
-    let selected_ports = if request.ports.is_empty() {
+    let mut selected_ports = if request.ports.is_empty() {
         let top = request.top_ports.unwrap_or(100);
         service_registry.top_tcp_ports(top)
     } else {
         request.ports.clone()
     };
+    apply_defensive_port_policy(
+        &request,
+        has_public_targets,
+        &mut selected_ports,
+        &mut global_warnings,
+    )?;
     if selected_ports.is_empty() {
         return Err(NProbeError::Parse(
             "no ports selected for scanning".to_string(),
@@ -284,6 +295,7 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
         .count();
     let safety_envelope_active = request.lab_mode
         || request.strict_safety
+        || has_public_targets
         || public_target_policy_applied
         || fragile_hosts > 0;
     let report = ScanReport {
@@ -662,6 +674,91 @@ fn enforce_safety(
     Ok(())
 }
 
+fn enforce_defensive_scope(
+    request: &mut ScanRequest,
+    resolved_ips: &[IpAddr],
+    warnings: &mut Vec<String>,
+) -> NProbeResult<()> {
+    let has_public_targets = resolved_ips.iter().any(|ip| !is_private_or_local(ip));
+
+    if has_public_targets && resolved_ips.len() > MAX_PUBLIC_HOSTS {
+        return Err(NProbeError::Safety(format!(
+            "defensive guard blocked a public-target scan across {} hosts; narrow scope to {} hosts or fewer",
+            resolved_ips.len(),
+            MAX_PUBLIC_HOSTS
+        )));
+    }
+
+    if has_public_targets && request.total_shards.unwrap_or(1) > 1 {
+        return Err(NProbeError::Safety(
+            "defensive guard blocks distributed public-target scans; remove sharding and narrow the scope"
+                .to_string(),
+        ));
+    }
+
+    if request.strict_safety && request.profile != ScanProfile::Stealth {
+        warnings.push(format!(
+            "strict-safety active: forcing profile {} -> stealth",
+            format!("{:?}", request.profile).to_ascii_lowercase()
+        ));
+        request.profile = ScanProfile::Stealth;
+    }
+
+    if has_public_targets && request.profile != ScanProfile::Stealth {
+        warnings.push(format!(
+            "public-target defensive guard: forcing profile {} -> stealth",
+            format!("{:?}", request.profile).to_ascii_lowercase()
+        ));
+        request.profile = ScanProfile::Stealth;
+    }
+
+    if request.strict_safety || has_public_targets {
+        if request.include_udp {
+            request.include_udp = false;
+            warnings.push(
+                "defensive guard disabled UDP probing to minimize amplification and device stress"
+                    .to_string(),
+            );
+        }
+
+        if request.aggressive_root {
+            request.aggressive_root = false;
+            warnings.push(
+                "defensive guard disabled aggressive-root extensions; high-pressure raw probing is not allowed in safe mode"
+                    .to_string(),
+            );
+        }
+
+        if request.privileged_probes {
+            request.privileged_probes = false;
+            warnings.push(
+                "defensive guard disabled privileged raw probes; scan will remain in low-impact user-space paths"
+                    .to_string(),
+            );
+        }
+    }
+
+    if request.strict_safety {
+        request.service_detection = false;
+        warnings.push(
+            "strict-safety active: deeper service fingerprinting deferred unless host evidence later proves resilience"
+                .to_string(),
+        );
+        apply_safe_mode_limits(request);
+    }
+
+    if has_public_targets {
+        request.service_detection = false;
+        warnings.push(
+            "public-target defensive guard: service detection downgraded to port-state discovery only"
+                .to_string(),
+        );
+        apply_public_defensive_limits(request);
+    }
+
+    Ok(())
+}
+
 fn enforce_privileged_modes(
     request: &mut ScanRequest,
     warnings: &mut Vec<String>,
@@ -702,6 +799,85 @@ fn apply_conservative_limits(request: &mut ScanRequest) {
     request.concurrency = Some(base_concurrency.min(96));
     request.delay_ms = Some(base_delay.max(15));
     request.timeout_ms = Some(base_timeout.max(1000));
+}
+
+fn apply_public_defensive_limits(request: &mut ScanRequest) {
+    let defaults = request.profile.defaults();
+    let base_concurrency = request.concurrency.unwrap_or(defaults.concurrency);
+    let base_delay = request.delay_ms.unwrap_or(defaults.delay_ms);
+    let base_timeout = request.timeout_ms.unwrap_or(defaults.timeout_ms);
+    let base_rate_pps = request.rate_limit_pps.unwrap_or(1_500);
+    let base_burst = request.burst_size.unwrap_or(24);
+
+    request.concurrency = Some(base_concurrency.min(24));
+    request.delay_ms = Some(base_delay.max(25));
+    request.timeout_ms = Some(base_timeout.max(1800));
+    request.rate_limit_pps = Some(base_rate_pps.min(750));
+    request.burst_size = Some(base_burst.min(16));
+    request.max_retries = Some(request.max_retries.unwrap_or(1).min(1));
+}
+
+fn apply_safe_mode_limits(request: &mut ScanRequest) {
+    let defaults = request.profile.defaults();
+    let base_concurrency = request.concurrency.unwrap_or(defaults.concurrency);
+    let base_delay = request.delay_ms.unwrap_or(defaults.delay_ms);
+    let base_timeout = request.timeout_ms.unwrap_or(defaults.timeout_ms);
+    let base_rate_pps = request.rate_limit_pps.unwrap_or(1_500);
+    let base_burst = request.burst_size.unwrap_or(32);
+
+    request.concurrency = Some(base_concurrency.min(32));
+    request.delay_ms = Some(base_delay.max(15));
+    request.timeout_ms = Some(base_timeout.max(1600));
+    request.rate_limit_pps = Some(base_rate_pps.min(1_200));
+    request.burst_size = Some(base_burst.min(24));
+    request.max_retries = Some(request.max_retries.unwrap_or(2).max(2));
+}
+
+fn apply_defensive_port_policy(
+    request: &ScanRequest,
+    has_public_targets: bool,
+    selected_ports: &mut Vec<u16>,
+    warnings: &mut Vec<String>,
+) -> NProbeResult<()> {
+    if request.strict_safety || has_public_targets {
+        let protected_ports = selected_ports
+            .iter()
+            .copied()
+            .filter(|port| UNIVERSAL_PROTECTED_PORTS.contains(port))
+            .collect::<Vec<_>>();
+        if !protected_ports.is_empty() {
+            selected_ports.retain(|port| !UNIVERSAL_PROTECTED_PORTS.contains(port));
+            warnings.push(format!(
+                "defensive guard skipped protected ports {:?} to avoid device side effects",
+                protected_ports
+            ));
+        }
+    }
+
+    let max_ports = if has_public_targets {
+        MAX_PUBLIC_PORTS
+    } else if request.strict_safety {
+        MAX_DEFENSIVE_PORTS
+    } else {
+        usize::MAX
+    };
+    if selected_ports.len() > max_ports {
+        let previous = selected_ports.len();
+        selected_ports.truncate(max_ports);
+        warnings.push(format!(
+            "defensive guard reduced active port scope from {} to {} ports",
+            previous, max_ports
+        ));
+    }
+
+    if selected_ports.is_empty() {
+        return Err(NProbeError::Safety(
+            "defensive guard left zero safe ports to scan; narrow your selection or disable protected ports from the request"
+                .to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 fn apply_root_only_limits(request: &mut ScanRequest) {

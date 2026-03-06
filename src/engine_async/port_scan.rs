@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::engine_async::scanner::{self, AsyncScanConfig};
-use crate::engine_intel::device_profile::classify_mac;
+use crate::engine_intel::device_profile::{classify_mac, DeviceClass};
 use crate::engine_intel::strategy::ScanStrategy;
 use crate::engine_packet::arp as packet_arp;
 use crate::error::NProbeResult;
@@ -32,6 +32,7 @@ pub async fn run(
     let mut service_detection = request.service_detection;
     let base_rate_pps = request.rate_limit_pps.unwrap_or(strategy.rate_limit_pps);
     let mut rate_limit_pps = base_rate_pps;
+    let mut profile_class = None::<DeviceClass>;
 
     if let IpAddr::V4(target_v4) = target {
         if packet_arp::is_lan_ipv4(target_v4) {
@@ -45,6 +46,7 @@ pub async fn run(
                     observed_mac = Some(mac.clone());
                     device_class = Some(profile.class.to_string());
                     device_vendor = profile.vendor.map(str::to_string);
+                    profile_class = Some(profile.class);
                     warnings.push(format!(
                         "device-profile active: mac={} {}",
                         mac,
@@ -81,13 +83,13 @@ pub async fn run(
                         }
                     }
 
-                    if profile.is_fragile() && service_detection {
+                    if !profile.allows_active_fingerprinting() && service_detection {
                         service_detection = false;
                         warnings.push(
-                            "fragile-mode active: banner/service detection downgraded to passive probes"
+                            "defensive guard kept service detection passive because the target has not demonstrated enterprise-grade resilience"
                                 .to_string(),
                         );
-                        safety_actions.push("fragile-mode:passive-probes".to_string());
+                        safety_actions.push("defensive-probing:passive-stage1".to_string());
                     }
 
                     if !profile.safety_blacklist.is_empty() {
@@ -121,6 +123,34 @@ pub async fn run(
                     "device-profile skipped: background lookup failed: {err}"
                 )),
             }
+        }
+    }
+
+    if request.strict_safety && !matches!(profile_class, Some(DeviceClass::Enterprise)) {
+        if runtime.concurrency > 8 {
+            let previous = runtime.concurrency;
+            runtime.concurrency = 8;
+            warnings.push(format!(
+                "strict-safety unknown-device cap applied: reduced concurrency from {} to {}",
+                previous, runtime.concurrency
+            ));
+            safety_actions.push(format!("concurrency-capped:{}->{}", previous, runtime.concurrency));
+        }
+        if rate_limit_pps > 250 {
+            warnings.push(format!(
+                "strict-safety unknown-device cap applied: rate reduced from {}pps to 250pps",
+                rate_limit_pps
+            ));
+            safety_actions.push(format!("rate-capped:{}->250pps", rate_limit_pps));
+            rate_limit_pps = 250;
+        }
+        if service_detection {
+            service_detection = false;
+            warnings.push(
+                "strict-safety active: deeper probes suppressed until the host is explicitly classified as resilient"
+                    .to_string(),
+            );
+            safety_actions.push("strict-safety:passive-only".to_string());
         }
     }
 

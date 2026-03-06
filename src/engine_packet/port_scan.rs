@@ -129,6 +129,20 @@ pub async fn run(
         }
     }
 
+    if !matches!(
+        device_profile.map(|profile| profile.class),
+        Some(DeviceClass::Enterprise)
+    ) {
+        if rate_pps > 500 {
+            warnings.push(format!(
+                "defensive guard applied conservative raw rate cap: {}pps -> 500pps",
+                rate_pps
+            ));
+            safety_actions.push(format!("rate-capped:{}->500pps", rate_pps));
+            rate_pps = 500;
+        }
+    }
+
     let safety_blacklist = device_profile
         .map(|profile| profile.safety_blacklist.to_vec())
         .unwrap_or_default();
@@ -287,7 +301,12 @@ pub async fn run(
 
     // Stage 2/3: async intelligence pipeline for open TCP ports only.
     let mut stage2_report = MultiStageProbeReport::default();
-    if request.service_detection {
+    if request.service_detection
+        && matches!(
+            device_profile.map(|profile| profile.allows_active_fingerprinting()),
+            Some(true)
+        )
+    {
         let stage2_concurrency = match device_profile.map(|profile| profile.class) {
             Some(DeviceClass::FragileEmbedded) => request.runtime_settings().concurrency.min(4),
             Some(DeviceClass::PrinterSensitive) => request.runtime_settings().concurrency.min(8),
@@ -317,6 +336,12 @@ pub async fn run(
                 stage2_concurrency
             ));
         }
+    } else if request.service_detection {
+        stage2_report.notes.push(
+            "stage2-intelligence skipped: defensive guard requires an enterprise-resilient device profile before deeper active fingerprinting"
+                .to_string(),
+        );
+        safety_actions.push("defensive-probing:passive-stage1".to_string());
     } else {
         stage2_report
             .notes

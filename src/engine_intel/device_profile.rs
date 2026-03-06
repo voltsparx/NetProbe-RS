@@ -52,13 +52,17 @@ impl DeviceProfile {
         match self.class {
             DeviceClass::FragileEmbedded => Some(4),
             DeviceClass::PrinterSensitive => Some(8),
-            DeviceClass::Enterprise => Some(256),
-            DeviceClass::Generic => None,
+            DeviceClass::Enterprise => Some(128),
+            DeviceClass::Generic => Some(16),
         }
+    }
+
+    pub fn allows_active_fingerprinting(self) -> bool {
+        matches!(self.class, DeviceClass::Enterprise)
     }
 }
 
-const PRINTER_BLACKLIST: &[u16] = &[9100];
+const UNIVERSAL_SAFETY_BLACKLIST: &[u16] = &[9100];
 
 const ESPRESSIF_OUIS: &[[u8; 3]] = &[
     [0x24, 0x0a, 0xc4],
@@ -122,8 +126,8 @@ fn classify_oui(oui: [u8; 3]) -> DeviceProfile {
         return DeviceProfile {
             class: DeviceClass::FragileEmbedded,
             vendor: Some("embedded-iot"),
-            max_pps: Some(50),
-            safety_blacklist: PRINTER_BLACKLIST,
+            max_pps: Some(25),
+            safety_blacklist: UNIVERSAL_SAFETY_BLACKLIST,
         };
     }
 
@@ -131,8 +135,8 @@ fn classify_oui(oui: [u8; 3]) -> DeviceProfile {
         return DeviceProfile {
             class: DeviceClass::PrinterSensitive,
             vendor: Some("printer-family"),
-            max_pps: Some(200),
-            safety_blacklist: PRINTER_BLACKLIST,
+            max_pps: Some(100),
+            safety_blacklist: UNIVERSAL_SAFETY_BLACKLIST,
         };
     }
 
@@ -140,8 +144,8 @@ fn classify_oui(oui: [u8; 3]) -> DeviceProfile {
         return DeviceProfile {
             class: DeviceClass::Enterprise,
             vendor: Some("cisco"),
-            max_pps: Some(10_000),
-            safety_blacklist: &[],
+            max_pps: Some(5_000),
+            safety_blacklist: UNIVERSAL_SAFETY_BLACKLIST,
         };
     }
 
@@ -149,16 +153,16 @@ fn classify_oui(oui: [u8; 3]) -> DeviceProfile {
         return DeviceProfile {
             class: DeviceClass::Enterprise,
             vendor: Some("dell"),
-            max_pps: Some(10_000),
-            safety_blacklist: &[],
+            max_pps: Some(5_000),
+            safety_blacklist: UNIVERSAL_SAFETY_BLACKLIST,
         };
     }
 
     DeviceProfile {
         class: DeviceClass::Generic,
         vendor: Some("unknown"),
-        max_pps: None,
-        safety_blacklist: &[],
+        max_pps: Some(500),
+        safety_blacklist: UNIVERSAL_SAFETY_BLACKLIST,
     }
 }
 
