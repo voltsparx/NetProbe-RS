@@ -103,6 +103,7 @@ async fn run() -> NProbeResult<()> {
             newer_session_id,
             ip_filter,
             target_filter,
+            severity_filter,
             report_format,
             output_path,
         }) => {
@@ -111,6 +112,7 @@ async fn run() -> NProbeResult<()> {
                 &newer_session_id,
                 ip_filter.as_deref(),
                 target_filter.as_deref(),
+                severity_filter,
             )?;
             let body = match report_format {
                 crate::models::ReportFormat::Txt | crate::models::ReportFormat::Cli => {

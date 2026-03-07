@@ -111,6 +111,7 @@ pub struct SessionActionableDiff {
     pub newer: ScanSessionRecord,
     pub ip_filter: Option<String>,
     pub target_filter: Option<String>,
+    pub severity_filter: Option<ActionableSeverity>,
     pub added: Vec<ActionableDiffItem>,
     pub resolved: Vec<ActionableDiffItem>,
     pub escalated: Vec<ActionableDiffItem>,
@@ -381,6 +382,7 @@ pub fn diff_session_actionables(
     newer_session_id: &str,
     ip_filter: Option<&str>,
     target_filter: Option<&str>,
+    severity_filter: Option<ActionableSeverity>,
 ) -> NProbeResult<SessionActionableDiff> {
     let older = load_scan_session(older_session_id)?
         .ok_or_else(|| NProbeError::Cli(format!("session '{older_session_id}' was not found")))?;
@@ -399,11 +401,13 @@ pub fn diff_session_actionables(
         sql_persistence::load_actionable_snapshots(&db_path, older_session_id)?,
         ip_filter,
         target_filter,
+        severity_filter,
     );
     let newer_records = filter_actionable_records(
         sql_persistence::load_actionable_snapshots(&db_path, newer_session_id)?,
         ip_filter,
         target_filter,
+        severity_filter,
     );
 
     let older_map = older_records
@@ -452,6 +456,7 @@ pub fn diff_session_actionables(
         newer,
         ip_filter: ip_filter.map(str::to_string),
         target_filter: target_filter.map(str::to_string),
+        severity_filter,
         added,
         resolved,
         escalated,
@@ -655,6 +660,7 @@ fn filter_actionable_records(
     records: Vec<sql_persistence::ActionableSnapshotRecord>,
     ip_filter: Option<&str>,
     target_filter: Option<&str>,
+    severity_filter: Option<ActionableSeverity>,
 ) -> Vec<sql_persistence::ActionableSnapshotRecord> {
     let ip_filter = ip_filter
         .map(str::trim)
@@ -676,7 +682,10 @@ fn filter_actionable_records(
                 .as_deref()
                 .map(|needle| record.target.to_ascii_lowercase().contains(needle))
                 .unwrap_or(true);
-            ip_ok && target_ok
+            let severity_ok = severity_filter
+                .map(|minimum| record.severity.rank() >= minimum.rank())
+                .unwrap_or(true);
+            ip_ok && target_ok && severity_ok
         })
         .collect()
 }

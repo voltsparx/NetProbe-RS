@@ -3,7 +3,7 @@
 //   read input -> process safely -> return deterministic output
 // the CLI is a polite bouncer: clear args only.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::io::{self, IsTerminal, Write};
 use std::net::Ipv4Addr;
@@ -24,6 +24,25 @@ enum FileType {
     Json,
     Html,
     Csv,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SeverityFilter {
+    Review,
+    Moderate,
+    High,
+    Critical,
+}
+
+impl SeverityFilter {
+    fn as_actionable_severity(self) -> crate::reporter::actionable::ActionableSeverity {
+        match self {
+            SeverityFilter::Review => crate::reporter::actionable::ActionableSeverity::Review,
+            SeverityFilter::Moderate => crate::reporter::actionable::ActionableSeverity::Moderate,
+            SeverityFilter::High => crate::reporter::actionable::ActionableSeverity::High,
+            SeverityFilter::Critical => crate::reporter::actionable::ActionableSeverity::Critical,
+        }
+    }
 }
 
 impl FileType {
@@ -80,6 +99,7 @@ pub enum SessionCommand {
         newer_session_id: String,
         ip_filter: Option<String>,
         target_filter: Option<String>,
+        severity_filter: Option<crate::reporter::actionable::ActionableSeverity>,
         report_format: ReportFormat,
         output_path: Option<PathBuf>,
     },
@@ -365,6 +385,13 @@ struct SessionArgs {
     target_filter: Option<String>,
 
     #[arg(
+        long = "severity",
+        value_enum,
+        help = "Minimum severity to include in session diff: review, moderate, high, critical"
+    )]
+    severity_filter: Option<SeverityFilter>,
+
+    #[arg(
         short = 'f',
         long = "file-type",
         value_enum,
@@ -507,7 +534,7 @@ pub fn maybe_render_quick_help_mode() -> Option<String> {
     }
 
     Some(
-        "Usage:\n  nprobe-rs <target> [options]\n  nprobe-rs interactive\n  nprobe-rs integrity [--reseal]\n  nprobe-rs sessions [--limit N]\n  nprobe-rs sessions --show <session-id>\n  nprobe-rs sessions --diff <older-session-id> <newer-session-id>\n\nCommon options:\n  -p, --ports <list|range>   Select ports (example: -p 22,80,443)\n      --all-ports            Scan ports 1-65535 (Nmap: -p-)\n  -U, --udp                  Enable UDP probes (Nmap: -sU)\n  -S, --syn                  Enable privileged TCP probes (Nmap: -sS)\n      --connect              Force user-space TCP connect scanning (Nmap: -sT)\n      --arp                  Enable ARP neighbor discovery (local IPv4)\n  -A, --aggressive           Aggressive mode (Nmap: -A)\n  -w, --timeout-ms <ms>      Probe timeout in milliseconds\n      --rate-pps <num>       Dispatch rate target in packets per second\n      --burst-size <num>     Token-bucket burst limit\n      --max-retries <num>    Adaptive retries per probe (0..20)\n      --total-shards <num>   Total shard count for distributed scans\n      --shard-index <num>    Current shard index (requires total-shards)\n      --scan-seed <num>      Deterministic port shuffle seed\n      --resume               Resume from shard checkpoint\n      --fresh-scan           Ignore/reset shard checkpoint for this run\n  -r, --reverse-dns          Enable reverse DNS lookups\n  -n, --no-dns               Disable reverse DNS lookups\n  -e, --explain              Add concise per-port rationale in output\n  -v, --verbose              Show full output sections\n  -f, --file-type <type>     Export format: txt|json|html|csv\n  -o, --output <name>        Output filename\n  -L, --location <dir>       Output directory\n\nLearner mode:\n  nprobe-rs interactive      Guided prompt mode with banner and safe defaults\n  nprobe-rs learn            Alias for interactive mode\n\nIntegrity:\n  nprobe-rs integrity\n  nprobe-rs integrity --reseal\n\nSession history:\n  nprobe-rs sessions --limit 20\n  nprobe-rs sessions --show <session-id>\n  nprobe-rs sessions --diff <older-session-id> <newer-session-id>\n\nNmap-style shortcuts accepted:\n  -sU  -sS  -sT  -sV  -Pn  -A  -T0..-T5  -p-\n\nFlag docs mode:\n  nprobe-rs --flag-help --scan\n  nprobe-rs --flag-help -sU\n  nprobe-rs --explain --scan   (legacy alias)\n\nCompatibility:\n  nprobe-rs scan <target> [options] still works.".to_string(),
+        "Usage:\n  nprobe-rs <target> [options]\n  nprobe-rs interactive\n  nprobe-rs integrity [--reseal]\n  nprobe-rs sessions [--limit N]\n  nprobe-rs sessions --show <session-id>\n  nprobe-rs sessions --diff <older-session-id> <newer-session-id>\n\nCommon options:\n  -p, --ports <list|range>   Select ports (example: -p 22,80,443)\n      --all-ports            Scan ports 1-65535 (Nmap: -p-)\n  -U, --udp                  Enable UDP probes (Nmap: -sU)\n  -S, --syn                  Enable privileged TCP probes (Nmap: -sS)\n      --connect              Force user-space TCP connect scanning (Nmap: -sT)\n      --arp                  Enable ARP neighbor discovery (local IPv4)\n  -A, --aggressive           Aggressive mode (Nmap: -A)\n  -w, --timeout-ms <ms>      Probe timeout in milliseconds\n      --rate-pps <num>       Dispatch rate target in packets per second\n      --burst-size <num>     Token-bucket burst limit\n      --max-retries <num>    Adaptive retries per probe (0..20)\n      --total-shards <num>   Total shard count for distributed scans\n      --shard-index <num>    Current shard index (requires total-shards)\n      --scan-seed <num>      Deterministic port shuffle seed\n      --resume               Resume from shard checkpoint\n      --fresh-scan           Ignore/reset shard checkpoint for this run\n  -r, --reverse-dns          Enable reverse DNS lookups\n  -n, --no-dns               Disable reverse DNS lookups\n  -e, --explain              Add concise per-port rationale in output\n  -v, --verbose              Show full output sections\n  -f, --file-type <type>     Export format: txt|json|html|csv\n  -o, --output <name>        Output filename\n  -L, --location <dir>       Output directory\n\nLearner mode:\n  nprobe-rs interactive      Guided prompt mode with banner and safe defaults\n  nprobe-rs learn            Alias for interactive mode\n\nIntegrity:\n  nprobe-rs integrity\n  nprobe-rs integrity --reseal\n\nSession history:\n  nprobe-rs sessions --limit 20\n  nprobe-rs sessions --show <session-id>\n  nprobe-rs sessions --diff <older-session-id> <newer-session-id>\n      Optional diff filters: --ip <addr> --target-contains <text> --severity <level>\n      Optional diff export:  -f txt|json|html -o <name> -L <dir>\n\nNmap-style shortcuts accepted:\n  -sU  -sS  -sT  -sV  -Pn  -A  -T0..-T5  -p-\n\nFlag docs mode:\n  nprobe-rs --flag-help --scan\n  nprobe-rs --flag-help -sU\n  nprobe-rs --explain --scan   (legacy alias)\n\nCompatibility:\n  nprobe-rs scan <target> [options] still works.".to_string(),
     )
 }
 
@@ -558,6 +585,9 @@ impl SessionArgs {
                 newer_session_id: newer.to_string(),
                 ip_filter: self.ip_filter.filter(|value| !value.trim().is_empty()),
                 target_filter: self.target_filter.filter(|value| !value.trim().is_empty()),
+                severity_filter: self
+                    .severity_filter
+                    .map(SeverityFilter::as_actionable_severity),
                 report_format,
                 output_path,
             }));
@@ -565,6 +595,7 @@ impl SessionArgs {
 
         if self.ip_filter.is_some()
             || self.target_filter.is_some()
+            || self.severity_filter.is_some()
             || self.file_type.is_some()
             || self.output.is_some()
             || self.location.is_some()
@@ -1335,6 +1366,9 @@ pub fn render_session_diff(diff: &SessionActionableDiff) -> String {
     if let Some(target_filter) = &diff.target_filter {
         out.push_str(&format!("target_filter={target_filter}\n"));
     }
+    if let Some(severity_filter) = diff.severity_filter {
+        out.push_str(&format!("severity_filter={}\n", severity_filter.as_str()));
+    }
 
     append_diff_section(&mut out, "New issues", &diff.added);
     append_diff_section(&mut out, "Resolved issues", &diff.resolved);
@@ -1362,6 +1396,8 @@ pub fn render_session_diff_html(diff: &SessionActionableDiff) -> String {
         .meta{color:var(--muted);font-size:14px;line-height:1.6}
         h1,h2,h3{margin:0 0 10px 0}
         ul{margin:8px 0 0 18px}
+        details{margin-top:10px;border-top:1px solid #eef2f7;padding-top:10px}
+        summary{cursor:pointer;font-weight:700;list-style:none}
         .sev{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;margin-right:8px}
         .sev-critical{background:#f7dfdf;color:var(--critical)}
         .sev-high{background:#f8e7d7;color:var(--high)}
@@ -1394,6 +1430,12 @@ pub fn render_session_diff_html(diff: &SessionActionableDiff) -> String {
         html.push_str(&format!(
             "<div class=\"meta\">Target filter: <code>{}</code></div>",
             escape_html(target_filter)
+        ));
+    }
+    if let Some(severity_filter) = diff.severity_filter {
+        html.push_str(&format!(
+            "<div class=\"meta\">Minimum severity: <code>{}</code></div>",
+            escape_html(severity_filter.as_str())
         ));
     }
     html.push_str("</div>");
@@ -1449,35 +1491,68 @@ fn append_diff_section_html(html: &mut String, title: &str, items: &[ActionableD
         return;
     }
 
-    html.push_str(&format!("<div class=\"card\"><h2>{}</h2><ul>", title));
+    let mut groups: BTreeMap<(String, String), Vec<&ActionableDiffItem>> = BTreeMap::new();
     for item in items {
-        let severity = item
-            .severity_after
-            .or(item.severity_before)
-            .map(|value| value.as_str())
-            .unwrap_or("review");
-        html.push_str(&format!(
-            "<li><span class=\"sev sev-{}\">{}</span>{} ({}) {}",
-            escape_html(severity),
-            escape_html(severity),
-            escape_html(&item.ip),
-            escape_html(&item.target),
-            escape_html(&item.issue)
-        ));
-        if let Some(after) = item.action_after.as_deref() {
-            html.push_str(&format!(
-                "<br><span class=\"meta\">Next: {}</span>",
-                escape_html(after)
-            ));
-        } else if let Some(before) = item.action_before.as_deref() {
-            html.push_str(&format!(
-                "<br><span class=\"meta\">Previous: {}</span>",
-                escape_html(before)
-            ));
-        }
-        html.push_str("</li>");
+        groups
+            .entry((item.ip.clone(), item.target.clone()))
+            .or_default()
+            .push(item);
     }
-    html.push_str("</ul></div>");
+
+    html.push_str(&format!("<div class=\"card\"><h2>{}</h2>", title));
+    for ((ip, target), host_items) in groups {
+        let highest = host_items
+            .iter()
+            .filter_map(|item| item.severity_after.or(item.severity_before))
+            .max_by_key(|severity| severity.rank());
+        let highest = highest.unwrap_or(crate::reporter::actionable::ActionableSeverity::Review);
+        let open_attr = if host_items.iter().any(|item| {
+            matches!(
+                item.severity_after.or(item.severity_before),
+                Some(crate::reporter::actionable::ActionableSeverity::Critical)
+            )
+        }) {
+            " open"
+        } else {
+            ""
+        };
+
+        html.push_str(&format!(
+            "<details{}><summary><span class=\"sev sev-{}\">{}</span>{} ({}) - {} item(s)</summary><ul>",
+            open_attr,
+            escape_html(highest.as_str()),
+            escape_html(highest.as_str()),
+            escape_html(&ip),
+            escape_html(&target),
+            host_items.len()
+        ));
+
+        for item in host_items {
+            let severity_label = diff_item_severity_label(item);
+            let severity_css = diff_item_css_severity(item);
+            html.push_str(&format!(
+                "<li><span class=\"sev sev-{}\">{}</span>{}",
+                escape_html(severity_css),
+                escape_html(&severity_label),
+                escape_html(&item.issue)
+            ));
+            if let Some(after) = item.action_after.as_deref() {
+                html.push_str(&format!(
+                    "<br><span class=\"meta\">Next: {}</span>",
+                    escape_html(after)
+                ));
+            } else if let Some(before) = item.action_before.as_deref() {
+                html.push_str(&format!(
+                    "<br><span class=\"meta\">Previous: {}</span>",
+                    escape_html(before)
+                ));
+            }
+            html.push_str("</li>");
+        }
+
+        html.push_str("</ul></details>");
+    }
+    html.push_str("</div>");
 }
 
 fn escape_html(input: &str) -> String {
@@ -1493,6 +1568,24 @@ fn escape_html(input: &str) -> String {
         }
     }
     out
+}
+
+fn diff_item_severity_label(item: &ActionableDiffItem) -> String {
+    match (item.severity_before, item.severity_after) {
+        (Some(before), Some(after)) if before != after => {
+            format!("{}->{}", before.as_str(), after.as_str())
+        }
+        (_, Some(after)) => after.as_str().to_string(),
+        (Some(before), None) => before.as_str().to_string(),
+        (None, None) => "review".to_string(),
+    }
+}
+
+fn diff_item_css_severity(item: &ActionableDiffItem) -> &'static str {
+    item.severity_after
+        .or(item.severity_before)
+        .unwrap_or(crate::reporter::actionable::ActionableSeverity::Review)
+        .as_str()
 }
 
 fn map_timing_to_profile(level: &str) -> Option<&'static str> {
@@ -1594,6 +1687,7 @@ mod tests {
         should_inject_scan, Cli, CliAction, SessionCommand,
     };
     use crate::platform::self_integrity::IntegrityStatus;
+    use crate::reporter::actionable::ActionableSeverity;
     use clap::Parser;
     use std::ffi::OsString;
 
@@ -1650,16 +1744,20 @@ mod tests {
             "--diff",
             "older-session",
             "newer-session",
+            "--severity",
+            "high",
         ]);
         let action = cli.into_action().expect("cli action should parse");
         match action {
             CliAction::Sessions(SessionCommand::Diff {
                 older_session_id,
                 newer_session_id,
+                severity_filter,
                 ..
             }) => {
                 assert_eq!(older_session_id, "older-session");
                 assert_eq!(newer_session_id, "newer-session");
+                assert_eq!(severity_filter, Some(ActionableSeverity::High));
             }
             other => panic!("unexpected action: {other:?}"),
         }
