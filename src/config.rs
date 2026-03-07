@@ -94,7 +94,7 @@ pub struct ScanSessionRecord {
     pub notes: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ActionableDiffItem {
     pub ip: String,
     pub target: String,
@@ -105,10 +105,12 @@ pub struct ActionableDiffItem {
     pub action_after: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SessionActionableDiff {
     pub older: ScanSessionRecord,
     pub newer: ScanSessionRecord,
+    pub ip_filter: Option<String>,
+    pub target_filter: Option<String>,
     pub added: Vec<ActionableDiffItem>,
     pub resolved: Vec<ActionableDiffItem>,
     pub escalated: Vec<ActionableDiffItem>,
@@ -377,6 +379,8 @@ pub fn load_scan_session(session_id: &str) -> NProbeResult<Option<ScanSessionRec
 pub fn diff_session_actionables(
     older_session_id: &str,
     newer_session_id: &str,
+    ip_filter: Option<&str>,
+    target_filter: Option<&str>,
 ) -> NProbeResult<SessionActionableDiff> {
     let older = load_scan_session(older_session_id)?
         .ok_or_else(|| NProbeError::Cli(format!("session '{older_session_id}' was not found")))?;
@@ -391,8 +395,16 @@ pub fn diff_session_actionables(
         ));
     }
 
-    let older_records = sql_persistence::load_actionable_snapshots(&db_path, older_session_id)?;
-    let newer_records = sql_persistence::load_actionable_snapshots(&db_path, newer_session_id)?;
+    let older_records = filter_actionable_records(
+        sql_persistence::load_actionable_snapshots(&db_path, older_session_id)?,
+        ip_filter,
+        target_filter,
+    );
+    let newer_records = filter_actionable_records(
+        sql_persistence::load_actionable_snapshots(&db_path, newer_session_id)?,
+        ip_filter,
+        target_filter,
+    );
 
     let older_map = older_records
         .into_iter()
@@ -438,6 +450,8 @@ pub fn diff_session_actionables(
     Ok(SessionActionableDiff {
         older,
         newer,
+        ip_filter: ip_filter.map(str::to_string),
+        target_filter: target_filter.map(str::to_string),
         added,
         resolved,
         escalated,
@@ -635,6 +649,36 @@ fn sort_diff_items(items: &mut [ActionableDiffItem]) {
             .then_with(|| left.ip.cmp(&right.ip))
             .then_with(|| left.issue.cmp(&right.issue))
     });
+}
+
+fn filter_actionable_records(
+    records: Vec<sql_persistence::ActionableSnapshotRecord>,
+    ip_filter: Option<&str>,
+    target_filter: Option<&str>,
+) -> Vec<sql_persistence::ActionableSnapshotRecord> {
+    let ip_filter = ip_filter
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let target_filter = target_filter
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase());
+
+    records
+        .into_iter()
+        .filter(|record| {
+            let ip_ok = ip_filter
+                .as_deref()
+                .map(|expected| record.ip == expected)
+                .unwrap_or(true);
+            let target_ok = target_filter
+                .as_deref()
+                .map(|needle| record.target.to_ascii_lowercase().contains(needle))
+                .unwrap_or(true);
+            ip_ok && target_ok
+        })
+        .collect()
 }
 
 fn update_runtime_values(kv: &mut BTreeMap<String, String>, request: &ScanRequest) {

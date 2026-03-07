@@ -101,9 +101,26 @@ async fn run() -> NProbeResult<()> {
         CliAction::Sessions(SessionCommand::Diff {
             older_session_id,
             newer_session_id,
+            ip_filter,
+            target_filter,
+            report_format,
+            output_path,
         }) => {
-            let diff = config::diff_session_actionables(&older_session_id, &newer_session_id)?;
-            println!("{}", cli::render_session_diff(&diff));
+            let diff = config::diff_session_actionables(
+                &older_session_id,
+                &newer_session_id,
+                ip_filter.as_deref(),
+                target_filter.as_deref(),
+            )?;
+            let body = match report_format {
+                crate::models::ReportFormat::Txt | crate::models::ReportFormat::Cli => {
+                    cli::render_session_diff(&diff)
+                }
+                crate::models::ReportFormat::Json => cli::render_session_diff_json(&diff)?,
+                crate::models::ReportFormat::Html => cli::render_session_diff_html(&diff),
+                crate::models::ReportFormat::Csv => unreachable!("session diff csv blocked in CLI"),
+            };
+            output::emit(&body, report_format, output_path.as_deref()).await?;
             Ok(())
         }
         CliAction::Scan(mut request) => {

@@ -78,6 +78,10 @@ pub enum SessionCommand {
     Diff {
         older_session_id: String,
         newer_session_id: String,
+        ip_filter: Option<String>,
+        target_filter: Option<String>,
+        report_format: ReportFormat,
+        output_path: Option<PathBuf>,
     },
 }
 
@@ -350,6 +354,33 @@ struct SessionArgs {
         help = "Compare actionable findings between two sessions"
     )]
     diff: Option<Vec<String>>,
+
+    #[arg(long = "ip", help = "Filter session diff to one IP")]
+    ip_filter: Option<String>,
+
+    #[arg(
+        long = "target-contains",
+        help = "Filter session diff to targets containing this text"
+    )]
+    target_filter: Option<String>,
+
+    #[arg(
+        short = 'f',
+        long = "file-type",
+        value_enum,
+        help = "Session diff export format: txt, json, html"
+    )]
+    file_type: Option<FileType>,
+
+    #[arg(short = 'o', long = "output", help = "Session diff output file name")]
+    output: Option<String>,
+
+    #[arg(
+        short = 'L',
+        long = "location",
+        help = "Directory for session diff export"
+    )]
+    location: Option<PathBuf>,
 }
 
 #[derive(Debug, Args, Default)]
@@ -501,10 +532,46 @@ impl SessionArgs {
                     "--diff requires two non-empty session ids".to_string(),
                 ));
             }
+
+            let report_format = match self.file_type.unwrap_or(FileType::Txt) {
+                FileType::Txt => ReportFormat::Txt,
+                FileType::Json => ReportFormat::Json,
+                FileType::Html => ReportFormat::Html,
+                FileType::Csv => {
+                    return Err(NProbeError::Cli(
+                        "session diff export does not support csv; use txt, json, or html"
+                            .to_string(),
+                    ));
+                }
+            };
+            let output_requested = self.output.is_some() || self.location.is_some();
+            let output_path = build_output_path(
+                self.output.as_deref(),
+                self.location.as_deref(),
+                report_format,
+                output_requested,
+                true,
+            )?;
+
             return Ok(CliAction::Sessions(SessionCommand::Diff {
                 older_session_id: older.to_string(),
                 newer_session_id: newer.to_string(),
+                ip_filter: self.ip_filter.filter(|value| !value.trim().is_empty()),
+                target_filter: self.target_filter.filter(|value| !value.trim().is_empty()),
+                report_format,
+                output_path,
             }));
+        }
+
+        if self.ip_filter.is_some()
+            || self.target_filter.is_some()
+            || self.file_type.is_some()
+            || self.output.is_some()
+            || self.location.is_some()
+        {
+            return Err(NProbeError::Cli(
+                "session diff filters and export flags require --diff".to_string(),
+            ));
         }
 
         if let Some(session_id) = self.session_id {
@@ -1262,6 +1329,12 @@ pub fn render_session_diff(diff: &SessionActionableDiff) -> String {
         diff.reduced.len(),
         diff.unchanged
     ));
+    if let Some(ip_filter) = &diff.ip_filter {
+        out.push_str(&format!("ip_filter={ip_filter}\n"));
+    }
+    if let Some(target_filter) = &diff.target_filter {
+        out.push_str(&format!("target_filter={target_filter}\n"));
+    }
 
     append_diff_section(&mut out, "New issues", &diff.added);
     append_diff_section(&mut out, "Resolved issues", &diff.resolved);
@@ -1269,6 +1342,69 @@ pub fn render_session_diff(diff: &SessionActionableDiff) -> String {
     append_diff_section(&mut out, "Reduced issues", &diff.reduced);
 
     out
+}
+
+pub fn render_session_diff_json(diff: &SessionActionableDiff) -> NProbeResult<String> {
+    Ok(serde_json::to_string_pretty(diff)?)
+}
+
+pub fn render_session_diff_html(diff: &SessionActionableDiff) -> String {
+    let mut html = String::new();
+    html.push_str("<!doctype html><html><head><meta charset=\"utf-8\">");
+    html.push_str("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">");
+    html.push_str("<title>NProbe-RS Session Diff</title>");
+    html.push_str("<style>");
+    html.push_str(
+        ":root{--bg:#f5f7fb;--panel:#ffffff;--ink:#182332;--muted:#66758a;--critical:#8f2d2d;--high:#a3581a;--moderate:#735f13;--review:#3f648f;}
+        body{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:linear-gradient(120deg,#f5f7fb,#eaf0f7);color:var(--ink);margin:0;padding:24px;}
+        .wrap{max-width:1100px;margin:0 auto;}
+        .card{background:var(--panel);border:1px solid #e5ebf2;border-radius:14px;padding:18px;margin-bottom:18px;box-shadow:0 6px 20px rgba(10,20,40,.06);}
+        .meta{color:var(--muted);font-size:14px;line-height:1.6}
+        h1,h2,h3{margin:0 0 10px 0}
+        ul{margin:8px 0 0 18px}
+        .sev{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;margin-right:8px}
+        .sev-critical{background:#f7dfdf;color:var(--critical)}
+        .sev-high{background:#f8e7d7;color:var(--high)}
+        .sev-moderate{background:#f5edcf;color:var(--moderate)}
+        .sev-review{background:#dde8f7;color:var(--review)}
+        code{background:#eef3f8;padding:1px 5px;border-radius:6px}
+        </style></head><body><div class=\"wrap\">",
+    );
+    html.push_str("<div class=\"card\">");
+    html.push_str("<h1>NProbe-RS Actionable Session Diff</h1>");
+    html.push_str(&format!(
+        "<div class=\"meta\">Older session: <code>{}</code><br>Newer session: <code>{}</code><br>Older target: {}<br>Newer target: {}<br>Summary: added {} | resolved {} | escalated {} | reduced {} | unchanged {}</div>",
+        escape_html(&diff.older.session_id),
+        escape_html(&diff.newer.session_id),
+        escape_html(&diff.older.target),
+        escape_html(&diff.newer.target),
+        diff.added.len(),
+        diff.resolved.len(),
+        diff.escalated.len(),
+        diff.reduced.len(),
+        diff.unchanged
+    ));
+    if let Some(ip_filter) = &diff.ip_filter {
+        html.push_str(&format!(
+            "<div class=\"meta\">IP filter: <code>{}</code></div>",
+            escape_html(ip_filter)
+        ));
+    }
+    if let Some(target_filter) = &diff.target_filter {
+        html.push_str(&format!(
+            "<div class=\"meta\">Target filter: <code>{}</code></div>",
+            escape_html(target_filter)
+        ));
+    }
+    html.push_str("</div>");
+
+    append_diff_section_html(&mut html, "New issues", &diff.added);
+    append_diff_section_html(&mut html, "Resolved issues", &diff.resolved);
+    append_diff_section_html(&mut html, "Escalated issues", &diff.escalated);
+    append_diff_section_html(&mut html, "Reduced issues", &diff.reduced);
+
+    html.push_str("</div></body></html>");
+    html
 }
 
 fn truncate_cell(value: &str, width: usize) -> String {
@@ -1306,6 +1442,57 @@ fn append_diff_section(out: &mut String, title: &str, items: &[ActionableDiffIte
             out.push_str(&format!("  previous={before}\n"));
         }
     }
+}
+
+fn append_diff_section_html(html: &mut String, title: &str, items: &[ActionableDiffItem]) {
+    if items.is_empty() {
+        return;
+    }
+
+    html.push_str(&format!("<div class=\"card\"><h2>{}</h2><ul>", title));
+    for item in items {
+        let severity = item
+            .severity_after
+            .or(item.severity_before)
+            .map(|value| value.as_str())
+            .unwrap_or("review");
+        html.push_str(&format!(
+            "<li><span class=\"sev sev-{}\">{}</span>{} ({}) {}",
+            escape_html(severity),
+            escape_html(severity),
+            escape_html(&item.ip),
+            escape_html(&item.target),
+            escape_html(&item.issue)
+        ));
+        if let Some(after) = item.action_after.as_deref() {
+            html.push_str(&format!(
+                "<br><span class=\"meta\">Next: {}</span>",
+                escape_html(after)
+            ));
+        } else if let Some(before) = item.action_before.as_deref() {
+            html.push_str(&format!(
+                "<br><span class=\"meta\">Previous: {}</span>",
+                escape_html(before)
+            ));
+        }
+        html.push_str("</li>");
+    }
+    html.push_str("</ul></div>");
+}
+
+fn escape_html(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 fn map_timing_to_profile(level: &str) -> Option<&'static str> {
@@ -1469,6 +1656,7 @@ mod tests {
             CliAction::Sessions(SessionCommand::Diff {
                 older_session_id,
                 newer_session_id,
+                ..
             }) => {
                 assert_eq!(older_session_id, "older-session");
                 assert_eq!(newer_session_id, "newer-session");
