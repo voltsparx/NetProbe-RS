@@ -15,9 +15,10 @@ pub struct ServiceRegistry {
 
 impl ServiceRegistry {
     pub fn load() -> Self {
-        let nmap_services = Path::new("temp/nmap/nmap-services");
-        if let Ok(content) = fs::read_to_string(nmap_services) {
-            return Self::from_nmap_services(&content);
+        for nmap_services in candidate_nmap_service_paths() {
+            if let Ok(content) = fs::read_to_string(&nmap_services) {
+                return Self::from_nmap_services(&content);
+            }
         }
         Self::fallback()
     }
@@ -151,4 +152,11 @@ impl ServiceRegistry {
             ranked_tcp_ports: top_ports,
         }
     }
+}
+
+fn candidate_nmap_service_paths() -> [std::path::PathBuf; 2] {
+    [
+        Path::new("intel-source/nmap/nmap-services").to_path_buf(),
+        Path::new("temp/nmap/nmap-services").to_path_buf(),
+    ]
 }

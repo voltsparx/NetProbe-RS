@@ -21,6 +21,7 @@ OS_TAG="${NPROBE_RS_OS_TAG:-$(detect_os_tag)}"
 DEFAULT_INSTALL_DIR="${NPROBE_RS_DEFAULT_INSTALL_DIR:-${NPROBE_RS_INSTALL_DIR:-$HOME/.local/bin}}"
 INSTALL_DIR="${NPROBE_RS_INSTALL_DIR:-}"
 PATH_UPDATE_MODE="ask"
+INSTALL_DEPS="no"
 
 usage() {
   cat <<'EOF'
@@ -28,6 +29,7 @@ Usage:
   ./building-scripts/install.sh [action] [options]
 
 Actions:
+  deps               Install build dependencies for the current platform when supported
   install            Install binary to local/custom bin and optionally add PATH
   update             Rebuild and replace existing installed binary
   test               Build a test binary into build-<os>/ in repo root
@@ -38,10 +40,11 @@ Prompt mode:
 
 Compatibility aliases:
   phase1 -> test, phase2 -> install, phase3 -> update, phase4 -> uninstall
-  upgrade -> update, remove -> uninstall
+  upgrade -> update, remove -> uninstall, install-deps -> deps
 
 Options:
   --install-dir <dir>  Install/uninstall target directory
+  --install-deps       Install build dependencies before install/update/test
   --add-to-path        Add install dir to PATH without prompting
   --no-path-update     Do not add install dir to PATH
   -h, --help           Show this help
@@ -51,7 +54,7 @@ EOF
 ACTION=""
 if [ "$#" -gt 0 ]; then
   case "$1" in
-    phase1|phase2|phase3|phase4|test|install|update|uninstall|upgrade|remove)
+    phase1|phase2|phase3|phase4|test|install|update|uninstall|upgrade|remove|deps|install-deps)
       ACTION="$1"
       shift
       ;;
@@ -74,6 +77,9 @@ while [ "$#" -gt 0 ]; do
         exit 1
       fi
       INSTALL_DIR="$1"
+      ;;
+    --install-deps)
+      INSTALL_DEPS="yes"
       ;;
     --add-to-path)
       PATH_UPDATE_MODE="yes"
@@ -100,6 +106,7 @@ normalize_action() {
     phase2|install) printf '%s\n' "install" ;;
     phase3|upgrade|update) printf '%s\n' "update" ;;
     phase4|remove|uninstall) printf '%s\n' "uninstall" ;;
+    deps|install-deps) printf '%s\n' "deps" ;;
     *)
       echo "error: unknown action '$1'" >&2
       usage
@@ -115,12 +122,14 @@ choose_action_interactive() {
     printf '%s\n' "2) update"
     printf '%s\n' "3) test"
     printf '%s\n' "4) uninstall"
-    printf '%s' "Choose [1/2/3/4] (default: 1): "
+    printf '%s\n' "5) deps (prepare build dependencies)"
+    printf '%s' "Choose [1/2/3/4/5] (default: 1): "
     IFS= read -r choice || choice=""
     case "$choice" in
       2) printf '%s\n' "update" ;;
       3) printf '%s\n' "test" ;;
       4) printf '%s\n' "uninstall" ;;
+      5) printf '%s\n' "deps" ;;
       *) printf '%s\n' "install" ;;
     esac
     return
@@ -134,7 +143,57 @@ if [ -z "$ACTION" ]; then
 fi
 ACTION="$(normalize_action "$ACTION")"
 
+run_system_package_cmd() {
+  if [ "$(id -u)" -eq 0 ]; then
+    "$@"
+    return
+  fi
+
+  if command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
+    return
+  fi
+
+  "$@"
+}
+
+ensure_unix_build_deps() {
+  echo "Installing build dependencies for $OS_TAG..."
+  if command -v apt-get >/dev/null 2>&1; then
+    run_system_package_cmd apt-get update
+    run_system_package_cmd apt-get install -y build-essential pkg-config curl clang
+  elif command -v dnf >/dev/null 2>&1; then
+    run_system_package_cmd dnf install -y gcc gcc-c++ make pkgconf-pkg-config curl clang
+  elif command -v yum >/dev/null 2>&1; then
+    run_system_package_cmd yum install -y gcc gcc-c++ make pkgconfig curl clang
+  elif command -v pacman >/dev/null 2>&1; then
+    run_system_package_cmd pacman -Sy --needed --noconfirm base-devel pkgconf curl clang
+  elif command -v zypper >/dev/null 2>&1; then
+    run_system_package_cmd zypper install -y gcc gcc-c++ make pkg-config curl clang
+  elif command -v apk >/dev/null 2>&1; then
+    run_system_package_cmd apk add --no-cache build-base pkgconf curl clang
+  elif [ "$OS_TAG" = "macos" ] && command -v brew >/dev/null 2>&1; then
+    brew install pkg-config llvm rustup-init || true
+  else
+    echo "error: unsupported package manager for automatic dependency install." >&2
+    echo "Install Rust toolchain, clang, make, and pkg-config manually, then rerun." >&2
+    exit 1
+  fi
+
+  if ! command -v cargo >/dev/null 2>&1; then
+    echo "warning: cargo is still not available. Install Rust with rustup: https://rustup.rs/" >&2
+  fi
+}
+
+maybe_install_deps() {
+  if [ "$INSTALL_DEPS" = "yes" ]; then
+    ensure_unix_build_deps
+    INSTALL_DEPS="done"
+  fi
+}
+
 build_release_binary() {
+  maybe_install_deps
   if ! command -v cargo >/dev/null 2>&1; then
     echo "error: cargo not found in PATH. Install Rust toolchain first: https://rustup.rs/" >&2
     exit 1
@@ -390,7 +449,12 @@ action_uninstall() {
   maybe_remove_path_exports
 }
 
+action_deps() {
+  ensure_unix_build_deps
+}
+
 case "$ACTION" in
+  deps) action_deps ;;
   test) action_test ;;
   install) action_install ;;
   update) action_update ;;

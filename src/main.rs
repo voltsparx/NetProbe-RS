@@ -34,14 +34,15 @@ use std::path::Path;
 #[cfg(unix)]
 use std::process::{Command, ExitStatus};
 
-use crate::cli::{Cli, CliAction, SessionCommand};
+use crate::cli::{Cli, CliAction, IntegrityCommand, SessionCommand};
 use crate::error::{NProbeError, NProbeResult};
 use crate::models::ScanRequest;
+use crate::platform::self_integrity;
 
 #[tokio::main]
 async fn main() {
     if let Err(err) = run().await {
-        eprintln!("error: {err}");
+        eprintln!("{}", err.user_message());
         std::process::exit(1);
     }
 }
@@ -67,7 +68,22 @@ async fn run() -> NProbeResult<()> {
     }
 
     let cli = Cli::parse_normalized();
-    match cli.into_action()? {
+    let action = cli.into_action()?;
+
+    if let CliAction::Integrity(command) = action {
+        let status = match command {
+            IntegrityCommand::Status => self_integrity::status()?,
+            IntegrityCommand::Reseal => self_integrity::reseal_trusted_baseline()?,
+        };
+        println!("{}", cli::render_integrity_status(&status));
+        return Ok(());
+    }
+
+    let integrity_status = self_integrity::enforce_startup()?;
+    self_integrity::publish_runtime_status(&integrity_status);
+
+    match action {
+        CliAction::Integrity(_) => unreachable!("integrity action handled above"),
         CliAction::Sessions(SessionCommand::List { limit }) => {
             let records = config::list_scan_sessions(limit)?;
             println!("{}", cli::render_session_list(&records));
@@ -80,6 +96,14 @@ async fn run() -> NProbeResult<()> {
                 )));
             };
             println!("{}", cli::render_session_detail(&record));
+            Ok(())
+        }
+        CliAction::Sessions(SessionCommand::Diff {
+            older_session_id,
+            newer_session_id,
+        }) => {
+            let diff = config::diff_session_actionables(&older_session_id, &newer_session_id)?;
+            println!("{}", cli::render_session_diff(&diff));
             Ok(())
         }
         CliAction::Scan(mut request) => {

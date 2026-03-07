@@ -4,6 +4,10 @@
 // html output wears a suit so results can meet management.
 
 use crate::models::ScanReport;
+use crate::output::{
+    actionable_summary_line, good_next_steps, phantom_device_check_summary, service_detail_lines,
+    service_label, top_actionable_items,
+};
 
 pub fn render(report: &ScanReport) -> String {
     let mut html = String::new();
@@ -12,7 +16,7 @@ pub fn render(report: &ScanReport) -> String {
     html.push_str("<title>NProbe-RS Report</title>");
     html.push_str("<style>");
     html.push_str(
-        ":root{--bg:#f6f8fb;--panel:#ffffff;--ink:#16212f;--muted:#6a7789;--accent:#0f7a6e;--warn:#8f3f2e;}
+        ":root{--bg:#f6f8fb;--panel:#ffffff;--ink:#16212f;--muted:#6a7789;--accent:#0f7a6e;--warn:#8f3f2e;--critical:#8f2d2d;--high:#a3581a;--moderate:#735f13;--review:#3f648f;}
         body{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:linear-gradient(120deg,#f6f8fb,#edf2f8);color:var(--ink);margin:0;padding:24px;}
         .wrap{max-width:1100px;margin:0 auto;}
         .card{background:var(--panel);border:1px solid #e6ebf2;border-radius:14px;padding:18px;margin-bottom:18px;box-shadow:0 6px 20px rgba(10,20,40,.06);}
@@ -22,6 +26,11 @@ pub fn render(report: &ScanReport) -> String {
         th,td{padding:8px;border-bottom:1px solid #ecf1f7;text-align:left;font-size:13px;vertical-align:top}
         th{color:#33465c}
         .pill{display:inline-block;padding:2px 8px;border-radius:999px;background:#e7f8f4;color:var(--accent);font-size:12px}
+        .sev{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;margin-right:8px}
+        .sev-critical{background:#f7dfdf;color:var(--critical)}
+        .sev-high{background:#f8e7d7;color:var(--high)}
+        .sev-moderate{background:#f5edcf;color:var(--moderate)}
+        .sev-review{background:#dde8f7;color:var(--review)}
         .warn{color:var(--warn)}
         ul{margin:6px 0 0 18px}
         </style></head><body><div class=\"wrap\">",
@@ -40,15 +49,21 @@ pub fn render(report: &ScanReport) -> String {
         report.metadata.started_at, report.metadata.finished_at, report.metadata.duration_ms
     ));
     html.push_str(&format!(
-        "<div class=\"meta\">Async tasks: {} | Thread tasks: {} | Parallel tasks: {} | Lua hooks: {}</div>",
+        "<div class=\"meta\">Async tasks: {} | Thread tasks: {} | Parallel tasks: {} | Lua hooks: {} | Integrity: {} ({})</div>",
         report.metadata.engine_stats.async_engine_tasks,
         report.metadata.engine_stats.thread_pool_tasks,
         report.metadata.engine_stats.parallel_tasks,
-        report.metadata.engine_stats.lua_hooks_ran
+        report.metadata.engine_stats.lua_hooks_ran,
+        esc(&report.metadata.engine_stats.integrity_state),
+        esc(&report.metadata.engine_stats.integrity_manifest)
     ));
     html.push_str(&format!(
-        "<div class=\"meta\">Role: {} | Teaching: {} | Safety envelope: {} | Public target policy: {} | Profiled hosts: {} | Fragile hosts: {} | Suppressed ports: {}</div>",
+        "<div class=\"meta\">Role: {} | Family: {} | Safety model: {} | Bundle: {} | Resources: {} | Teaching: {} | Safety envelope: {} | Public target policy: {} | Profiled hosts: {} | Fragile hosts: {} | Suppressed ports: {}</div>",
         esc(&report.metadata.engine_stats.framework_role),
+        esc(&report.metadata.engine_stats.scan_family),
+        esc(&report.metadata.engine_stats.safety_model),
+        esc(&report.metadata.engine_stats.scan_bundle),
+        esc(&report.metadata.engine_stats.resource_policy),
         report.metadata.engine_stats.teaching_mode,
         report.metadata.engine_stats.safety_envelope_active,
         report.metadata.engine_stats.public_target_policy_applied,
@@ -66,6 +81,13 @@ pub fn render(report: &ScanReport) -> String {
         report.metadata.platform.planned,
         report.metadata.platform.intentionally_excluded
     ));
+    html.push_str("<div class=\"meta\">Workflow lanes: learners=interactive | fragile/unknown=phantom/kis/sar | specialists=nmap-style safe flags | audits=balanced/stealth</div>");
+    if !report.metadata.engine_stats.scan_bundle_stages.is_empty() {
+        html.push_str(&format!(
+            "<div class=\"meta\">Bundle stages: {}</div>",
+            esc(&report.metadata.engine_stats.scan_bundle_stages.join(" -> "))
+        ));
+    }
     html.push_str(&format!(
         "<div class=\"meta\">Knowledge: services {} | top ports {} | payloads {} | rules {}/{} (skipped {}) | NSE scripts {} | NSE libs {}</div>",
         report.metadata.knowledge.services_loaded,
@@ -101,6 +123,30 @@ pub fn render(report: &ScanReport) -> String {
                 esc(host.observed_mac.as_deref().unwrap_or("unknown"))
             ));
         }
+        if let Some(summary) = phantom_device_check_summary(host) {
+            html.push_str(&format!(
+                "<div class=\"meta\">Device check: Phantom stage={} | responsive={}/{} | timeout={} | avg latency={} ms | payload budget={} | passive follow-up={}</div>",
+                esc(&summary.stage),
+                summary.responsive_ports.unwrap_or(0),
+                summary.sampled_ports.unwrap_or(0),
+                summary.timeout_ports.unwrap_or(0),
+                esc(&summary
+                    .avg_latency_ms
+                    .map(|latency| latency.to_string())
+                    .unwrap_or_else(|| "n/a".to_string())),
+                esc(&summary
+                    .payload_budget
+                    .map(|budget| budget.to_string())
+                    .unwrap_or_else(|| "n/a".to_string())),
+                if summary.passive_follow_up { "yes" } else { "no" }
+            ));
+        }
+        if let Some(summary) = actionable_summary_line(host) {
+            html.push_str(&format!(
+                "<div class=\"meta\">Actionable findings: {}</div>",
+                esc(&summary)
+            ));
+        }
         for warning in &host.warnings {
             html.push_str(&format!(
                 "<div class=\"meta warn\">Warning: {}</div>",
@@ -122,7 +168,7 @@ pub fn render(report: &ScanReport) -> String {
                 p.port,
                 esc(&p.protocol),
                 esc(&p.state.to_string()),
-                esc(p.service.as_deref().unwrap_or("unknown")),
+                esc(&service_label(p)),
                 esc(&p.reason),
                 esc(p.banner.as_deref().unwrap_or("")),
                 esc(p.matched_by.as_deref().unwrap_or("unknown")),
@@ -131,8 +177,38 @@ pub fn render(report: &ScanReport) -> String {
                     .unwrap_or_else(|| "n/a".to_string()),
                 esc(p.educational_note.as_deref().unwrap_or(""))
             ));
+            let details = service_detail_lines(p);
+            if !details.is_empty() {
+                html.push_str("<tr><td></td><td colspan=\"7\"><ul>");
+                for detail in details {
+                    html.push_str(&format!("<li>{}</li>", esc(&detail)));
+                }
+                html.push_str("</ul></td></tr>");
+            }
         }
         html.push_str("</tbody></table>");
+
+        let key_issues = top_actionable_items(host);
+        if !key_issues.is_empty() {
+            html.push_str("<h3>What Looks Wrong</h3><ul>");
+            for issue in &key_issues {
+                html.push_str(&format!(
+                    "<li><span class=\"sev sev-{}\">{}</span>{}</li>",
+                    esc(issue.severity.as_str()),
+                    esc(issue.severity.as_str()),
+                    esc(&issue.issue)
+                ));
+            }
+            html.push_str("</ul>");
+        }
+        let next_steps = good_next_steps(host);
+        if !next_steps.is_empty() {
+            html.push_str("<h3>Good Next Steps</h3><ul>");
+            for step in &next_steps {
+                html.push_str(&format!("<li>{}</li>", esc(step)));
+            }
+            html.push_str("</ul>");
+        }
 
         if !host.insights.is_empty() {
             html.push_str("<h3>Insights</h3><ul>");

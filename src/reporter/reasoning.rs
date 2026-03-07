@@ -30,6 +30,30 @@ fn explain_port(finding: &PortFinding) -> String {
             "{state_reason}; identified service hint is '{service}' and reason='{}'",
             finding.reason
         );
+        if let Some(identity) = &finding.service_identity {
+            let mut identity_parts = Vec::new();
+            if let Some(product) = &identity.product {
+                identity_parts.push(product.clone());
+            }
+            if let Some(version) = &identity.version {
+                identity_parts.push(format!("version={version}"));
+            }
+            if let Some(info) = &identity.info {
+                identity_parts.push(info.clone());
+            }
+            if let Some(device_type) = &identity.device_type {
+                identity_parts.push(format!("device={device_type}"));
+            }
+            if let Some(os) = &identity.operating_system {
+                identity_parts.push(format!("os={os}"));
+            }
+            if !identity.cpes.is_empty() {
+                identity_parts.push(format!("cpe={}", identity.cpes.join(",")));
+            }
+            if !identity_parts.is_empty() {
+                base.push_str(&format!("; identity={}", identity_parts.join(" | ")));
+            }
+        }
         if let Some(matched_by) = &finding.matched_by {
             if let Some(confidence) = finding.confidence {
                 base.push_str(&format!(
@@ -38,6 +62,12 @@ fn explain_port(finding: &PortFinding) -> String {
             } else {
                 base.push_str(&format!("; detection source={matched_by}"));
             }
+        }
+        if !finding.vulnerability_hints.is_empty() {
+            base.push_str(&format!(
+                "; exposure hints={}",
+                finding.vulnerability_hints.join(" | ")
+            ));
         }
         base
     } else {

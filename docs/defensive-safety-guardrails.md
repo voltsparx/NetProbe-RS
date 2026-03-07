@@ -12,6 +12,7 @@ Current structural guardrails:
 - Fragile and printer-like devices receive lower rate caps, lower concurrency, and passive-only follow-up behavior.
 - Packet-blast selection is no longer a volume-only escalation; it requires privileged low-impact conditions and disabled active fingerprinting.
 - `phantom`, `sar`, and `kis` are implemented as low-impact defensive concepts only; they automatically enable strict safety, stay on async paths, and disable UDP, raw privileged probing, and deep fingerprinting.
+- These profiles are grouped under the `TBNS` family so reports and learning output can explain when Tri-Blue guardrails were active.
 
 Design intent:
 

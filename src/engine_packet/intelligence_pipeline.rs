@@ -14,7 +14,7 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 use crate::fingerprint_db::{FingerprintDatabase, ProbeProtocol};
-use crate::models::{PortFinding, PortState};
+use crate::models::{PortFinding, PortState, ServiceIdentity};
 
 #[derive(Debug, Clone, Default)]
 pub struct MultiStageProbeReport {
@@ -28,6 +28,7 @@ pub struct MultiStageProbePolicy {
     pub max_concurrency: usize,
     pub fragile_mode: bool,
     pub safety_blacklist: Vec<u16>,
+    pub payload_budget: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -35,6 +36,7 @@ struct PortProbeUpdate {
     index: usize,
     banner: Option<String>,
     service: Option<String>,
+    service_identity: Option<ServiceIdentity>,
     matched_by: Option<String>,
     confidence: Option<f32>,
     stage: &'static str,
@@ -89,6 +91,7 @@ pub async fn run_multi_stage_tcp_probe_pipeline(
         .max_concurrency
         .clamp(1, concurrency_cap)
         .min(candidates.len().max(1));
+    let payload_budget = policy.payload_budget.max(1);
     let mut in_flight = FuturesUnordered::new();
 
     while !candidates.is_empty() || !in_flight.is_empty() {
@@ -98,7 +101,7 @@ pub async fn run_multi_stage_tcp_probe_pipeline(
             };
             let db = Arc::clone(&fingerprint_db);
             in_flight.push(tokio::spawn(async move {
-                probe_open_tcp_port(index, target, port, db, timeout_budget).await
+                probe_open_tcp_port(index, target, port, db, timeout_budget, payload_budget).await
             }));
             report.tasks_spawned += 1;
         }
@@ -114,6 +117,9 @@ pub async fn run_multi_stage_tcp_probe_pipeline(
                 if update.service.is_some() {
                     report.services_identified += 1;
                     finding.service = update.service;
+                }
+                if update.service_identity.is_some() {
+                    finding.service_identity = update.service_identity;
                 }
                 if update.matched_by.is_some() {
                     finding.matched_by = update.matched_by;
@@ -139,6 +145,7 @@ async fn probe_open_tcp_port(
     port: u16,
     fingerprint_db: Arc<FingerprintDatabase>,
     timeout_budget: Duration,
+    payload_budget: usize,
 ) -> Option<PortProbeUpdate> {
     let generic = generic_probe_payload(port);
     let mut best_banner = None::<String>;
@@ -152,6 +159,7 @@ async fn probe_open_tcp_port(
                 index,
                 banner: best_banner,
                 service: Some(matched.service),
+                service_identity: Some(matched.identity),
                 matched_by: Some(if matched.soft {
                     format!("fingerprint-soft:{}", matched.source)
                 } else {
@@ -166,6 +174,7 @@ async fn probe_open_tcp_port(
                 index,
                 banner: best_banner,
                 service: Some(heuristic),
+                service_identity: None,
                 matched_by: Some("banner-heuristic".to_string()),
                 confidence: Some(0.57),
                 stage: "generic-heuristic",
@@ -173,7 +182,21 @@ async fn probe_open_tcp_port(
         }
     }
 
-    let mut payloads = fingerprint_db.payloads_for(ProbeProtocol::Tcp, port, 4);
+    let targeted_payload_budget = payload_budget.saturating_sub(1);
+    if targeted_payload_budget == 0 {
+        return best_banner.map(|banner| PortProbeUpdate {
+            index,
+            banner: Some(banner),
+            service: None,
+            service_identity: None,
+            matched_by: None,
+            confidence: None,
+            stage: "banner-only",
+        });
+    }
+
+    let mut payloads =
+        fingerprint_db.payloads_for(ProbeProtocol::Tcp, port, targeted_payload_budget);
     if payloads.is_empty() {
         payloads.push(b"\r\n".to_vec());
     }
@@ -192,6 +215,7 @@ async fn probe_open_tcp_port(
                     index,
                     banner: best_banner,
                     service: Some(matched.service),
+                    service_identity: Some(matched.identity),
                     matched_by: Some(if matched.soft {
                         format!("fingerprint-soft:{}", matched.source)
                     } else {
@@ -207,6 +231,7 @@ async fn probe_open_tcp_port(
                     index,
                     banner: best_banner,
                     service: Some(heuristic),
+                    service_identity: None,
                     matched_by: Some("banner-heuristic".to_string()),
                     confidence: Some(0.57),
                     stage: "targeted-heuristic",
@@ -219,6 +244,7 @@ async fn probe_open_tcp_port(
         index,
         banner: Some(banner),
         service: None,
+        service_identity: None,
         matched_by: None,
         confidence: None,
         stage: "banner-only",
@@ -341,10 +367,12 @@ mod tests {
             protocol: "tcp".to_string(),
             state: PortState::Open,
             service: None,
+            service_identity: None,
             banner: None,
             reason: "syn-ack received".to_string(),
             matched_by: None,
             confidence: None,
+            vulnerability_hints: Vec::new(),
             educational_note: None,
             latency_ms: None,
             explanation: None,
@@ -358,6 +386,7 @@ mod tests {
                 max_concurrency: 8,
                 fragile_mode: false,
                 safety_blacklist: Vec::new(),
+                payload_budget: 4,
             },
         )
         .await;
@@ -378,10 +407,12 @@ mod tests {
             protocol: "tcp".to_string(),
             state: PortState::Closed,
             service: None,
+            service_identity: None,
             banner: None,
             reason: "closed".to_string(),
             matched_by: None,
             confidence: None,
+            vulnerability_hints: Vec::new(),
             educational_note: None,
             latency_ms: None,
             explanation: None,
@@ -397,6 +428,7 @@ mod tests {
                 max_concurrency: 4,
                 fragile_mode: false,
                 safety_blacklist: Vec::new(),
+                payload_budget: 4,
             },
         ));
         assert_eq!(report.tasks_spawned, 0);

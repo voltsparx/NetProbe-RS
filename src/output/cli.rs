@@ -3,6 +3,10 @@
 //   read input -> process safely -> return deterministic output
 
 use crate::models::{PortFinding, PortState, ScanReport};
+use crate::output::{
+    actionable_summary_line, good_next_steps, key_issue_lines, phantom_device_check_summary,
+    service_detail_lines, service_label,
+};
 
 pub fn render(report: &ScanReport) -> String {
     let mut out = String::new();
@@ -27,8 +31,14 @@ pub fn render(report: &ScanReport) -> String {
         report.metadata.engine_stats.shard_dimension
     ));
     out.push_str(&format!(
-        "Role: {} | teaching: {} | safety envelope: {} | public-target policy: {} | profiled hosts: {} | fragile hosts: {} | suppressed ports: {}\n",
+        "Role: {} | family: {} | safety model: {} | bundle: {} | resources: {} | integrity: {} ({}) | teaching: {} | safety envelope: {} | public-target policy: {} | profiled hosts: {} | fragile hosts: {} | suppressed ports: {}\n",
         report.metadata.engine_stats.framework_role,
+        report.metadata.engine_stats.scan_family,
+        report.metadata.engine_stats.safety_model,
+        report.metadata.engine_stats.scan_bundle,
+        report.metadata.engine_stats.resource_policy,
+        report.metadata.engine_stats.integrity_state,
+        report.metadata.engine_stats.integrity_manifest,
         if report.metadata.engine_stats.teaching_mode {
             "on"
         } else {
@@ -58,6 +68,15 @@ pub fn render(report: &ScanReport) -> String {
         report.metadata.platform.planned,
         report.metadata.platform.intentionally_excluded
     ));
+    out.push_str(
+        "Workflow lanes: learners=interactive | fragile/unknown=phantom/kis/sar | specialists=nmap-style flags with safe semantics | audits=balanced/stealth\n",
+    );
+    if !report.metadata.engine_stats.scan_bundle_stages.is_empty() {
+        out.push_str(&format!(
+            "Bundle stages: {}\n",
+            report.metadata.engine_stats.scan_bundle_stages.join(" -> ")
+        ));
+    }
 
     if let Some(seed) = report.metadata.engine_stats.scan_seed {
         out.push_str(&format!("Scan seed: {seed}\n"));
@@ -105,6 +124,24 @@ pub fn render(report: &ScanReport) -> String {
                 host.observed_mac.as_deref().unwrap_or("unknown")
             ));
         }
+        if let Some(summary) = phantom_device_check_summary(host) {
+            out.push_str(&format!(
+                "Device check: phantom stage={} responsive={}/{} timeout={} avg-latency={}ms payload-budget={} passive-follow-up={}\n",
+                summary.stage,
+                summary.responsive_ports.unwrap_or(0),
+                summary.sampled_ports.unwrap_or(0),
+                summary.timeout_ports.unwrap_or(0),
+                summary
+                    .avg_latency_ms
+                    .map(|latency| latency.to_string())
+                    .unwrap_or_else(|| "n/a".to_string()),
+                summary
+                    .payload_budget
+                    .map(|budget| budget.to_string())
+                    .unwrap_or_else(|| "n/a".to_string()),
+                if summary.passive_follow_up { "yes" } else { "no" }
+            ));
+        }
 
         let open_like: Vec<&PortFinding> = host
             .ports
@@ -131,12 +168,31 @@ pub fn render(report: &ScanReport) -> String {
                     p.port,
                     p.protocol,
                     p.state,
-                    p.service.as_deref().unwrap_or("unknown")
+                    service_label(p)
                 ));
             }
         }
 
         out.push_str(&format!("Risk score: {}/100\n", host.risk_score));
+        if let Some(summary) = actionable_summary_line(host) {
+            out.push_str(&format!("Actionable findings: {summary}\n"));
+        }
+
+        let key_issues = key_issue_lines(host);
+        if !key_issues.is_empty() {
+            out.push_str("What looks wrong:\n");
+            for issue in &key_issues {
+                out.push_str(&format!("- {}\n", issue));
+            }
+        }
+
+        let next_steps = good_next_steps(host);
+        if !next_steps.is_empty() {
+            out.push_str("Good next steps:\n");
+            for step in &next_steps {
+                out.push_str(&format!("- {}\n", step));
+            }
+        }
 
         if report.request.explain && !open_like.is_empty() {
             out.push_str("Why these ports matter:\n");
@@ -147,6 +203,25 @@ pub fn render(report: &ScanReport) -> String {
         }
 
         if report.request.verbose {
+            let detailed_ports: Vec<&PortFinding> = host
+                .ports
+                .iter()
+                .filter(|p| !service_detail_lines(p).is_empty())
+                .collect();
+            if !detailed_ports.is_empty() {
+                out.push_str("Service Details:\n");
+                for port in detailed_ports {
+                    out.push_str(&format!(
+                        "- {}/{} {}\n",
+                        port.port,
+                        port.protocol,
+                        service_label(port)
+                    ));
+                    for detail in service_detail_lines(port) {
+                        out.push_str(&format!("  {detail}\n"));
+                    }
+                }
+            }
             if !host.warnings.is_empty() {
                 out.push_str("Warnings:\n");
                 for warning in &host.warnings {

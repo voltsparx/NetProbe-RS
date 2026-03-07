@@ -5,14 +5,18 @@
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
+use std::io::{self, IsTerminal, Write};
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use crate::config::ScanSessionRecord;
+use crate::config::{ActionableDiffItem, ScanSessionRecord, SessionActionableDiff};
+use crate::engines::phantom_preflight;
 use crate::error::{NProbeError, NProbeResult};
 use crate::models::{ReportFormat, ScanProfile, ScanRequest};
+use crate::platform::self_integrity::IntegrityStatus;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum FileType {
@@ -38,7 +42,7 @@ impl FileType {
     name = "nprobe-rs",
     version,
     about = "NProbe-RS: Reverse-Engineered scanner in safe, explainable Rust",
-    override_usage = "nprobe-rs <target> [OPTIONS]\n       nprobe-rs scan <target> [OPTIONS]\n       nprobe-rs sessions [OPTIONS]",
+    override_usage = "nprobe-rs <target> [OPTIONS]\n       nprobe-rs scan <target> [OPTIONS]\n       nprobe-rs interactive\n       nprobe-rs integrity [OPTIONS]\n       nprobe-rs sessions [OPTIONS]",
     after_help = "Nmap-style shortcuts supported: -sU, -sS, -A, -T0..-T5, -p-",
     arg_required_else_help = true
 )]
@@ -50,19 +54,37 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     Scan(Box<ScanArgs>),
+    #[command(visible_alias = "learn", visible_alias = "wizard")]
+    Interactive(InteractiveArgs),
+    Integrity(IntegrityArgs),
     Sessions(SessionArgs),
 }
 
 #[derive(Debug, Clone)]
 pub enum CliAction {
     Scan(Box<ScanRequest>),
+    Integrity(IntegrityCommand),
     Sessions(SessionCommand),
 }
 
 #[derive(Debug, Clone)]
 pub enum SessionCommand {
-    List { limit: usize },
-    Show { session_id: String },
+    List {
+        limit: usize,
+    },
+    Show {
+        session_id: String,
+    },
+    Diff {
+        older_session_id: String,
+        newer_session_id: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum IntegrityCommand {
+    Status,
+    Reseal,
 }
 
 #[derive(Debug, Args)]
@@ -99,9 +121,18 @@ struct ScanArgs {
         short = 'S',
         long = "syn",
         visible_alias = "sS",
+        conflicts_with = "connect",
         help = "Use privileged TCP probing (Nmap: -sS). Will auto-prompt for sudo/su if required"
     )]
     syn: bool,
+
+    #[arg(
+        long = "connect",
+        visible_alias = "sT",
+        conflicts_with_all = ["syn", "aggressive", "aggressive_root", "privileged_probes", "root_only"],
+        help = "Use user-space TCP connect scanning (Nmap: -sT)"
+    )]
+    connect: bool,
 
     #[arg(
         long = "arp",
@@ -122,6 +153,14 @@ struct ScanArgs {
         help = "Skip reverse DNS lookups (Nmap-compatible)"
     )]
     no_dns: bool,
+
+    #[arg(
+        long = "no-host-discovery",
+        visible_alias = "Pn",
+        hide = true,
+        help = "Nmap compatibility: current scan flow already avoids a separate ping-only discovery phase"
+    )]
+    no_host_discovery: bool,
 
     #[arg(
         short = 'N',
@@ -253,6 +292,7 @@ struct ScanArgs {
 
     #[arg(
         long = "rate-pps",
+        visible_aliases = ["max-rate", "min-rate"],
         help = "Probe dispatch rate target (packets per second)"
     )]
     rate_limit_pps: Option<u32>,
@@ -302,7 +342,34 @@ struct SessionArgs {
 
     #[arg(long = "show", help = "Show a specific session by id")]
     session_id: Option<String>,
+
+    #[arg(
+        long = "diff",
+        value_names = ["OLDER", "NEWER"],
+        num_args = 2,
+        help = "Compare actionable findings between two sessions"
+    )]
+    diff: Option<Vec<String>>,
 }
+
+#[derive(Debug, Args, Default)]
+struct InteractiveArgs {}
+
+#[derive(Debug, Args)]
+struct IntegrityArgs {
+    #[arg(
+        long = "reseal",
+        help = "Trust the current build and executable as the new integrity baseline"
+    )]
+    reseal: bool,
+}
+
+const INTERACTIVE_BANNER: &str = r#"    _   ______             __               ____  _____
+   / | / / __ \_________  / /_  ___        / __ \/ ___/
+  /  |/ / /_/ / ___/ __ \/ __ \/ _ \______/ /_/ /\__ \
+ / /|  / ____/ /  / /_/ / /_/ /  __/_____/ _, _/___/ /
+/_/ |_/_/   /_/   \____/_.___/\___/     /_/ |_|/____/
+"#;
 
 impl Cli {
     pub fn parse_normalized() -> Self {
@@ -313,6 +380,8 @@ impl Cli {
     pub fn into_action(self) -> NProbeResult<CliAction> {
         match self.command {
             Commands::Scan(scan) => Ok(CliAction::Scan(Box::new(scan.into_request()?))),
+            Commands::Interactive(args) => Ok(CliAction::Scan(Box::new(args.into_request()?))),
+            Commands::Integrity(args) => args.into_action(),
             Commands::Sessions(args) => args.into_action(),
         }
     }
@@ -407,7 +476,7 @@ pub fn maybe_render_quick_help_mode() -> Option<String> {
     }
 
     Some(
-        "Usage:\n  nprobe-rs <target> [options]\n  nprobe-rs sessions [--limit N]\n  nprobe-rs sessions --show <session-id>\n\nCommon options:\n  -p, --ports <list|range>   Select ports (example: -p 22,80,443)\n      --all-ports            Scan ports 1-65535 (Nmap: -p-)\n  -U, --udp                  Enable UDP probes (Nmap: -sU)\n  -S, --syn                  Enable privileged TCP probes (Nmap: -sS)\n      --arp                  Enable ARP neighbor discovery (local IPv4)\n  -A, --aggressive           Aggressive mode (Nmap: -A)\n  -w, --timeout-ms <ms>      Probe timeout in milliseconds\n      --rate-pps <num>       Dispatch rate target in packets per second\n      --burst-size <num>     Token-bucket burst limit\n      --max-retries <num>    Adaptive retries per probe (0..20)\n      --total-shards <num>   Total shard count for distributed scans\n      --shard-index <num>    Current shard index (requires total-shards)\n      --scan-seed <num>      Deterministic port shuffle seed\n      --resume               Resume from shard checkpoint\n      --fresh-scan           Ignore/reset shard checkpoint for this run\n  -r, --reverse-dns          Enable reverse DNS lookups\n  -n, --no-dns               Disable reverse DNS lookups\n  -e, --explain              Add concise per-port rationale in output\n  -v, --verbose              Show full output sections\n  -f, --file-type <type>     Export format: txt|json|html|csv\n  -o, --output <name>        Output filename\n  -L, --location <dir>       Output directory\n\nSession history:\n  nprobe-rs sessions --limit 20\n  nprobe-rs sessions --show <session-id>\n\nNmap-style shortcuts accepted:\n  -sU  -sS  -A  -T0..-T5  -p-\n\nFlag docs mode:\n  nprobe-rs --flag-help --scan\n  nprobe-rs --flag-help -sU\n  nprobe-rs --explain --scan   (legacy alias)\n\nCompatibility:\n  nprobe-rs scan <target> [options] still works.".to_string(),
+        "Usage:\n  nprobe-rs <target> [options]\n  nprobe-rs interactive\n  nprobe-rs integrity [--reseal]\n  nprobe-rs sessions [--limit N]\n  nprobe-rs sessions --show <session-id>\n  nprobe-rs sessions --diff <older-session-id> <newer-session-id>\n\nCommon options:\n  -p, --ports <list|range>   Select ports (example: -p 22,80,443)\n      --all-ports            Scan ports 1-65535 (Nmap: -p-)\n  -U, --udp                  Enable UDP probes (Nmap: -sU)\n  -S, --syn                  Enable privileged TCP probes (Nmap: -sS)\n      --connect              Force user-space TCP connect scanning (Nmap: -sT)\n      --arp                  Enable ARP neighbor discovery (local IPv4)\n  -A, --aggressive           Aggressive mode (Nmap: -A)\n  -w, --timeout-ms <ms>      Probe timeout in milliseconds\n      --rate-pps <num>       Dispatch rate target in packets per second\n      --burst-size <num>     Token-bucket burst limit\n      --max-retries <num>    Adaptive retries per probe (0..20)\n      --total-shards <num>   Total shard count for distributed scans\n      --shard-index <num>    Current shard index (requires total-shards)\n      --scan-seed <num>      Deterministic port shuffle seed\n      --resume               Resume from shard checkpoint\n      --fresh-scan           Ignore/reset shard checkpoint for this run\n  -r, --reverse-dns          Enable reverse DNS lookups\n  -n, --no-dns               Disable reverse DNS lookups\n  -e, --explain              Add concise per-port rationale in output\n  -v, --verbose              Show full output sections\n  -f, --file-type <type>     Export format: txt|json|html|csv\n  -o, --output <name>        Output filename\n  -L, --location <dir>       Output directory\n\nLearner mode:\n  nprobe-rs interactive      Guided prompt mode with banner and safe defaults\n  nprobe-rs learn            Alias for interactive mode\n\nIntegrity:\n  nprobe-rs integrity\n  nprobe-rs integrity --reseal\n\nSession history:\n  nprobe-rs sessions --limit 20\n  nprobe-rs sessions --show <session-id>\n  nprobe-rs sessions --diff <older-session-id> <newer-session-id>\n\nNmap-style shortcuts accepted:\n  -sU  -sS  -sT  -sV  -Pn  -A  -T0..-T5  -p-\n\nFlag docs mode:\n  nprobe-rs --flag-help --scan\n  nprobe-rs --flag-help -sU\n  nprobe-rs --explain --scan   (legacy alias)\n\nCompatibility:\n  nprobe-rs scan <target> [options] still works.".to_string(),
     )
 }
 
@@ -417,6 +486,25 @@ impl SessionArgs {
             return Err(NProbeError::Cli(
                 "--limit must be greater than 0".to_string(),
             ));
+        }
+
+        if let Some(values) = self.diff {
+            if self.session_id.is_some() {
+                return Err(NProbeError::Cli(
+                    "--diff cannot be used together with --show".to_string(),
+                ));
+            }
+            let older = values.first().map(String::as_str).unwrap_or("").trim();
+            let newer = values.get(1).map(String::as_str).unwrap_or("").trim();
+            if older.is_empty() || newer.is_empty() {
+                return Err(NProbeError::Cli(
+                    "--diff requires two non-empty session ids".to_string(),
+                ));
+            }
+            return Ok(CliAction::Sessions(SessionCommand::Diff {
+                older_session_id: older.to_string(),
+                newer_session_id: newer.to_string(),
+            }));
         }
 
         if let Some(session_id) = self.session_id {
@@ -437,6 +525,16 @@ impl SessionArgs {
     }
 }
 
+impl IntegrityArgs {
+    fn into_action(self) -> NProbeResult<CliAction> {
+        Ok(CliAction::Integrity(if self.reseal {
+            IntegrityCommand::Reseal
+        } else {
+            IntegrityCommand::Status
+        }))
+    }
+}
+
 fn render_flag_explain(raw_query: Option<&str>) -> String {
     let key = raw_query
         .map(|value| value.trim().trim_start_matches('-').to_ascii_lowercase())
@@ -445,6 +543,12 @@ fn render_flag_explain(raw_query: Option<&str>) -> String {
     let body = match key.as_str() {
         "scan" => {
             "Default scan mode. Use `nprobe-rs <target>` without the `scan` subcommand."
+        }
+        "st" | "connect" => {
+            "Force user-space TCP connect scanning (`-sT` or `--connect`) without privileged raw probing."
+        }
+        "pn" | "no-host-discovery" => {
+            "Compatibility flag (`-Pn` or `--no-host-discovery`). Current nprobe-rs scanning already avoids a separate ping-only discovery phase."
         }
         "p" | "ports" => "Select ports or ranges. Example: `-p 22,80,443` or `-p 1-1024`.",
         "s" | "su" | "udp" => "Enable UDP probing (`-sU` or `--udp`).",
@@ -459,8 +563,8 @@ fn render_flag_explain(raw_query: Option<&str>) -> String {
             "Timing profile (`-T0`..`-T5`). Mapped to internal profiles from stealth to aggressive."
         }
         "p-" | "all-ports" => "Scan all TCP ports 1-65535 (`-p-` or `--all-ports`).",
-        "ratepps" | "rate-pps" => {
-            "Set probe dispatch rate target in packets/sec (`--rate-pps`). Lower values reduce scan pressure."
+        "ratepps" | "rate-pps" | "maxrate" | "max-rate" | "minrate" | "min-rate" => {
+            "Set probe dispatch rate target in packets/sec (`--rate-pps`, `--max-rate`, or `--min-rate`). Lower values reduce scan pressure."
         }
         "burstsize" | "burst-size" => {
             "Set token-bucket burst size (`--burst-size`) to smooth short-term packet bursts."
@@ -486,7 +590,7 @@ fn render_flag_explain(raw_query: Option<&str>) -> String {
             "When used in scans, `--explain` adds concise per-port rationale lines in output."
         }
         _ => {
-            "Unknown flag. Try one of: --scan, -p, -sU, -sS, -A, -T4, -p-, -v, --explain. Tip: use --flag-help <flag>."
+            "Unknown flag. Try one of: --scan, -p, -sU, -sS, -sT, -Pn, -A, -T4, -p-, -v, --explain. Tip: use --flag-help <flag>."
         }
     };
 
@@ -495,6 +599,28 @@ fn render_flag_explain(raw_query: Option<&str>) -> String {
         raw_query.unwrap_or("--scan"),
         body
     )
+}
+
+pub fn render_integrity_status(status: &IntegrityStatus) -> String {
+    let mut out = String::new();
+    out.push_str("nprobe-rs integrity status\n");
+    out.push_str(&format!("state={}\n", status.state));
+    out.push_str(&format!("baseline_present={}\n", status.baseline_present));
+    out.push_str(&format!(
+        "source_tree_verified={}\n",
+        status.source_tree_verified
+    ));
+    out.push_str(&format!("files_checked={}\n", status.files_checked));
+    out.push_str(&format!("manifest_sha256={}\n", status.manifest_sha256));
+    out.push_str(&format!("executable_sha256={}\n", status.executable_sha256));
+    out.push_str(&format!("executable_path={}\n", status.executable_path));
+    if !status.notes.is_empty() {
+        out.push_str("notes:\n");
+        for note in &status.notes {
+            out.push_str(&format!("- {note}\n"));
+        }
+    }
+    out
 }
 
 impl ScanArgs {
@@ -678,6 +804,114 @@ impl ScanArgs {
     }
 }
 
+impl InteractiveArgs {
+    fn into_request(self) -> NProbeResult<ScanRequest> {
+        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+            return Err(NProbeError::Cli(
+                "interactive mode requires a terminal because it prompts for beginner-friendly scan choices".to_string(),
+            ));
+        }
+        println!("{INTERACTIVE_BANNER}");
+        println!("[i] Interactive learner mode");
+        println!("[i] Safe defaults: TBNS-first, strict-safety on, private-scope mode on");
+        println!("[i] This mode is meant for beginners and learners using prompt-based setup.\n");
+
+        let target = prompt_nonempty("Target host or CIDR")?;
+        let profile = prompt_profile_choice()?;
+        let (ports, top_ports) = prompt_port_selection(profile)?;
+        let strict_safety = prompt_yes_no("Keep strict safety enabled", true)?;
+        let lab_mode = prompt_yes_no("Limit this run to private/local targets", true)?;
+        let explain = prompt_yes_no("Show concise explanations in results", true)?;
+        let verbose = prompt_yes_no("Show learner sections (warnings, notes, advice)", true)?;
+        let reverse_dns = prompt_yes_no("Enable reverse DNS lookups", false)?;
+        let arp_discovery = if target.contains('/') || looks_like_private_ipv4_target(&target) {
+            prompt_yes_no(
+                "Enable ARP neighbor discovery for local IPv4 targets",
+                false,
+            )?
+        } else {
+            false
+        };
+        let service_detection = if strict_safety || profile.is_low_impact_concept() {
+            false
+        } else {
+            prompt_yes_no("Enable deeper service detection", false)?
+        };
+
+        let port_summary = if let Some(top) = top_ports {
+            format!("top-{top}")
+        } else {
+            format!("custom {} ports", ports.len())
+        };
+        let planned_port_count = top_ports.unwrap_or(ports.len()).max(1);
+        let phantom_preview = phantom_preflight::preview(
+            profile,
+            planned_port_count,
+            strict_safety,
+            service_detection,
+        );
+        println!(
+            "\n[+] Plan: target={} profile={} family={} scope={} ports={} strict-safety={} explain={} verbose={}",
+            target,
+            profile.as_str(),
+            profile.scan_family(),
+            if lab_mode { "private/local" } else { "user-selected" },
+            port_summary,
+            strict_safety,
+            explain,
+            verbose
+        );
+        println!(
+            "[i] Phantom device check preview: stage=pending sample-budget={} payload-budget={} strict-safety={}",
+            phantom_preview.sample_budget,
+            phantom_preview.initial_payload_budget,
+            phantom_preview.strict_safety
+        );
+        for note in &phantom_preview.notes {
+            println!("    - {note}");
+        }
+
+        if !prompt_yes_no("Start scan now", true)? {
+            return Err(NProbeError::Cli("interactive scan cancelled".to_string()));
+        }
+
+        Ok(ScanRequest {
+            target,
+            session_id: None,
+            ports,
+            top_ports,
+            include_udp: false,
+            reverse_dns,
+            service_detection,
+            explain,
+            verbose,
+            report_format: ReportFormat::Cli,
+            profile,
+            profile_explicit: true,
+            root_only: false,
+            aggressive_root: false,
+            privileged_probes: false,
+            arp_discovery,
+            lab_mode,
+            allow_external: false,
+            strict_safety,
+            output_path: None,
+            lua_script: None,
+            timeout_ms: None,
+            concurrency: None,
+            delay_ms: None,
+            rate_limit_pps: None,
+            burst_size: None,
+            max_retries: None,
+            total_shards: None,
+            shard_index: None,
+            scan_seed: None,
+            resume_from_checkpoint: true,
+            fresh_scan: false,
+        })
+    }
+}
+
 fn normalize_args(args: Vec<OsString>) -> Vec<OsString> {
     if args.is_empty() {
         return args;
@@ -694,9 +928,11 @@ fn normalize_args(args: Vec<OsString>) -> Vec<OsString> {
             "--scan" => {}
             "-sU" => mapped.push("--udp".into()),
             "-sS" => mapped.push("--syn".into()),
+            "-sT" => mapped.push("--connect".into()),
             "-A" => mapped.push("--aggressive".into()),
             "-p-" => mapped.push("--all-ports".into()),
             "-sV" => mapped.push("--service-detect".into()),
+            "-Pn" => mapped.push("--no-host-discovery".into()),
             "-T" => {
                 if idx + 1 < args.len() {
                     let level = args[idx + 1].to_string_lossy().to_string();
@@ -742,8 +978,136 @@ fn should_inject_scan(mapped: &[OsString]) -> bool {
     let first = mapped[0].to_string_lossy();
     !matches!(
         first.as_ref(),
-        "scan" | "sessions" | "-h" | "--help" | "-V" | "--version"
+        "scan"
+            | "interactive"
+            | "learn"
+            | "wizard"
+            | "integrity"
+            | "sessions"
+            | "-h"
+            | "--help"
+            | "-V"
+            | "--version"
     )
+}
+
+fn prompt_nonempty(label: &str) -> NProbeResult<String> {
+    loop {
+        let value = prompt_line(label)?;
+        if !value.trim().is_empty() {
+            return Ok(value.trim().to_string());
+        }
+        println!("[!] Please enter a non-empty value.");
+    }
+}
+
+fn prompt_line(label: &str) -> NProbeResult<String> {
+    print!("{label}: ");
+    io::stdout().flush().map_err(NProbeError::Io)?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).map_err(NProbeError::Io)?;
+    Ok(input.trim().to_string())
+}
+
+fn prompt_yes_no(label: &str, default_yes: bool) -> NProbeResult<bool> {
+    loop {
+        let suffix = if default_yes { "[Y/n]" } else { "[y/N]" };
+        let value = prompt_line(&format!("{label} {suffix}"))?;
+        if value.is_empty() {
+            return Ok(default_yes);
+        }
+        match value.to_ascii_lowercase().as_str() {
+            "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
+            _ => println!("[!] Enter yes or no."),
+        }
+    }
+}
+
+fn prompt_profile_choice() -> NProbeResult<ScanProfile> {
+    println!("Profiles:");
+    println!("  1. phantom  (TBNS device-check, least-contact, recommended)");
+    println!("  2. kis      (TBNS identity hints, timing-focused)");
+    println!("  3. sar      (TBNS logic observation, timing-delta)");
+    println!("  4. stealth  (core cautious scan)");
+    println!("  5. balanced (core general scan)");
+    loop {
+        let value = prompt_line("Choose profile [1-5]")?;
+        let normalized = if value.is_empty() {
+            "1"
+        } else {
+            value.as_str()
+        };
+        let profile = match normalized.to_ascii_lowercase().as_str() {
+            "1" | "phantom" => Some(ScanProfile::Phantom),
+            "2" | "kis" => Some(ScanProfile::Kis),
+            "3" | "sar" => Some(ScanProfile::Sar),
+            "4" | "stealth" => Some(ScanProfile::Stealth),
+            "5" | "balanced" => Some(ScanProfile::Balanced),
+            _ => None,
+        };
+        if let Some(profile) = profile {
+            return Ok(profile);
+        }
+        println!("[!] Choose one of: 1, 2, 3, 4, 5.");
+    }
+}
+
+fn prompt_port_selection(profile: ScanProfile) -> NProbeResult<(Vec<u16>, Option<usize>)> {
+    if let Some(budget) = profile.concept_port_budget() {
+        let smaller = (budget / 2).max(1);
+        println!("Port scope:");
+        println!("  1. top-{smaller} (recommended)");
+        println!("  2. top-{budget}");
+        println!("  3. custom list/range");
+        loop {
+            let value = prompt_line("Choose port scope [1-3]")?;
+            let normalized = if value.is_empty() {
+                "1"
+            } else {
+                value.as_str()
+            };
+            match normalized {
+                "1" => return Ok((Vec::new(), Some(smaller))),
+                "2" => return Ok((Vec::new(), Some(budget))),
+                "3" => {
+                    let raw = prompt_nonempty("Enter ports like 22,80,443 or 1-32")?;
+                    return Ok((parse_ports(&raw)?, None));
+                }
+                _ => println!("[!] Choose one of: 1, 2, 3."),
+            }
+        }
+    }
+
+    println!("Port scope:");
+    println!("  1. top-25 (recommended)");
+    println!("  2. top-100");
+    println!("  3. custom list/range");
+    loop {
+        let value = prompt_line("Choose port scope [1-3]")?;
+        let normalized = if value.is_empty() {
+            "1"
+        } else {
+            value.as_str()
+        };
+        match normalized {
+            "1" => return Ok((Vec::new(), Some(25))),
+            "2" => return Ok((Vec::new(), Some(100))),
+            "3" => {
+                let raw = prompt_nonempty("Enter ports like 22,80,443 or 1-1024")?;
+                return Ok((parse_ports(&raw)?, None));
+            }
+            _ => println!("[!] Choose one of: 1, 2, 3."),
+        }
+    }
+}
+
+fn looks_like_private_ipv4_target(target: &str) -> bool {
+    let token = target.trim().split('/').next().unwrap_or("").trim();
+    token
+        .parse::<Ipv4Addr>()
+        .map(|ip| ip.is_private() || ip.is_link_local())
+        .unwrap_or(false)
 }
 
 pub fn render_session_list(records: &[ScanSessionRecord]) -> String {
@@ -857,6 +1221,13 @@ pub fn render_session_detail(record: &ScanSessionRecord) -> String {
             .map(|value| value.to_string())
             .unwrap_or_else(|| "n/a".to_string())
     ));
+    out.push_str(&format!(
+        "host_snapshot_count={}\n",
+        record
+            .host_snapshot_count
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "n/a".to_string())
+    ));
     if let Some(category) = &record.failure_category {
         out.push_str(&format!("failure_category={category}\n"));
     }
@@ -872,6 +1243,34 @@ pub fn render_session_detail(record: &ScanSessionRecord) -> String {
     out
 }
 
+pub fn render_session_diff(diff: &SessionActionableDiff) -> String {
+    let mut out = String::new();
+    out.push_str("nprobe-rs actionable session diff\n");
+    out.push_str(&format!(
+        "older_session={} newer_session={}\n",
+        diff.older.session_id, diff.newer.session_id
+    ));
+    out.push_str(&format!(
+        "older_target={} newer_target={}\n",
+        diff.older.target, diff.newer.target
+    ));
+    out.push_str(&format!(
+        "summary added={} resolved={} escalated={} reduced={} unchanged={}\n",
+        diff.added.len(),
+        diff.resolved.len(),
+        diff.escalated.len(),
+        diff.reduced.len(),
+        diff.unchanged
+    ));
+
+    append_diff_section(&mut out, "New issues", &diff.added);
+    append_diff_section(&mut out, "Resolved issues", &diff.resolved);
+    append_diff_section(&mut out, "Escalated issues", &diff.escalated);
+    append_diff_section(&mut out, "Reduced issues", &diff.reduced);
+
+    out
+}
+
 fn truncate_cell(value: &str, width: usize) -> String {
     let mut chars = value.chars();
     let truncated: String = chars.by_ref().take(width.saturating_sub(1)).collect();
@@ -879,6 +1278,33 @@ fn truncate_cell(value: &str, width: usize) -> String {
         format!("{truncated}~")
     } else {
         value.to_string()
+    }
+}
+
+fn append_diff_section(out: &mut String, title: &str, items: &[ActionableDiffItem]) {
+    if items.is_empty() {
+        return;
+    }
+
+    out.push_str(&format!("{title}:\n"));
+    for item in items {
+        let severity = match (item.severity_before, item.severity_after) {
+            (Some(before), Some(after)) if before != after => {
+                format!("{}->{}", before.as_str(), after.as_str())
+            }
+            (_, Some(after)) => after.as_str().to_string(),
+            (Some(before), None) => before.as_str().to_string(),
+            (None, None) => "review".to_string(),
+        };
+        out.push_str(&format!(
+            "- [{}] {} ({}) {}\n",
+            severity, item.ip, item.target, item.issue
+        ));
+        if let Some(after) = item.action_after.as_deref() {
+            out.push_str(&format!("  next={after}\n"));
+        } else if let Some(before) = item.action_before.as_deref() {
+            out.push_str(&format!("  previous={before}\n"));
+        }
     }
 }
 
@@ -972,4 +1398,98 @@ fn parse_port(raw: &str) -> NProbeResult<u16> {
                 Ok(port)
             }
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        looks_like_private_ipv4_target, normalize_args, render_integrity_status,
+        should_inject_scan, Cli, CliAction, SessionCommand,
+    };
+    use crate::platform::self_integrity::IntegrityStatus;
+    use clap::Parser;
+    use std::ffi::OsString;
+
+    #[test]
+    fn normalize_args_keeps_interactive_subcommands() {
+        let args = vec![OsString::from("nprobe-rs"), OsString::from("interactive")];
+        let normalized = normalize_args(args);
+        assert_eq!(normalized[1].to_string_lossy(), "interactive");
+
+        let learn = vec![OsString::from("nprobe-rs"), OsString::from("learn")];
+        let normalized_learn = normalize_args(learn);
+        assert_eq!(normalized_learn[1].to_string_lossy(), "learn");
+        assert!(!should_inject_scan(&normalized_learn[1..]));
+    }
+
+    #[test]
+    fn private_ipv4_helper_is_precise() {
+        assert!(looks_like_private_ipv4_target("10.0.0.5"));
+        assert!(looks_like_private_ipv4_target("192.168.1.0/24"));
+        assert!(!looks_like_private_ipv4_target("172.2.0.1"));
+        assert!(!looks_like_private_ipv4_target("example.com"));
+    }
+
+    #[test]
+    fn normalize_args_maps_nmap_connect_and_no_ping_aliases() {
+        let args = vec![
+            OsString::from("nprobe-rs"),
+            OsString::from("-sT"),
+            OsString::from("-Pn"),
+            OsString::from("10.0.0.5"),
+        ];
+        let normalized = normalize_args(args);
+        let rendered = normalized
+            .iter()
+            .map(|value| value.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert!(rendered.contains(&"--connect".to_string()));
+        assert!(rendered.contains(&"--no-host-discovery".to_string()));
+    }
+
+    #[test]
+    fn normalize_args_keeps_integrity_subcommand() {
+        let args = vec![OsString::from("nprobe-rs"), OsString::from("integrity")];
+        let normalized = normalize_args(args);
+        assert_eq!(normalized[1].to_string_lossy(), "integrity");
+        assert!(!should_inject_scan(&normalized[1..]));
+    }
+
+    #[test]
+    fn sessions_diff_parses_into_diff_command() {
+        let cli = Cli::parse_from([
+            "nprobe-rs",
+            "sessions",
+            "--diff",
+            "older-session",
+            "newer-session",
+        ]);
+        let action = cli.into_action().expect("cli action should parse");
+        match action {
+            CliAction::Sessions(SessionCommand::Diff {
+                older_session_id,
+                newer_session_id,
+            }) => {
+                assert_eq!(older_session_id, "older-session");
+                assert_eq!(newer_session_id, "newer-session");
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn integrity_status_renderer_is_operator_readable() {
+        let rendered = render_integrity_status(&IntegrityStatus {
+            state: "trusted".to_string(),
+            manifest_sha256: "abc123".to_string(),
+            executable_sha256: "def456".to_string(),
+            files_checked: 4,
+            source_tree_verified: true,
+            baseline_present: true,
+            executable_path: "/tmp/nprobe-rs".to_string(),
+            notes: vec!["baseline matches".to_string()],
+        });
+        assert!(rendered.contains("state=trusted"));
+        assert!(rendered.contains("baseline matches"));
+    }
 }

@@ -8,6 +8,7 @@ use crate::engine_async::scanner::{self, AsyncScanConfig};
 use crate::engine_intel::device_profile::{classify_mac, DeviceClass};
 use crate::engine_intel::strategy::ScanStrategy;
 use crate::engine_packet::arp as packet_arp;
+use crate::engines::{bio_response_governor, phantom_preflight};
 use crate::error::NProbeResult;
 use crate::fingerprint_db::FingerprintDatabase;
 use crate::models::{HostResult, PortFinding, PortState, ScanRequest};
@@ -30,9 +31,23 @@ pub async fn run(
     let mut blocked_findings = Vec::new();
     let mut scan_ports = ports;
     let mut service_detection = request.service_detection;
+    let mut fingerprint_payload_budget = if service_detection { 4 } else { 0 };
     let base_rate_pps = request.rate_limit_pps.unwrap_or(strategy.rate_limit_pps);
     let mut rate_limit_pps = base_rate_pps;
     let mut profile_class = None::<DeviceClass>;
+
+    if let Some(chapter) = request.profile.tbns_chapter() {
+        warnings.push(format!(
+            "tbns {} active: chapter={} low-impact safety bus enforced for this host",
+            request.profile.as_str(),
+            chapter
+        ));
+        safety_actions.push(format!(
+            "tbns:{}:chapter={}",
+            request.profile.as_str(),
+            chapter
+        ));
+    }
 
     if let IpAddr::V4(target_v4) = target {
         if packet_arp::is_lan_ipv4(target_v4) {
@@ -157,6 +172,159 @@ pub async fn run(
         }
     }
 
+    let bio_response = bio_response_governor::decide(
+        request.profile,
+        request.strict_safety,
+        profile_class,
+        rate_limit_pps,
+        runtime.concurrency,
+        runtime.delay,
+    );
+    if bio_response.rate_cap_pps < rate_limit_pps {
+        warnings.push(format!(
+            "bio-response governor applied rate cap: {}pps -> {}pps",
+            rate_limit_pps, bio_response.rate_cap_pps
+        ));
+        safety_actions.push(format!(
+            "bio-response:rate-capped:{}->{}pps",
+            rate_limit_pps, bio_response.rate_cap_pps
+        ));
+        rate_limit_pps = bio_response.rate_cap_pps;
+    }
+    if bio_response.concurrency_cap < runtime.concurrency {
+        let previous = runtime.concurrency;
+        runtime.concurrency = bio_response.concurrency_cap;
+        warnings.push(format!(
+            "bio-response governor applied concurrency cap: {} -> {}",
+            previous, runtime.concurrency
+        ));
+        safety_actions.push(format!(
+            "bio-response:concurrency-capped:{}->{}",
+            previous, runtime.concurrency
+        ));
+    }
+    if bio_response.delay_floor > runtime.delay {
+        let previous = runtime.delay;
+        runtime.delay = bio_response.delay_floor;
+        warnings.push(format!(
+            "bio-response governor raised dispatch delay floor: {}ms -> {}ms",
+            previous.as_millis(),
+            runtime.delay.as_millis()
+        ));
+        safety_actions.push(format!(
+            "bio-response:delay-raised:{}ms->{}ms",
+            previous.as_millis(),
+            runtime.delay.as_millis()
+        ));
+    }
+    if service_detection && !bio_response.service_detection_allowed {
+        service_detection = false;
+        warnings.push(
+            "bio-response governor withheld deeper service detection until the host proved resilient enough for safe follow-up"
+                .to_string(),
+        );
+        safety_actions.push("bio-response:passive-stage1".to_string());
+    }
+    warnings.push(format!(
+        "bio-response governor stage={} policy active for this host",
+        bio_response.stage
+    ));
+    safety_actions.push(format!("bio-response:stage={}", bio_response.stage));
+    for note in bio_response.notes {
+        warnings.push(note);
+    }
+
+    let preflight = phantom_preflight::run(phantom_preflight::PhantomPreflightInput {
+        target,
+        ports: &scan_ports,
+        requested_timeout: runtime.timeout,
+        requested_rate_pps: rate_limit_pps,
+        requested_concurrency: runtime.concurrency,
+        requested_delay: runtime.delay,
+        service_detection_requested: service_detection,
+        strict_safety: request.strict_safety,
+        profile: request.profile,
+        device_class: profile_class,
+    })
+    .await;
+    let phantom_device_check = Some(preflight.summary());
+    warnings.push(format!(
+        "phantom preflight stage={} responsive={}/{} timeout={} avg-latency={}ms",
+        preflight.stage,
+        preflight.responsive_ports,
+        preflight.sampled_ports.len(),
+        preflight.timeout_ports,
+        preflight
+            .avg_latency_ms
+            .map(|latency| latency.to_string())
+            .unwrap_or_else(|| "n/a".to_string())
+    ));
+    safety_actions.push(format!("phantom-preflight:stage={}", preflight.stage));
+    if preflight.rate_cap_pps < rate_limit_pps {
+        warnings.push(format!(
+            "phantom preflight tightened rate cap: {}pps -> {}pps",
+            rate_limit_pps, preflight.rate_cap_pps
+        ));
+        safety_actions.push(format!(
+            "phantom-preflight:rate-capped:{}->{}pps",
+            rate_limit_pps, preflight.rate_cap_pps
+        ));
+        rate_limit_pps = preflight.rate_cap_pps;
+    }
+    if preflight.concurrency_cap < runtime.concurrency {
+        let previous = runtime.concurrency;
+        runtime.concurrency = preflight.concurrency_cap;
+        warnings.push(format!(
+            "phantom preflight tightened concurrency: {} -> {}",
+            previous, runtime.concurrency
+        ));
+        safety_actions.push(format!(
+            "phantom-preflight:concurrency-capped:{}->{}",
+            previous, runtime.concurrency
+        ));
+    }
+    if preflight.delay_floor > runtime.delay {
+        let previous = runtime.delay;
+        runtime.delay = preflight.delay_floor;
+        warnings.push(format!(
+            "phantom preflight raised dispatch delay floor: {}ms -> {}ms",
+            previous.as_millis(),
+            runtime.delay.as_millis()
+        ));
+        safety_actions.push(format!(
+            "phantom-preflight:delay-raised:{}ms->{}ms",
+            previous.as_millis(),
+            runtime.delay.as_millis()
+        ));
+    }
+    if service_detection && !preflight.service_detection_allowed {
+        service_detection = false;
+        warnings.push(
+            "phantom preflight withheld active service detection because the target did not demonstrate a stable enough response profile"
+                .to_string(),
+        );
+        safety_actions.push("phantom-preflight:passive-follow-up".to_string());
+    }
+    let requested_payload_budget = fingerprint_payload_budget;
+    fingerprint_payload_budget = if service_detection {
+        requested_payload_budget.min(preflight.fingerprint_payload_budget)
+    } else {
+        0
+    };
+    if fingerprint_payload_budget < requested_payload_budget {
+        warnings.push(format!(
+            "phantom preflight reduced active payload budget: {} -> {}",
+            requested_payload_budget, fingerprint_payload_budget
+        ));
+        safety_actions.push(format!(
+            "phantom-preflight:payload-budget:{}->{}",
+            requested_payload_budget, fingerprint_payload_budget
+        ));
+    }
+    for note in preflight.notes {
+        warnings.push(note);
+    }
+
     let config = AsyncScanConfig {
         target,
         ports: scan_ports,
@@ -172,6 +340,7 @@ pub async fn run(
         burst_size: request.burst_size.unwrap_or(strategy.burst_size),
         max_retries: request.max_retries.unwrap_or(strategy.max_retries),
         scan_seed: request.scan_seed,
+        fingerprint_payload_budget,
     };
 
     let (mut findings, task_count) = scanner::scan_ports(config, services).await;
@@ -189,6 +358,7 @@ pub async fn run(
         observed_mac,
         device_class,
         device_vendor,
+        phantom_device_check,
         safety_actions,
         warnings,
         ports: findings,
@@ -223,10 +393,12 @@ fn blocked_finding(port: u16, protocol: &str, service: Option<&str>) -> PortFind
         protocol: protocol.to_string(),
         state: PortState::Filtered,
         service: service.map(str::to_string),
+        service_identity: None,
         banner: None,
         reason: "skipped by device-profile safety blacklist".to_string(),
         matched_by: Some("device-profile-safety".to_string()),
         confidence: Some(1.0),
+        vulnerability_hints: Vec::new(),
         educational_note: Some(
             "nprobe-rs skipped this probe because the detected device class has a safety rule for this port."
                 .to_string(),

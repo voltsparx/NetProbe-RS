@@ -3,6 +3,10 @@
 //   read input -> process safely -> return deterministic output
 
 use crate::models::ScanReport;
+use crate::output::{
+    actionable_summary_line, good_next_steps, key_issue_lines, phantom_device_check_summary,
+    service_detail_lines, service_label,
+};
 
 pub fn render(report: &ScanReport) -> String {
     let mut out = String::new();
@@ -15,15 +19,22 @@ pub fn render(report: &ScanReport) -> String {
         report.metadata.started_at, report.metadata.finished_at, report.metadata.duration_ms
     ));
     out.push_str(&format!(
-        "async_tasks={} thread_tasks={} parallel_tasks={} lua_hooks={}\n",
+        "async_tasks={} thread_tasks={} parallel_tasks={} lua_hooks={} integrity_checked={} integrity_state={} integrity_manifest={}\n",
         report.metadata.engine_stats.async_engine_tasks,
         report.metadata.engine_stats.thread_pool_tasks,
         report.metadata.engine_stats.parallel_tasks,
-        report.metadata.engine_stats.lua_hooks_ran
+        report.metadata.engine_stats.lua_hooks_ran,
+        report.metadata.engine_stats.integrity_checked,
+        report.metadata.engine_stats.integrity_state,
+        report.metadata.engine_stats.integrity_manifest
     ));
     out.push_str(&format!(
-        "framework_role={} teaching_mode={} safety_envelope={} public_target_policy={} profiled_hosts={} fragile_hosts={} suppressed_ports={}\n",
+        "framework_role={} scan_family={} safety_model={} scan_bundle={} resource_policy={} teaching_mode={} safety_envelope={} public_target_policy={} profiled_hosts={} fragile_hosts={} suppressed_ports={}\n",
         report.metadata.engine_stats.framework_role,
+        report.metadata.engine_stats.scan_family,
+        report.metadata.engine_stats.safety_model,
+        report.metadata.engine_stats.scan_bundle,
+        report.metadata.engine_stats.resource_policy,
         report.metadata.engine_stats.teaching_mode,
         report.metadata.engine_stats.safety_envelope_active,
         report.metadata.engine_stats.public_target_policy_applied,
@@ -41,6 +52,15 @@ pub fn render(report: &ScanReport) -> String {
         report.metadata.platform.tool_families.join(","),
         report.metadata.platform.capability_domains.join(",")
     ));
+    out.push_str(
+        "workflow_lanes=learners:interactive,fragile_unknown:tbns,specialists:nmap-compatible-safe-flags,audits:balanced-stealth\n",
+    );
+    if !report.metadata.engine_stats.scan_bundle_stages.is_empty() {
+        out.push_str(&format!(
+            "scan_bundle_stages={}\n",
+            report.metadata.engine_stats.scan_bundle_stages.join(">")
+        ));
+    }
     out.push_str(&format!(
         "knowledge services={} top_ports={} payloads={} rules_compiled={} rules_total={} rules_skipped={} nse={} nselib={}\n",
         report.metadata.knowledge.services_loaded,
@@ -66,6 +86,27 @@ pub fn render(report: &ScanReport) -> String {
                 host.observed_mac.as_deref().unwrap_or("unknown")
             ));
         }
+        if let Some(summary) = phantom_device_check_summary(host) {
+            out.push_str(&format!(
+                "device_check profile=phantom stage={} responsive={}/{} timeout={} avg_latency_ms={} payload_budget={} passive_follow_up={}\n",
+                summary.stage,
+                summary.responsive_ports.unwrap_or(0),
+                summary.sampled_ports.unwrap_or(0),
+                summary.timeout_ports.unwrap_or(0),
+                summary
+                    .avg_latency_ms
+                    .map(|latency| latency.to_string())
+                    .unwrap_or_else(|| "n/a".to_string()),
+                summary
+                    .payload_budget
+                    .map(|budget| budget.to_string())
+                    .unwrap_or_else(|| "n/a".to_string()),
+                summary.passive_follow_up
+            ));
+        }
+        if let Some(summary) = actionable_summary_line(host) {
+            out.push_str(&format!("actionable_summary={summary}\n"));
+        }
         for action in &host.safety_actions {
             out.push_str(&format!("safety_action={}\n", action));
         }
@@ -78,13 +119,22 @@ pub fn render(report: &ScanReport) -> String {
                 port.port,
                 port.protocol,
                 port.state,
-                port.service.as_deref().unwrap_or("unknown"),
+                service_label(port),
                 port.reason,
                 port.matched_by.as_deref().unwrap_or("unknown"),
                 port.confidence
                     .map(|v| format!("{v:.2}"))
                     .unwrap_or_else(|| "n/a".to_string())
             ));
+            for detail in service_detail_lines(port) {
+                out.push_str(&format!("service_detail={}\n", detail));
+            }
+        }
+        for issue in key_issue_lines(host) {
+            out.push_str(&format!("issue={}\n", issue));
+        }
+        for step in good_next_steps(host) {
+            out.push_str(&format!("next_step={}\n", step));
         }
         for finding in &host.insights {
             out.push_str(&format!("insight={}\n", finding));

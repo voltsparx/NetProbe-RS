@@ -1,10 +1,11 @@
 # Phantom Scan
 
-`phantom` is the least-contact first-touch profile in NProbe-RS.
+`phantom` is the least-contact device-check profile in the `TBNS` family.
 
 What it means:
 
 - passive-first, minimal-impact defensive triage
+- first-touch device check before broader scanning
 - transparent operator identity
 - no spoofing, no decoys, no third-party host involvement
 - no privileged raw probing, no UDP, no deep fingerprinting
@@ -24,7 +25,8 @@ Runtime shape:
 Purpose:
 
 - touch unknown or fragile devices as little as possible
-- gather basic reachability and low-impact timing evidence
+- gather basic reachability, responsiveness, and low-impact timing evidence
+- decide safe size, speed, rate, and follow-up depth for the real scan
 - hand escalation decisions to the safety and intelligence layers
 
 Non-goals:
@@ -34,4 +36,4 @@ Non-goals:
 - zombie-style behavior
 - source hiding
 
-If a device shows stress signals or remains unclassified, Phantom stays conservative and defers deeper probing.
+If a device shows stress signals or remains unclassified, Phantom stays conservative, reduces payload budget, and defers deeper probing.

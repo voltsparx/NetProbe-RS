@@ -4,6 +4,8 @@
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::Path;
 #[cfg(unix)]
 use std::process::Command;
 use std::sync::Arc;
@@ -23,8 +25,9 @@ use crate::engine_packet::{arp as packet_arp, port_scan as packet_port_scan};
 use crate::engine_parallel::dns;
 use crate::engine_plugin::lua;
 use crate::engine_report::reporting;
+use crate::engines::scan_bundle;
 use crate::error::{NProbeError, NProbeResult};
-use crate::fetchers;
+use crate::fetchers::{self, FetcherReport};
 use crate::fingerprint_db::FingerprintDatabase;
 use crate::models::{
     EngineStats, HostResult, KnowledgeStats, ScanMetadata, ScanProfile, ScanReport, ScanRequest,
@@ -151,6 +154,13 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
         };
     }
     strategy::apply_runtime_overrides(&mut request, &strategy);
+    if let Some(chapter) = request.profile.tbns_chapter() {
+        global_warnings.push(format!(
+            "tbns active: tri-blue-network-scans chapter={} profile={} safety-bus engaged for low-impact discovery",
+            chapter,
+            request.profile.as_str()
+        ));
+    }
     global_warnings.extend(strategy.notes.iter().cloned());
     if request.rate_limit_pps != Some(strategy.rate_limit_pps) {
         global_warnings.push(format!(
@@ -167,7 +177,22 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
 
     let defer_host_enrichment = shard_dimension == "ports";
     let mut host_queue = VecDeque::from(work_items);
-    let host_concurrency = host_parallelism(request.profile, strategy.mode, host_queue.len());
+    let bundle_plan = scan_bundle::plan(
+        request.profile,
+        request.service_detection,
+        request.strict_safety,
+    );
+    let mut snapshot_writer = if request.session_id.is_some() {
+        Some(config::open_host_snapshot_writer()?)
+    } else {
+        None
+    };
+    global_warnings.push(format!(
+        "scan bundle selected: {} [{}]",
+        bundle_plan.name, bundle_plan.summary
+    ));
+    let host_concurrency =
+        host_parallelism(&request, &strategy, selected_ports.len(), host_queue.len());
     let mut in_flight = FuturesUnordered::new();
     let mut hosts = Vec::new();
     let mut async_tasks = 0usize;
@@ -202,6 +227,19 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
         parallel_tasks += execution.parallel_tasks;
         lua_hooks_ran = lua_hooks_ran || execution.lua_hooks_ran;
         let checkpoint_unit = execution.checkpoint_unit.clone();
+        if let (Some(session_id), Some(writer)) =
+            (request.session_id.as_deref(), snapshot_writer.as_mut())
+        {
+            writer.save(
+                session_id,
+                &execution.host,
+                if defer_host_enrichment {
+                    "partial"
+                } else {
+                    "final"
+                },
+            )?;
+        }
         hosts.push(execution.host);
         if let Some(runtime) = checkpoint_runtime.as_mut() {
             if runtime.completed_units.insert(checkpoint_unit) {
@@ -243,6 +281,11 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
             thread_pool_tasks += extra_thread_pool_tasks;
             parallel_tasks += extra_parallel_tasks;
             lua_hooks_ran = lua_hooks_ran || extra_lua_hooks_ran;
+            if let (Some(session_id), Some(writer)) =
+                (request.session_id.as_deref(), snapshot_writer.as_mut())
+            {
+                writer.save(session_id, host, "final")?;
+            }
         }
     }
 
@@ -293,6 +336,12 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
         .flat_map(|host| host.ports.iter())
         .filter(|port| port.matched_by.as_deref() == Some("device-profile-safety"))
         .count();
+    let scan_family = request.profile.scan_family().to_string();
+    let safety_model = if request.profile.is_low_impact_concept() {
+        "tbns-safety-bus".to_string()
+    } else {
+        "defensive-guardrails".to_string()
+    };
     let safety_envelope_active = request.lab_mode
         || request.strict_safety
         || has_public_targets
@@ -309,7 +358,17 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
                 thread_pool_tasks,
                 parallel_tasks,
                 lua_hooks_ran,
+                integrity_checked: std::env::var("NPROBE_RS_INTEGRITY_STATE").is_ok(),
+                integrity_state: std::env::var("NPROBE_RS_INTEGRITY_STATE")
+                    .unwrap_or_else(|_| "unknown".to_string()),
+                integrity_manifest: std::env::var("NPROBE_RS_INTEGRITY_BASELINE")
+                    .unwrap_or_else(|_| "unverified".to_string()),
+                resource_policy: strategy.resource_policy.clone(),
+                scan_bundle: bundle_plan.name,
+                scan_bundle_stages: bundle_plan.stages,
                 framework_role: "defensive-learning-platform".to_string(),
+                scan_family,
+                safety_model,
                 teaching_mode: request.explain || request.verbose,
                 execution_mode: strategy.mode.as_str().to_string(),
                 scan_persona: strategy.persona.as_str().to_string(),
@@ -454,7 +513,7 @@ async fn process_host(
     defer_enrichment: bool,
 ) -> NProbeResult<HostExecution> {
     let ip = work_item.ip;
-    let (mut host, async_tasks) =
+    let engine_result: NProbeResult<(HostResult, usize)> =
         if matches!(strategy.mode, ExecutionMode::PacketBlast) && !request.include_udp {
             match packet_port_scan::run(
                 &request,
@@ -466,7 +525,7 @@ async fn process_host(
             )
             .await
             {
-                Ok(value) => value,
+                Ok(value) => Ok(value),
                 Err(raw_err) => {
                     let (mut fallback_host, fallback_tasks) = async_port_scan::run(
                         &request,
@@ -480,7 +539,7 @@ async fn process_host(
                     fallback_host.warnings.push(format!(
                         "packet-blast raw backend unavailable, fallback to async engine: {raw_err}"
                     ));
-                    (fallback_host, fallback_tasks)
+                    Ok((fallback_host, fallback_tasks))
                 }
             }
         } else {
@@ -492,8 +551,30 @@ async fn process_host(
                 fingerprint_db,
                 &strategy,
             )
-            .await?
+            .await
         };
+    let (mut host, async_tasks) = match engine_result {
+        Ok(result) => result,
+        Err(err) => {
+            let host = degraded_host_result(
+                &request.target,
+                ip,
+                &global_warnings,
+                &format!(
+                    "host scan engine failed for this target, but NProbe-RS kept the session running: {}",
+                    err.friendly_detail()
+                ),
+            );
+            return Ok(HostExecution {
+                checkpoint_unit: work_item.checkpoint_unit,
+                host,
+                async_tasks: 0,
+                thread_pool_tasks: 0,
+                parallel_tasks: 0,
+                lua_hooks_ran: false,
+            });
+        }
+    };
     host.warnings.extend(global_warnings);
 
     let mut thread_pool_tasks = 0usize;
@@ -508,8 +589,12 @@ async fn process_host(
             }
         }
 
-        parallel_tasks = analysis::run(&mut host, request.explain);
-        let fetcher_report = fetchers::run(&request, &host).await;
+        let (analysis_tasks, analysis_warning) = run_analysis_isolated(&mut host, request.explain);
+        parallel_tasks = analysis_tasks;
+        if let Some(warning) = analysis_warning {
+            host.warnings.push(warning);
+        }
+        let fetcher_report = run_fetchers_isolated(&request, &host).await;
         parallel_tasks += fetcher_report.parallel_tasks;
         host.warnings.extend(fetcher_report.warnings);
         host.insights.extend(fetcher_report.insights);
@@ -517,15 +602,20 @@ async fn process_host(
         dedupe_sort_strings(&mut host.warnings);
         dedupe_sort_strings(&mut host.insights);
         dedupe_sort_strings(&mut host.learning_notes);
-        let lua_findings = lua::run(&host, request.lua_script.as_deref())?;
+        let (lua_findings, lua_ok, lua_warning) =
+            run_lua_isolated(&host, request.lua_script.as_deref());
         host.lua_findings = lua_findings;
+        if let Some(warning) = lua_warning {
+            host.warnings.push(warning);
+            dedupe_sort_strings(&mut host.warnings);
+        }
         if !host.lua_findings.is_empty() {
             host.insights.push(format!(
                 "lua hooks added {} custom findings",
                 host.lua_findings.len()
             ));
         }
-        lua_hooks_ran = true;
+        lua_hooks_ran = lua_ok;
     }
 
     Ok(HostExecution {
@@ -536,6 +626,46 @@ async fn process_host(
         parallel_tasks,
         lua_hooks_ran,
     })
+}
+
+fn degraded_host_result(
+    target: &str,
+    ip: IpAddr,
+    global_warnings: &[String],
+    failure_warning: &str,
+) -> HostResult {
+    let mut warnings = global_warnings.to_vec();
+    warnings.push(failure_warning.to_string());
+    warnings.push(
+        "This host result is partial. Core session execution continued so other hosts could still be scanned."
+            .to_string(),
+    );
+    dedupe_sort_strings(&mut warnings);
+
+    HostResult {
+        target: target.to_string(),
+        ip: ip.to_string(),
+        reverse_dns: None,
+        observed_mac: None,
+        device_class: None,
+        device_vendor: None,
+        phantom_device_check: None,
+        safety_actions: vec!["fault-isolation:host-scan-degraded".to_string()],
+        warnings,
+        ports: Vec::new(),
+        risk_score: 0,
+        insights: vec![
+            "host scan incomplete: one engine failed for this target, so NProbe-RS preserved the rest of the session instead of aborting everything".to_string(),
+        ],
+        defensive_advice: vec![
+            "Retry this host after checking permissions, network reachability, and optional engine inputs.".to_string(),
+        ],
+        learning_notes: vec![
+            "Learning: NProbe-RS isolates host-level engine failures so one bad path does not collapse the full run."
+                .to_string(),
+        ],
+        lua_findings: Vec::new(),
+    }
 }
 
 fn merge_hosts_by_ip(hosts: Vec<HostResult>) -> Vec<HostResult> {
@@ -564,6 +694,7 @@ fn merge_hosts_by_ip(hosts: Vec<HostResult>) -> Vec<HostResult> {
             if existing.device_vendor.is_none() {
                 existing.device_vendor = host.device_vendor.take();
             }
+            existing.merge_phantom_device_check(host.phantom_device_check.take());
         } else {
             index_by_ip.insert(host.ip.clone(), merged.len());
             merged.push(host);
@@ -614,8 +745,12 @@ async fn finalize_host(
     host.learning_notes.clear();
     host.lua_findings.clear();
 
-    let mut parallel_tasks = analysis::run(host, request.explain);
-    let fetcher_report = fetchers::run(request, host).await;
+    let (analysis_tasks, analysis_warning) = run_analysis_isolated(host, request.explain);
+    let mut parallel_tasks = analysis_tasks;
+    if let Some(warning) = analysis_warning {
+        host.warnings.push(warning);
+    }
+    let fetcher_report = run_fetchers_isolated(request, host).await;
     parallel_tasks += fetcher_report.parallel_tasks;
     host.warnings.extend(fetcher_report.warnings);
     host.insights.extend(fetcher_report.insights);
@@ -624,8 +759,12 @@ async fn finalize_host(
     dedupe_sort_strings(&mut host.insights);
     dedupe_sort_strings(&mut host.learning_notes);
 
-    let lua_findings = lua::run(host, request.lua_script.as_deref())?;
+    let (lua_findings, lua_ok, lua_warning) = run_lua_isolated(host, request.lua_script.as_deref());
     host.lua_findings = lua_findings;
+    if let Some(warning) = lua_warning {
+        host.warnings.push(warning);
+        dedupe_sort_strings(&mut host.warnings);
+    }
     if !host.lua_findings.is_empty() {
         host.insights.push(format!(
             "lua hooks added {} custom findings",
@@ -633,7 +772,71 @@ async fn finalize_host(
         ));
     }
 
-    Ok((thread_pool_tasks, parallel_tasks, true))
+    Ok((thread_pool_tasks, parallel_tasks, lua_ok))
+}
+
+fn run_analysis_isolated(host: &mut HostResult, explain_mode: bool) -> (usize, Option<String>) {
+    let mut working_host = host.clone();
+    match catch_unwind(AssertUnwindSafe(|| {
+        analysis::run(&mut working_host, explain_mode)
+    })) {
+        Ok(tasks) => {
+            *host = working_host;
+            (tasks, None)
+        }
+        Err(_) => (
+            0,
+            Some(
+                "analysis engine had an internal problem for this host, so advanced scoring and explanations were skipped while the scan kept going."
+                    .to_string(),
+            ),
+        ),
+    }
+}
+
+async fn run_fetchers_isolated(request: &ScanRequest, host: &HostResult) -> FetcherReport {
+    let request = request.clone();
+    let host = host.clone();
+    match tokio::spawn(async move { fetchers::run(&request, &host).await }).await {
+        Ok(report) => report,
+        Err(_) => FetcherReport {
+            warnings: vec![
+                "fetcher engine had an internal problem for this host, so optional enrichment was skipped while the scan kept going."
+                    .to_string(),
+            ],
+            insights: Vec::new(),
+            learning_notes: vec![
+                "Learning: enrichment is optional in NProbe-RS. If a fetcher fails, the core scan result remains usable."
+                    .to_string(),
+            ],
+            parallel_tasks: 0,
+        },
+    }
+}
+
+fn run_lua_isolated(
+    host: &HostResult,
+    script_path: Option<&Path>,
+) -> (Vec<String>, bool, Option<String>) {
+    match catch_unwind(AssertUnwindSafe(|| lua::run(host, script_path))) {
+        Ok(Ok(findings)) => (findings, true, None),
+        Ok(Err(err)) => (
+            Vec::new(),
+            false,
+            Some(format!(
+                "lua engine was skipped for this host: {} The scan continued with the core findings.",
+                err.friendly_detail()
+            )),
+        ),
+        Err(_) => (
+            Vec::new(),
+            false,
+            Some(
+                "lua engine crashed for this host, so NProbe-RS disabled it for this run and kept the scan going."
+                    .to_string(),
+            ),
+        ),
+    }
 }
 
 fn enforce_safety(
@@ -1362,23 +1565,55 @@ fn shard_slice<T>(items: Vec<T>, total_shards: u16, shard_index: u16) -> Vec<T> 
         .collect()
 }
 
-fn host_parallelism(profile: ScanProfile, mode: ExecutionMode, host_count: usize) -> usize {
-    let base = match profile {
-        ScanProfile::Stealth => 1,
+fn host_parallelism(
+    request: &ScanRequest,
+    strategy: &ScanStrategy,
+    port_count: usize,
+    host_count: usize,
+) -> usize {
+    let cpu_threads = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(4)
+        .max(1);
+    let base = match request.profile {
+        ScanProfile::Stealth => 2,
         ScanProfile::Phantom => 1,
-        ScanProfile::Sar => 1,
+        ScanProfile::Sar => 2,
         ScanProfile::Kis => 1,
-        ScanProfile::Balanced => 2,
-        ScanProfile::Turbo => 4,
-        ScanProfile::Aggressive => 6,
-        ScanProfile::RootOnly => 2,
+        ScanProfile::Balanced => 6,
+        ScanProfile::Turbo => 10,
+        ScanProfile::Aggressive => 12,
+        ScanProfile::RootOnly => 4,
     };
-    let mode_floor = match mode {
-        ExecutionMode::Async => 1,
-        ExecutionMode::Hybrid => 2,
+    let mode_floor = match strategy.mode {
+        ExecutionMode::Async => 2,
+        ExecutionMode::Hybrid => 4,
         ExecutionMode::PacketBlast => 4,
     };
-    base.max(mode_floor).min(host_count.max(1))
+    let per_host_budget = if port_count <= 16 {
+        8
+    } else if port_count <= 64 {
+        16
+    } else if port_count <= 256 {
+        24
+    } else {
+        32
+    };
+    let strategy_cap = (strategy.recommended_concurrency / per_host_budget).max(1);
+    let cpu_cap = match strategy.mode {
+        ExecutionMode::Async => cpu_threads.saturating_mul(2),
+        ExecutionMode::Hybrid => cpu_threads.saturating_mul(3),
+        ExecutionMode::PacketBlast => cpu_threads.saturating_mul(3),
+    }
+    .clamp(2, 48);
+
+    let strict_cap = if request.strict_safety { 8 } else { 48 };
+
+    base.max(mode_floor)
+        .min(strategy_cap)
+        .min(cpu_cap)
+        .min(strict_cap)
+        .min(host_count.max(1))
 }
 
 #[cfg(test)]

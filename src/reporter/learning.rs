@@ -2,9 +2,8 @@
 // Pseudo-block:
 //   read input -> process safely -> return deterministic output
 
-use std::collections::BTreeSet;
-
 use crate::models::{HostResult, PortFinding, PortState};
+use crate::reporter::learning_guides;
 
 pub fn attach_port_notes(ports: &mut [PortFinding]) {
     for finding in ports {
@@ -13,97 +12,7 @@ pub fn attach_port_notes(ports: &mut [PortFinding]) {
 }
 
 pub fn build_learning_notes(host: &HostResult) -> Vec<String> {
-    let mut notes = BTreeSet::new();
-    let open_count = host
-        .ports
-        .iter()
-        .filter(|p| matches!(p.state, PortState::Open | PortState::OpenOrFiltered))
-        .count();
-    if open_count == 0 {
-        notes.insert(
-            "Learning: a fully closed result still matters; it confirms reachable host behavior and filtering posture."
-                .to_string(),
-        );
-    } else {
-        notes.insert(format!(
-            "Learning: {} reachable service(s) were observed; prioritize least-privilege exposure.",
-            open_count
-        ));
-    }
-
-    for p in &host.ports {
-        if !matches!(p.state, PortState::Open | PortState::OpenOrFiltered) {
-            continue;
-        }
-        if let Some(service) = &p.service {
-            if service.eq_ignore_ascii_case("http") || service.eq_ignore_ascii_case("https") {
-                notes.insert(
-                    "Learning: web services should be reviewed for auth, TLS policy, and exposed admin paths."
-                        .to_string(),
-                );
-            }
-            if service.eq_ignore_ascii_case("ssh") {
-                notes.insert(
-                    "Learning: SSH is safer than Telnet but still high impact if brute-force protections are weak."
-                        .to_string(),
-                );
-            }
-            if service.eq_ignore_ascii_case("dns") || service.eq_ignore_ascii_case("domain") {
-                notes.insert(
-                    "Learning: exposed DNS can leak internal structure and should enforce recursion controls."
-                        .to_string(),
-                );
-            }
-        }
-    }
-
-    if let Some(device_class) = host.device_class.as_deref() {
-        match device_class {
-            "fragile-embedded" => {
-                notes.insert(
-                    "Learning: fragile embedded targets were scanned in a reduced-pressure mode to avoid disrupting low-power systems."
-                        .to_string(),
-                );
-            }
-            "printer-sensitive" => {
-                notes.insert(
-                    "Learning: printer-like targets can misbehave on legacy print ports, so nprobe-rs preserved safety by suppressing risky probes."
-                        .to_string(),
-                );
-            }
-            "enterprise" => {
-                notes.insert(
-                    "Learning: enterprise-class hardware tolerates broader discovery, but service exposure still needs human review."
-                        .to_string(),
-                );
-            }
-            _ => {
-                notes.insert(
-                    "Learning: the device profile remained generic, so the framework kept conservative assumptions."
-                        .to_string(),
-                );
-            }
-        }
-    }
-
-    if !host.safety_actions.is_empty() {
-        notes.insert(format!(
-            "Learning: safety automation applied {} runtime action(s) for this host.",
-            host.safety_actions.len()
-        ));
-        if host
-            .safety_actions
-            .iter()
-            .any(|action| action.contains("passive"))
-        {
-            notes.insert(
-                "Learning: deeper active fingerprinting was intentionally withheld until the host looked resilient enough for safe follow-up."
-                    .to_string(),
-            );
-        }
-    }
-
-    notes.into_iter().collect()
+    learning_guides::build_host_notes(host)
 }
 
 fn teaching_note_for(finding: &PortFinding) -> Option<String> {

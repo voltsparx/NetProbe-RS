@@ -14,11 +14,10 @@ use std::{
 use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
-use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 use crate::fingerprint_db::{FingerprintDatabase, ProbeProtocol};
-use crate::models::{PortFinding, PortState};
+use crate::models::{PortFinding, PortState, ServiceIdentity};
 use crate::service_db::ServiceRegistry;
 
 #[derive(Debug, Clone)]
@@ -37,6 +36,7 @@ pub struct AsyncScanConfig {
     pub burst_size: usize,
     pub max_retries: u8,
     pub scan_seed: Option<u64>,
+    pub fingerprint_payload_budget: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +46,7 @@ struct ProbeSharedContext {
     aggressive_root: bool,
     privileged_probes: bool,
     max_retries: u8,
+    fingerprint_payload_budget: usize,
     services: Arc<ServiceRegistry>,
     fingerprint_db: Arc<FingerprintDatabase>,
 }
@@ -67,6 +68,7 @@ struct UdpProbeRequest {
 struct DetectionEvidence {
     banner: Option<String>,
     service: Option<String>,
+    service_identity: Option<ServiceIdentity>,
     matched_by: Option<String>,
     confidence: Option<f32>,
 }
@@ -349,21 +351,13 @@ async fn scan_tcp(config: &AsyncScanConfig, services: Arc<ServiceRegistry>) -> V
     ));
     let mut in_flight = FuturesUnordered::new();
     let mut findings = Vec::with_capacity(config.ports.len());
-    let control = Arc::new(Mutex::new(AdaptiveProbeController::new(
-        config.timeout,
-        config.concurrency,
-    )));
+    let mut control = AdaptiveProbeController::new(config.timeout, config.concurrency);
     let mut governor = RateGovernor::new(config.rate_limit_pps, config.burst_size);
 
     while !queue.is_empty() || !in_flight.is_empty() {
-        let (max_window, timeout_value, dispatch_delay) = {
-            let state = control.lock().await;
-            (
-                state.current_window().max(1),
-                state.current_timeout(),
-                state.dispatch_delay(config.dispatch_delay),
-            )
-        };
+        let max_window = control.current_window().max(1);
+        let timeout_value = control.current_timeout();
+        let dispatch_delay = control.dispatch_delay(config.dispatch_delay);
 
         while in_flight.len() < max_window {
             let Some(port) = queue.pop_front() else {
@@ -380,21 +374,22 @@ async fn scan_tcp(config: &AsyncScanConfig, services: Arc<ServiceRegistry>) -> V
                     aggressive_root: config.aggressive_root,
                     privileged_probes: config.privileged_probes,
                     max_retries: config.max_retries,
+                    fingerprint_payload_budget: config.fingerprint_payload_budget,
                     services: services.clone(),
                     fingerprint_db: config.fingerprint_db.clone(),
                 },
             };
 
-            in_flight.push(tokio::spawn(async move { scan_one_tcp(request).await }));
+            in_flight.push(scan_one_tcp(request));
 
             if !dispatch_delay.is_zero() {
                 tokio::time::sleep(dispatch_delay).await;
             }
         }
 
-        if let Some(Ok(finding)) = in_flight.next().await {
+        if let Some(finding) = in_flight.next().await {
             let feedback = classify_feedback(&finding);
-            control.lock().await.observe(feedback);
+            control.observe(feedback);
             governor.observe(feedback);
             findings.push(finding);
         }
@@ -410,21 +405,13 @@ async fn scan_udp(config: &AsyncScanConfig, services: Arc<ServiceRegistry>) -> V
     ));
     let mut in_flight = FuturesUnordered::new();
     let mut findings = Vec::with_capacity(config.ports.len());
-    let control = Arc::new(Mutex::new(AdaptiveProbeController::new(
-        config.timeout,
-        config.concurrency,
-    )));
+    let mut control = AdaptiveProbeController::new(config.timeout, config.concurrency);
     let mut governor = RateGovernor::new(config.rate_limit_pps, config.burst_size);
 
     while !queue.is_empty() || !in_flight.is_empty() {
-        let (max_window, timeout_value, dispatch_delay) = {
-            let state = control.lock().await;
-            (
-                state.current_window().max(1),
-                state.current_timeout(),
-                state.dispatch_delay(config.dispatch_delay),
-            )
-        };
+        let max_window = control.current_window().max(1);
+        let timeout_value = control.current_timeout();
+        let dispatch_delay = control.dispatch_delay(config.dispatch_delay);
 
         while in_flight.len() < max_window {
             let Some(port) = queue.pop_front() else {
@@ -440,21 +427,22 @@ async fn scan_udp(config: &AsyncScanConfig, services: Arc<ServiceRegistry>) -> V
                     aggressive_root: config.aggressive_root,
                     privileged_probes: config.privileged_probes,
                     max_retries: config.max_retries,
+                    fingerprint_payload_budget: config.fingerprint_payload_budget,
                     services: services.clone(),
                     fingerprint_db: config.fingerprint_db.clone(),
                 },
             };
 
-            in_flight.push(tokio::spawn(async move { scan_one_udp(request).await }));
+            in_flight.push(scan_one_udp(request));
 
             if !dispatch_delay.is_zero() {
                 tokio::time::sleep(dispatch_delay).await;
             }
         }
 
-        if let Some(Ok(finding)) = in_flight.next().await {
+        if let Some(finding) = in_flight.next().await {
             let feedback = classify_feedback(&finding);
-            control.lock().await.observe(feedback);
+            control.observe(feedback);
             governor.observe(feedback);
             findings.push(finding);
         }
@@ -557,6 +545,7 @@ async fn scan_one_tcp(request: TcpProbeRequest) -> PortFinding {
         aggressive_root,
         privileged_probes,
         max_retries,
+        fingerprint_payload_budget,
         services,
         fingerprint_db,
     } = shared;
@@ -567,12 +556,14 @@ async fn scan_one_tcp(request: TcpProbeRequest) -> PortFinding {
         protocol: "tcp".to_string(),
         state: PortState::Filtered,
         service: initial_service.clone(),
+        service_identity: None,
         banner: None,
         reason: "no response".to_string(),
         matched_by: initial_service
             .as_ref()
             .map(|_| "nmap-services-port-map".to_string()),
         confidence: initial_service.as_ref().map(|_| 0.46),
+        vulnerability_hints: Vec::new(),
         educational_note: None,
         latency_ms: None,
         explanation: None,
@@ -668,6 +659,7 @@ async fn scan_one_tcp(request: TcpProbeRequest) -> PortFinding {
                 timeout_value,
                 fingerprint_db,
                 ProbeProtocol::Tcp,
+                fingerprint_payload_budget,
             )
             .await;
             if evidence.banner.is_some() {
@@ -675,6 +667,9 @@ async fn scan_one_tcp(request: TcpProbeRequest) -> PortFinding {
             }
             if evidence.service.is_some() {
                 finding.service = evidence.service;
+            }
+            if evidence.service_identity.is_some() {
+                finding.service_identity = evidence.service_identity;
             }
             if evidence.matched_by.is_some() {
                 finding.matched_by = evidence.matched_by;
@@ -696,6 +691,7 @@ async fn scan_one_udp(request: UdpProbeRequest) -> PortFinding {
         aggressive_root,
         privileged_probes,
         max_retries,
+        fingerprint_payload_budget,
         services,
         fingerprint_db,
     } = shared;
@@ -706,12 +702,14 @@ async fn scan_one_udp(request: UdpProbeRequest) -> PortFinding {
         protocol: "udp".to_string(),
         state: PortState::OpenOrFiltered,
         service: initial_service.clone(),
+        service_identity: None,
         banner: None,
         reason: "no ICMP unreachable seen".to_string(),
         matched_by: initial_service
             .as_ref()
             .map(|_| "nmap-services-port-map".to_string()),
         confidence: initial_service.as_ref().map(|_| 0.43),
+        vulnerability_hints: Vec::new(),
         educational_note: None,
         latency_ms: None,
         explanation: None,
@@ -733,7 +731,8 @@ async fn scan_one_udp(request: UdpProbeRequest) -> PortFinding {
     }
 
     let start = Instant::now();
-    let mut payloads = fingerprint_db.payloads_for(ProbeProtocol::Udp, port, 2);
+    let mut payloads =
+        fingerprint_db.payloads_for(ProbeProtocol::Udp, port, fingerprint_payload_budget.max(1));
     if payloads.is_empty() {
         payloads.push(vec![0x00]);
     }
@@ -754,6 +753,7 @@ async fn scan_one_udp(request: UdpProbeRequest) -> PortFinding {
 
             if let Some(matched) = fingerprint_db.match_banner(ProbeProtocol::Udp, port, &buffer) {
                 finding.service = Some(matched.service);
+                finding.service_identity = Some(matched.identity);
                 finding.matched_by = Some(if matched.soft {
                     format!("fingerprint-soft:{}", matched.source)
                 } else {
@@ -822,6 +822,7 @@ async fn scan_one_udp(request: UdpProbeRequest) -> PortFinding {
                     fingerprint_db.match_banner(ProbeProtocol::Udp, port, &buffer)
                 {
                     finding.service = Some(matched.service);
+                    finding.service_identity = Some(matched.identity);
                     finding.matched_by = Some(if matched.soft {
                         format!("fingerprint-soft:{}", matched.source)
                     } else {
@@ -975,15 +976,18 @@ async fn attempt_banner_and_fingerprint(
     timeout_value: Duration,
     fingerprint_db: Arc<FingerprintDatabase>,
     protocol: ProbeProtocol,
+    fingerprint_payload_budget: usize,
 ) -> DetectionEvidence {
     let mut best_banner = None;
 
     if let Some(raw) = read_response(stream, Duration::from_millis(220)).await {
-        best_banner = Some(sanitize_banner(&raw));
+        let banner_text = sanitize_banner(&raw);
+        best_banner = Some(banner_text);
         if let Some(matched) = fingerprint_db.match_banner(protocol, port, &raw) {
             return DetectionEvidence {
                 banner: best_banner,
                 service: Some(matched.service),
+                service_identity: Some(matched.identity),
                 matched_by: Some(if matched.soft {
                     format!("fingerprint-soft:{}", matched.source)
                 } else {
@@ -994,7 +998,17 @@ async fn attempt_banner_and_fingerprint(
         }
     }
 
-    let mut payloads = fingerprint_db.payloads_for(protocol, port, 4);
+    if fingerprint_payload_budget == 0 {
+        return DetectionEvidence {
+            banner: best_banner,
+            service: None,
+            service_identity: None,
+            matched_by: None,
+            confidence: None,
+        };
+    }
+
+    let mut payloads = fingerprint_db.payloads_for(protocol, port, fingerprint_payload_budget);
     if payloads.is_empty() {
         payloads.push(default_probe_payload(port));
     }
@@ -1018,6 +1032,7 @@ async fn attempt_banner_and_fingerprint(
                 return DetectionEvidence {
                     banner: Some(banner_text),
                     service: Some(matched.service),
+                    service_identity: Some(matched.identity),
                     matched_by: Some(if matched.soft {
                         format!("fingerprint-soft:{}", matched.source)
                     } else {
@@ -1027,10 +1042,11 @@ async fn attempt_banner_and_fingerprint(
                 };
             }
 
-            if let Some(heuristic) = infer_service_from_banner(&raw) {
+            if let Some(heuristic) = infer_service_from_sanitized_banner(&banner_text) {
                 return DetectionEvidence {
                     banner: Some(banner_text),
                     service: Some(heuristic),
+                    service_identity: None,
                     matched_by: Some("banner-heuristic".to_string()),
                     confidence: Some(0.57),
                 };
@@ -1041,6 +1057,7 @@ async fn attempt_banner_and_fingerprint(
     DetectionEvidence {
         banner: best_banner,
         service: None,
+        service_identity: None,
         matched_by: None,
         confidence: None,
     }
@@ -1066,8 +1083,8 @@ fn default_probe_payload(port: u16) -> Vec<u8> {
     }
 }
 
-fn infer_service_from_banner(raw: &[u8]) -> Option<String> {
-    let banner = sanitize_banner(raw).to_ascii_lowercase();
+fn infer_service_from_sanitized_banner(banner: &str) -> Option<String> {
+    let banner = banner.to_ascii_lowercase();
     if banner.contains("ssh-") {
         return Some("ssh".to_string());
     }
@@ -1092,16 +1109,32 @@ fn infer_service_from_banner(raw: &[u8]) -> Option<String> {
     None
 }
 
+fn infer_service_from_banner(raw: &[u8]) -> Option<String> {
+    let banner = sanitize_banner(raw);
+    infer_service_from_sanitized_banner(&banner)
+}
+
 fn sanitize_banner(raw: &[u8]) -> String {
-    let mut out = String::with_capacity(raw.len());
+    let mut out = String::with_capacity(raw.len().min(220));
+    let mut last_was_space = false;
     for byte in raw.iter().copied().take(220) {
         if byte.is_ascii_graphic() || byte == b' ' {
-            out.push(char::from(byte));
-        } else if byte == b'\r' || byte == b'\n' || byte == b'\t' {
+            let ch = char::from(byte);
+            if ch == ' ' {
+                if !last_was_space {
+                    out.push(' ');
+                    last_was_space = true;
+                }
+            } else {
+                out.push(ch);
+                last_was_space = false;
+            }
+        } else if (byte == b'\r' || byte == b'\n' || byte == b'\t') && !last_was_space {
             out.push(' ');
+            last_was_space = true;
         }
     }
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
+    out.trim().to_string()
 }
 
 #[cfg(test)]

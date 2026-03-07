@@ -4,6 +4,7 @@
 
 use crate::error::{NProbeError, NProbeResult};
 use crate::models::ScanReport;
+use crate::output::{service_detail_lines, service_label};
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]
@@ -14,6 +15,7 @@ struct Row {
     protocol: String,
     state: String,
     service: String,
+    service_details: String,
     reason: String,
     matched_by: String,
     confidence: String,
@@ -34,8 +36,10 @@ pub fn render(report: &ScanReport) -> NProbeResult<String> {
                 state: port.state.to_string(),
                 service: port
                     .service
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string()),
+                    .as_ref()
+                    .map(|_| service_label(port))
+                    .unwrap_or_else(|| service_label(port)),
+                service_details: service_detail_lines(port).join(" | "),
                 reason: port.reason.clone(),
                 matched_by: port
                     .matched_by

@@ -60,4 +60,48 @@ impl NProbeError {
             }
         }
     }
+
+    pub fn friendly_title(&self) -> &'static str {
+        match self {
+            NProbeError::Cli(_) | NProbeError::Parse(_) => {
+                "NProbe-RS paused before starting the scan."
+            }
+            NProbeError::Safety(_) => {
+                "NProbe-RS stopped this run to protect the target, the network, or your system."
+            }
+            NProbeError::Config(_) => {
+                "NProbe-RS could not use part of its saved configuration or runtime state."
+            }
+            NProbeError::Io(_) | NProbeError::Csv(_) | NProbeError::Json(_) => {
+                "NProbe-RS hit an environment or data problem while working."
+            }
+            NProbeError::Lua(_) => "A script component failed while the framework was running.",
+            NProbeError::Join(_) => {
+                "A background task stopped unexpectedly while the framework was running."
+            }
+        }
+    }
+
+    pub fn friendly_detail(&self) -> String {
+        match self {
+            NProbeError::Io(message) => format!("I/O detail: {message}"),
+            NProbeError::Csv(message) => format!("CSV detail: {message}"),
+            NProbeError::Json(message) => format!("JSON detail: {message}"),
+            NProbeError::Lua(message) => format!("Lua detail: {message}"),
+            NProbeError::Join(message) => format!("Task detail: {message}"),
+            NProbeError::Cli(message)
+            | NProbeError::Parse(message)
+            | NProbeError::Safety(message)
+            | NProbeError::Config(message) => message.clone(),
+        }
+    }
+
+    pub fn user_message(&self) -> String {
+        format!(
+            "{}\nWhat went wrong: {}\nWhat you can do next: {}.",
+            self.friendly_title(),
+            self.friendly_detail(),
+            self.recovery_hint()
+        )
+    }
 }

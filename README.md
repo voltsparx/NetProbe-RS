@@ -4,7 +4,8 @@
 
 It reimplements proven network scanning concepts with a modern, safe architecture while helping users understand *why* results matter — not just what was found.
 
-**Version**: v1.3  <br>
+**Version**: v4.5 "Rusty Nail"  <br>
+**Edition**: 2026 Edition  <br>
 **Author**: voltsparx  <br>
 **Contact**: voltsparx@gmail.com
 
@@ -38,6 +39,24 @@ Instead of only reporting open ports, it explains findings, highlights risks, an
 - 🔐 Auto privilege elevation for root-required scan modes (sudo/su/doas where available)  
 - 📱 Termux/mobile-friendly presets  
 - ⚙️ Persistent configuration & last-run metadata  
+
+---
+
+## 📚 Scan Types
+
+- `phantom`: device-check first touch that decides safe rate, delay, and follow-up depth
+- `kis`: cautious identity hints using low-impact timing observation
+- `sar`: response-shape observation that studies how the target reacts under low pressure
+
+Overview and detailed docs:
+
+- [Scan Types Overview](docs/scan-types-overview.md)
+- [Phantom Scan](docs/phantom-scan.md)
+- [KIS Scan](docs/kis-scan.md)
+- [SAR Scan](docs/sar-scan.md)
+- [TBNS Family](docs/tbns.md)
+- [Service Detection Intelligence](docs/service-detection-intelligence.md)
+- [Service Knowledge Architecture](docs/service-knowledge-architecture.md)
 
 ---
 
@@ -155,6 +174,8 @@ Cross-platform install scripts are provided in `building-scripts/`:
 ### Linux/macOS
 ```bash
 ./building-scripts/install.sh             # prompt mode
+./building-scripts/install.sh deps
+./building-scripts/install.sh install --install-deps
 ./building-scripts/install.sh install
 ./building-scripts/install.sh update
 ./building-scripts/install.sh test
@@ -170,6 +191,8 @@ Cross-platform install scripts are provided in `building-scripts/`:
 ### Windows PowerShell
 ```powershell
 .\building-scripts\install.ps1             # prompt mode
+.\building-scripts\install.ps1 deps
+.\building-scripts\install.ps1 install -InstallDeps
 .\building-scripts\install.ps1 install
 .\building-scripts\install.ps1 update
 .\building-scripts\install.ps1 test

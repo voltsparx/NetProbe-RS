@@ -1,6 +1,6 @@
 # SAR Scan
 
-`sar` is a low-impact observation profile for response-shape and timing-delta analysis.
+`sar` is a low-impact observation profile in the `TBNS` family for response-shape and timing-delta analysis.
 
 What it means:
 

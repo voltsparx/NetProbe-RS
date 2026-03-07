@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{NProbeError, NProbeResult};
 use crate::models::{ScanProfile, ScanReport, ScanRequest};
+use crate::platform::sql_persistence;
+use crate::reporter::actionable::ActionableSeverity;
 
 const CONFIG_DIR_NAME: &str = ".nprobe-rs-config";
 const CONFIG_FILE_NAME: &str = "config.ini";
@@ -84,10 +86,34 @@ pub struct ScanSessionRecord {
     pub host_count: Option<usize>,
     pub responded_hosts: Option<usize>,
     pub duration_ms: Option<i64>,
+    #[serde(default)]
+    pub host_snapshot_count: Option<usize>,
     pub failure_category: Option<String>,
     pub recovery_hint: Option<String>,
     #[serde(default)]
     pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActionableDiffItem {
+    pub ip: String,
+    pub target: String,
+    pub issue: String,
+    pub severity_before: Option<ActionableSeverity>,
+    pub severity_after: Option<ActionableSeverity>,
+    pub action_before: Option<String>,
+    pub action_after: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionActionableDiff {
+    pub older: ScanSessionRecord,
+    pub newer: ScanSessionRecord,
+    pub added: Vec<ActionableDiffItem>,
+    pub resolved: Vec<ActionableDiffItem>,
+    pub escalated: Vec<ActionableDiffItem>,
+    pub reduced: Vec<ActionableDiffItem>,
+    pub unchanged: usize,
 }
 
 impl ScanSessionStatus {
@@ -149,6 +175,7 @@ impl ScanSessionRecord {
             host_count: None,
             responded_hosts: None,
             duration_ms: None,
+            host_snapshot_count: None,
             failure_category: None,
             recovery_hint: None,
             notes: Vec::new(),
@@ -248,6 +275,7 @@ pub fn init_and_update(request: &ScanRequest) -> NProbeResult<PathBuf> {
     let config_dir = resolve_config_dir()?;
     fs::create_dir_all(&config_dir)?;
     let config_path = config_dir.join(CONFIG_FILE_NAME);
+    let db_path = sql_persistence::database_path(&config_dir);
 
     let mut kv = if config_path.exists() {
         load_ini_map(&config_path)?
@@ -257,6 +285,8 @@ pub fn init_and_update(request: &ScanRequest) -> NProbeResult<PathBuf> {
 
     update_runtime_values(&mut kv, request);
     write_ini_map(&config_path, &kv)?;
+    let updated_at = Utc::now().to_rfc3339();
+    sql_persistence::upsert_runtime_kv_bulk(&db_path, kv.iter(), &updated_at)?;
 
     Ok(config_path)
 }
@@ -278,7 +308,16 @@ pub fn list_scan_sessions(limit: usize) -> NProbeResult<Vec<ScanSessionRecord>> 
         return Ok(Vec::new());
     }
 
-    let session_dir = resolve_config_dir()?.join(SESSION_DIR_NAME);
+    let config_dir = resolve_config_dir()?;
+    let db_path = sql_persistence::database_path(&config_dir);
+    if db_path.exists() {
+        let records = sql_persistence::list_sessions(&db_path, limit)?;
+        if !records.is_empty() {
+            return Ok(records);
+        }
+    }
+
+    let session_dir = config_dir.join(SESSION_DIR_NAME);
     if !session_dir.exists() {
         return Ok(Vec::new());
     }
@@ -313,6 +352,13 @@ pub fn list_scan_sessions(limit: usize) -> NProbeResult<Vec<ScanSessionRecord>> 
 }
 
 pub fn load_scan_session(session_id: &str) -> NProbeResult<Option<ScanSessionRecord>> {
+    let db_path = sql_persistence::database_path(&resolve_config_dir()?);
+    if db_path.exists() {
+        if let Some(record) = sql_persistence::load_session(&db_path, session_id)? {
+            return Ok(Some(record));
+        }
+    }
+
     let session_path = session_file_path(session_id)?;
     if !session_path.exists() {
         return Ok(None);
@@ -326,6 +372,78 @@ pub fn load_scan_session(session_id: &str) -> NProbeResult<Option<ScanSessionRec
         ))
     })?;
     Ok(Some(record))
+}
+
+pub fn diff_session_actionables(
+    older_session_id: &str,
+    newer_session_id: &str,
+) -> NProbeResult<SessionActionableDiff> {
+    let older = load_scan_session(older_session_id)?
+        .ok_or_else(|| NProbeError::Cli(format!("session '{older_session_id}' was not found")))?;
+    let newer = load_scan_session(newer_session_id)?
+        .ok_or_else(|| NProbeError::Cli(format!("session '{newer_session_id}' was not found")))?;
+
+    let db_path = sql_persistence::database_path(&resolve_config_dir()?);
+    if !db_path.exists() {
+        return Err(NProbeError::Config(
+            "sqlite persistence database is missing; no actionable diff data is available"
+                .to_string(),
+        ));
+    }
+
+    let older_records = sql_persistence::load_actionable_snapshots(&db_path, older_session_id)?;
+    let newer_records = sql_persistence::load_actionable_snapshots(&db_path, newer_session_id)?;
+
+    let older_map = older_records
+        .into_iter()
+        .map(|record| ((record.ip.clone(), record.issue.clone()), record))
+        .collect::<BTreeMap<_, _>>();
+    let newer_map = newer_records
+        .into_iter()
+        .map(|record| ((record.ip.clone(), record.issue.clone()), record))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut added = Vec::new();
+    let mut resolved = Vec::new();
+    let mut escalated = Vec::new();
+    let mut reduced = Vec::new();
+    let mut unchanged = 0usize;
+
+    for (key, newer_record) in &newer_map {
+        match older_map.get(key) {
+            None => added.push(diff_item(None, Some(newer_record))),
+            Some(older_record) => {
+                if newer_record.severity.rank() > older_record.severity.rank() {
+                    escalated.push(diff_item(Some(older_record), Some(newer_record)));
+                } else if newer_record.severity.rank() < older_record.severity.rank() {
+                    reduced.push(diff_item(Some(older_record), Some(newer_record)));
+                } else {
+                    unchanged += 1;
+                }
+            }
+        }
+    }
+
+    for (key, older_record) in &older_map {
+        if !newer_map.contains_key(key) {
+            resolved.push(diff_item(Some(older_record), None));
+        }
+    }
+
+    sort_diff_items(&mut added);
+    sort_diff_items(&mut resolved);
+    sort_diff_items(&mut escalated);
+    sort_diff_items(&mut reduced);
+
+    Ok(SessionActionableDiff {
+        older,
+        newer,
+        added,
+        resolved,
+        escalated,
+        reduced,
+        unchanged,
+    })
 }
 
 pub fn complete_scan_session(
@@ -355,6 +473,7 @@ pub fn complete_scan_session(
     record.host_count = Some(report.hosts.len());
     record.responded_hosts = Some(responded_hosts);
     record.duration_ms = Some(report.metadata.duration_ms);
+    record.host_snapshot_count = Some(report.hosts.len());
     record.failure_category = None;
     record.recovery_hint = None;
     record.notes.push(if interrupted {
@@ -379,6 +498,7 @@ pub fn fail_scan_session(
     };
     record.updated_at = Utc::now().to_rfc3339();
     record.finished_at = Some(record.updated_at.clone());
+    record.host_snapshot_count = count_host_snapshots_for_session(&record.session_id).ok();
     record.failure_category = Some(error.category().to_string());
     record.recovery_hint = Some(error.recovery_hint().to_string());
     record.notes.push(format!(
@@ -391,6 +511,13 @@ pub fn fail_scan_session(
 }
 
 pub fn load_shard_checkpoint(signature: &str) -> NProbeResult<Option<ShardCheckpointState>> {
+    let db_path = sql_persistence::database_path(&resolve_config_dir()?);
+    if db_path.exists() {
+        if let Some(state) = sql_persistence::load_checkpoint(&db_path, signature)? {
+            return Ok(Some(state));
+        }
+    }
+
     let checkpoint_path = shard_checkpoint_path(signature)?;
     if !checkpoint_path.exists() {
         return Ok(None);
@@ -432,6 +559,8 @@ pub fn save_shard_checkpoint(state: &ShardCheckpointState) -> NProbeResult<PathB
         let _ = fs::remove_file(&tmp_path);
         NProbeError::Io(err)
     })?;
+    let db_path = sql_persistence::database_path(&resolve_config_dir()?);
+    sql_persistence::save_checkpoint(&db_path, &state_to_save)?;
 
     Ok(checkpoint_path)
 }
@@ -441,7 +570,71 @@ pub fn clear_shard_checkpoint(signature: &str) -> NProbeResult<()> {
     if checkpoint_path.exists() {
         fs::remove_file(checkpoint_path)?;
     }
+    let db_path = sql_persistence::database_path(&resolve_config_dir()?);
+    if db_path.exists() {
+        sql_persistence::delete_checkpoint(&db_path, signature)?;
+    }
     Ok(())
+}
+
+pub struct HostSnapshotWriter {
+    inner: sql_persistence::HostSnapshotWriter,
+}
+
+impl HostSnapshotWriter {
+    pub fn save(
+        &mut self,
+        session_id: &str,
+        host: &crate::models::HostResult,
+        phase: &str,
+    ) -> NProbeResult<()> {
+        let updated_at = Utc::now().to_rfc3339();
+        self.inner.save(session_id, host, phase, &updated_at)
+    }
+}
+
+pub fn open_host_snapshot_writer() -> NProbeResult<HostSnapshotWriter> {
+    let db_path = sql_persistence::database_path(&resolve_config_dir()?);
+    Ok(HostSnapshotWriter {
+        inner: sql_persistence::HostSnapshotWriter::open(&db_path)?,
+    })
+}
+
+fn diff_item(
+    before: Option<&sql_persistence::ActionableSnapshotRecord>,
+    after: Option<&sql_persistence::ActionableSnapshotRecord>,
+) -> ActionableDiffItem {
+    let anchor = after
+        .or(before)
+        .expect("diff item requires at least one record");
+    ActionableDiffItem {
+        ip: anchor.ip.clone(),
+        target: anchor.target.clone(),
+        issue: anchor.issue.clone(),
+        severity_before: before.map(|record| record.severity),
+        severity_after: after.map(|record| record.severity),
+        action_before: before.map(|record| record.action.clone()),
+        action_after: after.map(|record| record.action.clone()),
+    }
+}
+
+fn sort_diff_items(items: &mut [ActionableDiffItem]) {
+    items.sort_by(|left, right| {
+        right
+            .severity_after
+            .or(right.severity_before)
+            .map(|severity| severity.rank())
+            .unwrap_or(0)
+            .cmp(
+                &left
+                    .severity_after
+                    .or(left.severity_before)
+                    .map(|severity| severity.rank())
+                    .unwrap_or(0),
+            )
+            .then_with(|| left.ip.cmp(&right.ip))
+            .then_with(|| left.issue.cmp(&right.issue))
+    });
 }
 
 fn update_runtime_values(kv: &mut BTreeMap<String, String>, request: &ScanRequest) {
@@ -567,6 +760,10 @@ fn resolve_config_dir() -> NProbeResult<PathBuf> {
     Err(NProbeError::Config(
         "could not resolve user home directory for config".to_string(),
     ))
+}
+
+pub fn config_dir() -> NProbeResult<PathBuf> {
+    resolve_config_dir()
 }
 
 fn shard_checkpoint_path(signature: &str) -> NProbeResult<PathBuf> {
@@ -722,6 +919,7 @@ fn save_scan_session(record: &ScanSessionRecord) -> NProbeResult<PathBuf> {
     let tmp_path = parent.join(format!("{}.tmp", session_file_name(&record.session_id)));
     let mut record_to_save = record.clone();
     record_to_save.updated_at = Utc::now().to_rfc3339();
+    record_to_save.host_snapshot_count = count_host_snapshots_for_session(&record.session_id).ok();
     let body = serde_json::to_string_pretty(&record_to_save)?;
     fs::write(&tmp_path, body)?;
 
@@ -732,8 +930,18 @@ fn save_scan_session(record: &ScanSessionRecord) -> NProbeResult<PathBuf> {
         let _ = fs::remove_file(&tmp_path);
         NProbeError::Io(err)
     })?;
+    let db_path = sql_persistence::database_path(&resolve_config_dir()?);
+    sql_persistence::save_session(&db_path, &record_to_save)?;
 
     Ok(session_path)
+}
+
+fn count_host_snapshots_for_session(session_id: &str) -> NProbeResult<usize> {
+    let db_path = sql_persistence::database_path(&resolve_config_dir()?);
+    if !db_path.exists() {
+        return Ok(0);
+    }
+    sql_persistence::count_host_snapshots(&db_path, session_id)
 }
 
 fn fnv1a64(bytes: &[u8]) -> u64 {

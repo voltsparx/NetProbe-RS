@@ -39,6 +39,16 @@ pub fn score_port(port: &PortFinding) -> u32 {
         }
     }
 
+    score += (port.vulnerability_hints.len() as u32 * 3).min(15);
+    if let Some(identity) = &port.service_identity {
+        if !identity.cpes.is_empty() {
+            score += 2;
+        }
+        if identity.version.is_some() {
+            score += 1;
+        }
+    }
+
     score
 }
 

@@ -4,9 +4,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use regex::bytes::{Regex, RegexBuilder};
+use regex::bytes::{Captures, Regex, RegexBuilder};
+
+use crate::models::ServiceIdentity;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeProtocol {
@@ -30,6 +32,7 @@ pub struct FingerprintMatch {
     pub source: String,
     pub soft: bool,
     pub confidence: f32,
+    pub identity: ServiceIdentity,
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +53,7 @@ struct FingerprintRule {
     ports: Vec<u16>,
     soft: bool,
     regex: Regex,
+    metadata: MatchMetadataTemplate,
 }
 
 impl FingerprintRule {
@@ -82,6 +86,17 @@ struct ProbeContext {
     ports: Vec<u16>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct MatchMetadataTemplate {
+    product: Option<String>,
+    version: Option<String>,
+    info: Option<String>,
+    hostname: Option<String>,
+    operating_system: Option<String>,
+    device_type: Option<String>,
+    cpes: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 struct RuleRelevanceBudget {
     generic_tcp_rules: usize,
@@ -107,10 +122,14 @@ impl RuleRelevanceBudget {
 
 impl FingerprintDatabase {
     pub fn load_for_ports(focus_ports: &[u16], include_udp: bool) -> Self {
-        let probes_path = Path::new("temp/nmap/nmap-service-probes");
-        let stats = count_nmap_script_assets(Path::new("temp/nmap"));
+        let nmap_root = candidate_nmap_roots()
+            .into_iter()
+            .find(|root| root.join("nmap-service-probes").exists())
+            .unwrap_or_else(|| Path::new("intel-source/nmap").to_path_buf());
+        let probes_path = nmap_root.join("nmap-service-probes");
+        let stats = count_nmap_script_assets(&nmap_root);
         let focus = focus_ports.iter().copied().collect::<HashSet<u16>>();
-        let mut db = if let Ok(content) = fs::read_to_string(probes_path) {
+        let mut db = if let Ok(content) = fs::read_to_string(&probes_path) {
             Self::from_service_probes(&content, stats.0, stats.1, &focus, include_udp)
         } else {
             Self::fallback(stats.0, stats.1)
@@ -181,24 +200,18 @@ impl FingerprintDatabase {
         banner: &[u8],
     ) -> Option<FingerprintMatch> {
         for rule in &self.hard_rules {
-            if rule.applies_to(protocol, port) && rule.regex.is_match(banner) {
-                return Some(FingerprintMatch {
-                    service: rule.service.clone(),
-                    source: rule.source.clone(),
-                    soft: false,
-                    confidence: 0.93,
-                });
+            if rule.applies_to(protocol, port) {
+                if let Some(captures) = rule.regex.captures(banner) {
+                    return Some(build_fingerprint_match(rule, captures, false));
+                }
             }
         }
 
         for rule in &self.soft_rules {
-            if rule.applies_to(protocol, port) && rule.regex.is_match(banner) {
-                return Some(FingerprintMatch {
-                    service: rule.service.clone(),
-                    source: rule.source.clone(),
-                    soft: true,
-                    confidence: 0.64,
-                });
+            if rule.applies_to(protocol, port) {
+                if let Some(captures) = rule.regex.captures(banner) {
+                    return Some(build_fingerprint_match(rule, captures, true));
+                }
             }
         }
 
@@ -470,7 +483,7 @@ fn parse_match_line(line: &str, current_probe: Option<&ProbeContext>) -> Option<
     let mut parts = rest.splitn(2, char::is_whitespace);
     let service = parts.next()?.trim().to_string();
     let matcher = parts.next()?.trim_start();
-    let (pattern, options) = extract_delimited(matcher, 'm')?;
+    let (pattern, options, trailing) = extract_delimited_with_rest(matcher, 'm')?;
     if pattern.len() > 240 || pattern_is_too_complex(&pattern) {
         return None;
     }
@@ -498,6 +511,7 @@ fn parse_match_line(line: &str, current_probe: Option<&ProbeContext>) -> Option<
         ports,
         soft,
         regex,
+        metadata: parse_match_metadata_templates(trailing),
     })
 }
 
@@ -571,6 +585,46 @@ fn push_unique_payload(bucket: &mut Vec<Vec<u8>>, payload: &[u8]) {
 }
 
 fn extract_delimited(input: &str, leader: char) -> Option<(String, String)> {
+    let (body, options, _) = extract_delimited_with_rest(input, leader)?;
+    Some((body, options))
+}
+
+fn extract_template_segment(input: &str) -> Option<(char, String, &str)> {
+    let bytes = input.as_bytes();
+    let delim = *bytes.first()? as char;
+    let mut idx = 1usize;
+    let mut escaped = false;
+    while idx < bytes.len() {
+        let b = bytes[idx];
+        if escaped {
+            escaped = false;
+            idx += 1;
+            continue;
+        }
+        if b == b'\\' {
+            escaped = true;
+            idx += 1;
+            continue;
+        }
+        if b == delim as u8 {
+            break;
+        }
+        idx += 1;
+    }
+    if idx >= bytes.len() {
+        return None;
+    }
+
+    let body = input[1..idx].to_string();
+    let rest = &input[idx + 1..];
+    let option_len = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphabetic())
+        .count();
+    Some((delim, body, &rest[option_len..]))
+}
+
+fn extract_delimited_with_rest(input: &str, leader: char) -> Option<(String, String, &str)> {
     let bytes = input.as_bytes();
     if bytes.len() < 3 || bytes[0] != leader as u8 {
         return None;
@@ -605,7 +659,273 @@ fn extract_delimited(input: &str, leader: char) -> Option<(String, String)> {
         .chars()
         .take_while(|ch| ch.is_ascii_alphabetic())
         .collect();
-    Some((body, options))
+    let trailing = &rest[options.len()..];
+    Some((body, options, trailing))
+}
+
+fn parse_match_metadata_templates(raw: &str) -> MatchMetadataTemplate {
+    let mut metadata = MatchMetadataTemplate::default();
+    let mut input = raw.trim();
+
+    while !input.is_empty() {
+        input = input.trim_start();
+        let mode_len = input
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphabetic())
+            .count();
+        if mode_len == 0 {
+            break;
+        }
+
+        let mode = &input[..mode_len];
+        let mut cursor = &input[mode_len..];
+        if mode.eq_ignore_ascii_case("cpe") && cursor.starts_with(':') {
+            cursor = &cursor[1..];
+        }
+        let Some(delim) = cursor.chars().next() else {
+            break;
+        };
+        if delim.is_ascii_whitespace() {
+            break;
+        }
+
+        let Some((_template_delim, body, trailing)) = extract_template_segment(cursor) else {
+            break;
+        };
+
+        let template = if mode.eq_ignore_ascii_case("cpe") {
+            format!("cpe:{delim}{body}")
+        } else {
+            body
+        };
+
+        match mode {
+            "p" => metadata.product = Some(template),
+            "v" => metadata.version = Some(template),
+            "i" => metadata.info = Some(template),
+            "h" => metadata.hostname = Some(template),
+            "o" => metadata.operating_system = Some(template),
+            "d" => metadata.device_type = Some(template),
+            "cpe" => metadata.cpes.push(template),
+            _ => {}
+        }
+
+        input = trailing;
+    }
+
+    metadata
+}
+
+fn build_fingerprint_match(
+    rule: &FingerprintRule,
+    captures: Captures<'_>,
+    soft: bool,
+) -> FingerprintMatch {
+    FingerprintMatch {
+        service: rule.service.clone(),
+        source: rule.source.clone(),
+        soft,
+        confidence: if soft { 0.64 } else { 0.93 },
+        identity: ServiceIdentity {
+            product: expand_template_opt(rule.metadata.product.as_deref(), &captures),
+            version: expand_template_opt(rule.metadata.version.as_deref(), &captures),
+            info: expand_template_opt(rule.metadata.info.as_deref(), &captures),
+            hostname: expand_template_opt(rule.metadata.hostname.as_deref(), &captures),
+            operating_system: expand_template_opt(
+                rule.metadata.operating_system.as_deref(),
+                &captures,
+            ),
+            device_type: expand_template_opt(rule.metadata.device_type.as_deref(), &captures),
+            cpes: rule
+                .metadata
+                .cpes
+                .iter()
+                .filter_map(|template| expand_template_opt(Some(template.as_str()), &captures))
+                .collect(),
+        },
+    }
+}
+
+fn expand_template_opt(template: Option<&str>, captures: &Captures<'_>) -> Option<String> {
+    let template = template?;
+    let expanded = expand_template(template, captures);
+    if expanded.is_empty() {
+        None
+    } else {
+        Some(expanded)
+    }
+}
+
+fn expand_template(template: &str, captures: &Captures<'_>) -> String {
+    let bytes = template.as_bytes();
+    let mut idx = 0usize;
+    let mut out = String::new();
+
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b'\\' => {
+                if idx + 1 < bytes.len() {
+                    out.push_str(&decode_template_escape(bytes, &mut idx));
+                } else {
+                    idx += 1;
+                }
+            }
+            b'$' => {
+                if let Some((value, consumed)) = expand_template_token(&template[idx..], captures) {
+                    out.push_str(&value);
+                    idx += consumed;
+                } else {
+                    out.push('$');
+                    idx += 1;
+                }
+            }
+            other => {
+                out.push(char::from(other));
+                idx += 1;
+            }
+        }
+    }
+
+    sanitize_template_output(&out)
+}
+
+fn decode_template_escape(bytes: &[u8], idx: &mut usize) -> String {
+    let start = *idx;
+    *idx += 1;
+    if *idx >= bytes.len() {
+        return String::new();
+    }
+
+    let result = match bytes[*idx] {
+        b'r' => "\r".to_string(),
+        b'n' => "\n".to_string(),
+        b't' => "\t".to_string(),
+        b'\\' => "\\".to_string(),
+        b'/' => "/".to_string(),
+        b'x' if *idx + 2 < bytes.len() => {
+            let text = std::str::from_utf8(&bytes[*idx + 1..*idx + 3]).unwrap_or("");
+            u8::from_str_radix(text, 16)
+                .ok()
+                .map(|value| String::from_utf8_lossy(&[value]).into_owned())
+                .unwrap_or_default()
+        }
+        other => char::from(other).to_string(),
+    };
+
+    *idx = match bytes.get(start + 1) {
+        Some(b'x') if start + 3 < bytes.len() => start + 4,
+        Some(_) => start + 2,
+        None => start + 1,
+    };
+    result
+}
+
+fn expand_template_token(input: &str, captures: &Captures<'_>) -> Option<(String, usize)> {
+    let bytes = input.as_bytes();
+    if bytes.first().copied()? != b'$' {
+        return None;
+    }
+
+    if bytes.get(1).copied()?.is_ascii_digit() {
+        let digit_len = input[1..]
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .count();
+        let index = input[1..1 + digit_len].parse::<usize>().ok()?;
+        return Some((capture_as_text(captures, index), 1 + digit_len));
+    }
+
+    if let Some(token) = input.strip_prefix("$P(") {
+        let close = token.find(')')?;
+        let index = token[..close].parse::<usize>().ok()?;
+        return Some((capture_as_printable(captures, index), close + 4));
+    }
+
+    if let Some(token) = input.strip_prefix("$I(") {
+        let close = token.find(')')?;
+        let args = &token[..close];
+        let (index_raw, endian_raw) = args.split_once(',')?;
+        let index = index_raw.parse::<usize>().ok()?;
+        let endian = endian_raw.trim().trim_matches('"');
+        return Some((capture_as_integer(captures, index, endian), close + 4));
+    }
+
+    if let Some(token) = input.strip_prefix("$SUBST(") {
+        let close = token.find(')')?;
+        let args = &token[..close];
+        let mut parts = args.splitn(3, ',');
+        let index = parts.next()?.trim().parse::<usize>().ok()?;
+        let from = parts.next()?.trim().trim_matches('"');
+        let to = parts.next()?.trim().trim_matches('"');
+        let value = capture_as_printable(captures, index).replace(from, to);
+        return Some((value, close + 8));
+    }
+
+    None
+}
+
+fn capture_as_text(captures: &Captures<'_>, index: usize) -> String {
+    captures
+        .get(index)
+        .map(|item| String::from_utf8_lossy(item.as_bytes()).into_owned())
+        .unwrap_or_default()
+}
+
+fn capture_as_printable(captures: &Captures<'_>, index: usize) -> String {
+    captures
+        .get(index)
+        .map(|item| sanitize_banner_like(item.as_bytes()))
+        .unwrap_or_default()
+}
+
+fn capture_as_integer(captures: &Captures<'_>, index: usize, endian: &str) -> String {
+    let Some(matched) = captures.get(index) else {
+        return String::new();
+    };
+    let bytes = matched.as_bytes();
+    if bytes.is_empty() || bytes.len() > 8 {
+        return String::new();
+    }
+
+    let value = match endian {
+        "<" => bytes.iter().enumerate().fold(0u64, |acc, (shift, byte)| {
+            acc | ((*byte as u64) << (shift * 8))
+        }),
+        _ => bytes
+            .iter()
+            .fold(0u64, |acc, byte| (acc << 8) | (*byte as u64)),
+    };
+    value.to_string()
+}
+
+fn sanitize_template_output(text: &str) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed
+        .trim_matches(|ch: char| ch == ';' || ch == ',' || ch.is_ascii_whitespace())
+        .to_string()
+}
+
+fn sanitize_banner_like(raw: &[u8]) -> String {
+    let mut out = String::with_capacity(raw.len().min(220));
+    let mut last_was_space = false;
+    for byte in raw.iter().copied().take(220) {
+        if byte.is_ascii_graphic() || byte == b' ' {
+            let ch = char::from(byte);
+            if ch == ' ' {
+                if !last_was_space {
+                    out.push(' ');
+                    last_was_space = true;
+                }
+            } else {
+                out.push(ch);
+                last_was_space = false;
+            }
+        } else if !last_was_space {
+            out.push(' ');
+            last_was_space = true;
+        }
+    }
+    out.trim().to_string()
 }
 
 fn decode_payload(raw: &[u8]) -> Vec<u8> {
@@ -726,6 +1046,13 @@ fn count_nmap_script_assets(root: &Path) -> (usize, usize) {
     (scripts, nselib)
 }
 
+fn candidate_nmap_roots() -> [PathBuf; 2] {
+    [
+        Path::new("intel-source/nmap").to_path_buf(),
+        Path::new("temp/nmap").to_path_buf(),
+    ]
+}
+
 fn count_files_with_extension(root: &Path, ext: &str) -> usize {
     let Ok(metadata) = fs::metadata(root) else {
         return 0;
@@ -760,4 +1087,48 @@ fn count_files_with_extension(root: &Path, ext: &str) -> usize {
         }
     }
     count
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_match_templates_and_cpe_metadata() {
+        let probe = ProbeContext {
+            protocol: ProbeProtocol::Tcp,
+            name: "GetRequest".to_string(),
+            payload: b"GET / HTTP/1.0\r\n\r\n".to_vec(),
+            ports: vec![80],
+        };
+        let rule = parse_match_line(
+            "match http m|^HTTP/1\\.1 200 OK\\r\\nServer: nginx/([\\d.]+)| p/nginx/ v/$1/ cpe:/a:nginx:nginx:$1/",
+            Some(&probe),
+        )
+        .expect("rule");
+
+        let captures = rule
+            .regex
+            .captures(b"HTTP/1.1 200 OK\r\nServer: nginx/1.25.3\r\n\r\n")
+            .expect("captures");
+        let matched = build_fingerprint_match(&rule, captures, false);
+
+        assert_eq!(matched.service, "http");
+        assert_eq!(matched.identity.product.as_deref(), Some("nginx"));
+        assert_eq!(matched.identity.version.as_deref(), Some("1.25.3"));
+        assert_eq!(
+            matched.identity.cpes,
+            vec!["cpe:/a:nginx:nginx:1.25.3".to_string()]
+        );
+    }
+
+    #[test]
+    fn expands_subst_and_integer_templates() {
+        let regex = RegexBuilder::new("^X(.)_(..)_$").build().expect("regex");
+        let captures = regex.captures(b"XA_12_").expect("captures");
+
+        assert_eq!(expand_template("$P(1)", &captures), "A");
+        assert_eq!(expand_template("$I(2,\">\")", &captures), "12594");
+        assert_eq!(expand_template("v$SUBST(2,\"1\",\"7\")", &captures), "v72");
+    }
 }

@@ -6,6 +6,7 @@
 param(
     [string]$Action = "",
     [string]$InstallDir = "",
+    [switch]$InstallDeps,
     [switch]$AddToPath,
     [switch]$NoPathUpdate,
     [switch]$Help
@@ -22,6 +23,7 @@ Usage:
   .\building-scripts\install.ps1 [action] [options]
 
 Actions:
+  deps               Install build dependencies when winget/choco is available
   install            Install binary to local/custom bin and optionally add PATH
   update             Rebuild and replace existing installed binary
   test               Build a test binary into build-windows\ in repo root
@@ -32,10 +34,11 @@ Prompt mode:
 
 Compatibility aliases:
   phase1 -> test, phase2 -> install, phase3 -> update, phase4 -> uninstall
-  upgrade -> update, remove -> uninstall
+  upgrade -> update, remove -> uninstall, install-deps -> deps
 
 Options:
   -InstallDir <dir>  Install/uninstall target directory
+  -InstallDeps       Install build dependencies before install/update/test
   -AddToPath         Add install dir to PATH without prompting
   -NoPathUpdate      Do not modify PATH
   -Help              Show this help
@@ -60,6 +63,8 @@ function Resolve-Action {
         "phase4" { return "uninstall" }
         "remove" { return "uninstall" }
         "uninstall" { return "uninstall" }
+        "deps" { return "deps" }
+        "install-deps" { return "deps" }
         "help" { return "help" }
         "-h" { return "help" }
         "--help" { return "help" }
@@ -74,11 +79,13 @@ function Request-Action {
         Write-Host "2) update"
         Write-Host "3) test"
         Write-Host "4) uninstall"
-        $choice = Read-Host "Choose [1/2/3/4] (default: 1)"
+        Write-Host "5) deps (prepare build dependencies)"
+        $choice = Read-Host "Choose [1/2/3/4/5] (default: 1)"
         switch ($choice) {
             "2" { return "update" }
             "3" { return "test" }
             "4" { return "uninstall" }
+            "5" { return "deps" }
             default { return "install" }
         }
     }
@@ -116,6 +123,10 @@ function Get-ReleaseBinaryPath {
 }
 
 function Build-ReleaseBinary {
+    if ($InstallDeps) {
+        Ensure-WindowsBuildDeps
+        $script:InstallDeps = $false
+    }
     $cargo = Get-Command cargo -ErrorAction SilentlyContinue
     if (-not $cargo) {
         throw "cargo was not found in PATH. Install Rust toolchain first: https://rustup.rs/"
@@ -128,6 +139,25 @@ function Build-ReleaseBinary {
     }
 
     return (Get-ReleaseBinaryPath)
+}
+
+function Ensure-WindowsBuildDeps {
+    $cargo = Get-Command cargo -ErrorAction SilentlyContinue
+    if ($cargo) {
+        Write-Host "Rust toolchain already available."
+    } elseif (Get-Command winget -ErrorAction SilentlyContinue) {
+        Write-Host "Installing Rust toolchain via winget..."
+        winget install -e --id Rustlang.Rustup --accept-package-agreements --accept-source-agreements
+    } elseif (Get-Command choco -ErrorAction SilentlyContinue) {
+        Write-Host "Installing Rust toolchain via Chocolatey..."
+        choco install -y rustup.install
+    } else {
+        throw "Neither cargo nor winget/choco is available. Install Rust from https://rustup.rs/ or install winget/choco first."
+    }
+
+    if (-not (Get-Command cargo -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.cargo\bin\cargo.exe")) {
+        $env:Path = "$HOME\.cargo\bin;$env:Path"
+    }
 }
 
 function Request-InstallDir {
@@ -313,6 +343,9 @@ if ([string]::IsNullOrWhiteSpace($normalizedAction)) {
 $pathMode = Get-PathUpdateMode
 
 switch ($normalizedAction) {
+    "deps" {
+        Ensure-WindowsBuildDeps
+    }
     "test" {
         $source = Build-ReleaseBinary
         $buildDir = Join-Path $RootDir "build-windows"

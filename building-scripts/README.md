@@ -4,6 +4,7 @@ Cross-platform lifecycle helpers for `nprobe-rs`.
 
 ## Actions
 
+- `deps`: install build dependencies on supported platforms
 - `install`: install to local/custom bin and optionally add install path to `PATH`
 - `update`: rebuild and replace installed binary
 - `test`: build release and copy test binary to `build-<os>/` in repo root
@@ -13,6 +14,8 @@ Cross-platform lifecycle helpers for `nprobe-rs`.
 
 ```bash
 ./building-scripts/install.sh             # prompt mode
+./building-scripts/install.sh deps
+./building-scripts/install.sh install --install-deps
 ./building-scripts/install.sh install
 ./building-scripts/install.sh update
 ./building-scripts/install.sh test
@@ -22,6 +25,7 @@ Cross-platform lifecycle helpers for `nprobe-rs`.
 Optional automation flags:
 
 - `--install-dir <dir>` for custom install/uninstall target
+- `--install-deps` to install supported build dependencies before install/update/test
 - `--add-to-path` to add install directory to PATH without prompting
 - `--no-path-update` to skip PATH changes
 
@@ -39,6 +43,8 @@ The Termux script installs dependencies first, then runs the same action flow as
 
 ```powershell
 .\building-scripts\install.ps1             # prompt mode
+.\building-scripts\install.ps1 deps
+.\building-scripts\install.ps1 install -InstallDeps
 .\building-scripts\install.ps1 install
 .\building-scripts\install.ps1 update
 .\building-scripts\install.ps1 test
@@ -48,6 +54,7 @@ The Termux script installs dependencies first, then runs the same action flow as
 Optional automation flags:
 
 - `-InstallDir <dir>` for custom install/uninstall target
+- `-InstallDeps` to install supported build dependencies before install/update/test
 - `-AddToPath` to add install directory to PATH without prompting
 - `-NoPathUpdate` to skip PATH changes
 - `-Help` for usage

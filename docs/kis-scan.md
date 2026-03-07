@@ -1,6 +1,6 @@
 # KIS Scan
 
-`kis` is a low-impact timing and impedance profile for cautious classification.
+`kis` is a low-impact timing and impedance profile in the `TBNS` family for cautious classification.
 
 What it means:
 

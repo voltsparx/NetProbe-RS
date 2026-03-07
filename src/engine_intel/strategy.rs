@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use crate::engines::resource_governor;
 use crate::models::{ScanProfile, ScanRequest};
 
 #[allow(dead_code)] // used only by the tests and may not be referenced in a normal build
@@ -51,6 +52,7 @@ impl ScanPersona {
 pub struct ScanStrategy {
     pub mode: ExecutionMode,
     pub persona: ScanPersona,
+    pub resource_policy: String,
     pub rate_limit_pps: u32,
     pub burst_size: usize,
     pub max_retries: u8,
@@ -74,34 +76,14 @@ pub fn plan(request: &ScanRequest, host_count: usize, port_count: usize) -> Scan
         ScanProfile::Stealth => ExecutionMode::Async,
         ScanProfile::Phantom | ScanProfile::Sar | ScanProfile::Kis => ExecutionMode::Async,
         ScanProfile::Balanced => {
-            if packet_blast_allowed && probe_volume >= 40_000 {
-                ExecutionMode::PacketBlast
-            } else if probe_volume >= 6_000 {
+            if probe_volume >= 6_000 {
                 ExecutionMode::Hybrid
             } else {
                 ExecutionMode::Async
             }
         }
-        ScanProfile::Turbo => {
-            if packet_blast_allowed && probe_volume >= 22_000 {
-                ExecutionMode::PacketBlast
-            } else {
-                ExecutionMode::Hybrid
-            }
-        }
-        ScanProfile::Aggressive => {
-            if packet_blast_allowed {
-                ExecutionMode::PacketBlast
-            } else {
-                ExecutionMode::Hybrid
-            }
-        }
-        ScanProfile::RootOnly => {
-            if packet_blast_allowed && probe_volume >= 14_000 {
-                ExecutionMode::PacketBlast
-            } else {
-                ExecutionMode::Hybrid
-            }
+        ScanProfile::Turbo | ScanProfile::Aggressive | ScanProfile::RootOnly => {
+            ExecutionMode::Hybrid
         }
     };
 
@@ -135,14 +117,14 @@ pub fn plan(request: &ScanRequest, host_count: usize, port_count: usize) -> Scan
     };
 
     let (mut rate_limit_pps, mut burst_size, mut max_retries) = match mode {
-        ExecutionMode::Async => (1_500, 32, 1),
-        ExecutionMode::Hybrid => (6_000, 96, 2),
+        ExecutionMode::Async => (2_400, 48, 1),
+        ExecutionMode::Hybrid => (9_000, 160, 2),
         ExecutionMode::PacketBlast => (80_000, 1024, 1),
     };
 
     let mut recommended_concurrency = match mode {
-        ExecutionMode::Async => 96,
-        ExecutionMode::Hybrid => 256,
+        ExecutionMode::Async => 128,
+        ExecutionMode::Hybrid => 320,
         ExecutionMode::PacketBlast => 768,
     };
     let mut recommended_timeout = match mode {
@@ -207,6 +189,11 @@ pub fn plan(request: &ScanRequest, host_count: usize, port_count: usize) -> Scan
         }
     }
 
+    let resource_plan = resource_governor::plan(request.profile, mode, host_count, port_count);
+    rate_limit_pps = rate_limit_pps.min(resource_plan.rate_cap_pps);
+    burst_size = burst_size.min(resource_plan.burst_cap);
+    recommended_concurrency = recommended_concurrency.min(resource_plan.concurrency_cap);
+
     if matches!(request.profile, ScanProfile::Stealth) {
         recommended_concurrency = recommended_concurrency.min(48);
         recommended_timeout = recommended_timeout.max(Duration::from_millis(2200));
@@ -231,6 +218,16 @@ pub fn plan(request: &ScanRequest, host_count: usize, port_count: usize) -> Scan
             request.strict_safety,
             request.service_detection
         ),
+        "defensive balance policy: packet-blast scheduling is disabled; speed comes from controlled multi-host parallelism and hybrid async execution"
+            .to_string(),
+        format!(
+            "resource governor: policy={} cpu_threads={} concurrency_cap={} rate_cap={}pps burst_cap={}",
+            resource_plan.resource_policy,
+            resource_plan.cpu_threads,
+            resource_plan.concurrency_cap,
+            resource_plan.rate_cap_pps,
+            resource_plan.burst_cap
+        ),
         format!(
             "rate target={}pps burst={} retries={}",
             rate_limit_pps, burst_size, max_retries
@@ -240,6 +237,7 @@ pub fn plan(request: &ScanRequest, host_count: usize, port_count: usize) -> Scan
     ScanStrategy {
         mode,
         persona,
+        resource_policy: resource_plan.resource_policy,
         rate_limit_pps,
         burst_size,
         max_retries,
@@ -326,13 +324,13 @@ mod tests {
     }
 
     #[test]
-    fn packet_blast_requires_privileged_low_impact_shape() {
+    fn aggressive_profiles_stay_hybrid_under_defensive_balance_policy() {
         let mut request = base_request();
         request.privileged_probes = true;
         request.service_detection = false;
         request.profile = ScanProfile::Aggressive;
         let strategy = plan(&request, 256, 1024);
-        assert_eq!(strategy.mode, ExecutionMode::PacketBlast);
+        assert_eq!(strategy.mode, ExecutionMode::Hybrid);
     }
 
     #[test]
@@ -347,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_safety_blocks_packet_blast_mode() {
+    fn strict_safety_keeps_aggressive_profiles_out_of_packet_blast_mode() {
         let mut request = base_request();
         request.strict_safety = true;
         request.profile = ScanProfile::Aggressive;

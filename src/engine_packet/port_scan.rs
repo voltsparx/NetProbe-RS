@@ -19,7 +19,9 @@ use crate::engine_packet::syn_scanner::{
     RawPortState, RawSynScanner, RawSynScannerConfig, RawTxBackend,
 };
 use crate::engines::async_engine::AsyncPacketEngine;
+use crate::engines::bio_response_governor;
 use crate::engines::fusion_engine::{FusionEngine, PacketFusionInput, PacketFusionPlan};
+use crate::engines::phantom_preflight;
 use crate::error::{NProbeError, NProbeResult};
 use crate::fingerprint_db::FingerprintDatabase;
 use crate::models::{HostResult, PortFinding, PortState, ScanRequest};
@@ -83,6 +85,11 @@ pub async fn run(
     let mut device_vendor = None::<String>;
     let base_rate_pps = request.rate_limit_pps.unwrap_or(strategy.rate_limit_pps) as u64;
     let mut rate_pps = base_rate_pps;
+    let runtime = request.runtime_settings();
+    let mut raw_worker_cap = runtime.concurrency.max(1);
+    let mut chunk_delay = runtime.delay;
+    let mut stage2_service_detection = request.service_detection;
+    let mut fingerprint_payload_budget = if stage2_service_detection { 4 } else { 0 };
     let burst_size = request.burst_size.unwrap_or(strategy.burst_size);
     let seed = request.scan_seed.unwrap_or(0x4e50_5253_5241_5753_u64);
     let source_port = source_port_from_seed(seed);
@@ -142,6 +149,67 @@ pub async fn run(
         rate_pps = 500;
     }
 
+    let bio_response = bio_response_governor::decide(
+        request.profile,
+        request.strict_safety,
+        device_profile.map(|profile| profile.class),
+        rate_pps.min(u32::MAX as u64) as u32,
+        raw_worker_cap,
+        chunk_delay,
+    );
+    if (bio_response.rate_cap_pps as u64) < rate_pps {
+        warnings.push(format!(
+            "bio-response governor applied raw rate cap: {}pps -> {}pps",
+            rate_pps, bio_response.rate_cap_pps
+        ));
+        safety_actions.push(format!(
+            "bio-response:rate-capped:{}->{}pps",
+            rate_pps, bio_response.rate_cap_pps
+        ));
+        rate_pps = bio_response.rate_cap_pps as u64;
+    }
+    if bio_response.concurrency_cap < raw_worker_cap {
+        let previous = raw_worker_cap;
+        raw_worker_cap = bio_response.concurrency_cap;
+        warnings.push(format!(
+            "bio-response governor applied raw worker cap: {} -> {}",
+            previous, raw_worker_cap
+        ));
+        safety_actions.push(format!(
+            "bio-response:concurrency-capped:{}->{}",
+            previous, raw_worker_cap
+        ));
+    }
+    if bio_response.delay_floor > chunk_delay {
+        let previous = chunk_delay;
+        chunk_delay = bio_response.delay_floor;
+        warnings.push(format!(
+            "bio-response governor raised raw chunk delay floor: {}ms -> {}ms",
+            previous.as_millis(),
+            chunk_delay.as_millis()
+        ));
+        safety_actions.push(format!(
+            "bio-response:delay-raised:{}ms->{}ms",
+            previous.as_millis(),
+            chunk_delay.as_millis()
+        ));
+    }
+    if stage2_service_detection && !bio_response.service_detection_allowed {
+        stage2_service_detection = false;
+        fingerprint_payload_budget = 0;
+        warnings.push(
+            "bio-response governor withheld deeper packet-path service detection until the host proved resilient enough for safe follow-up"
+                .to_string(),
+        );
+        safety_actions.push("bio-response:passive-stage1".to_string());
+    }
+    safety_actions.push(format!("bio-response:stage={}", bio_response.stage));
+    warnings.push(format!(
+        "bio-response governor stage={} policy active for the packet path",
+        bio_response.stage
+    ));
+    warnings.extend(bio_response.notes);
+
     let safety_blacklist = device_profile
         .map(|profile| profile.safety_blacklist.to_vec())
         .unwrap_or_default();
@@ -164,6 +232,99 @@ pub async fn run(
         .filter(|port| !safety_blacklist.contains(port))
         .map(|port| (target_v4, port))
         .collect::<Vec<_>>();
+    let preflight_ports = scan_targets
+        .iter()
+        .map(|(_, port)| *port)
+        .collect::<Vec<_>>();
+    let preflight = phantom_preflight::run(phantom_preflight::PhantomPreflightInput {
+        target,
+        ports: &preflight_ports,
+        requested_timeout: scan_timeout,
+        requested_rate_pps: rate_pps.min(u32::MAX as u64) as u32,
+        requested_concurrency: raw_worker_cap,
+        requested_delay: chunk_delay,
+        service_detection_requested: stage2_service_detection,
+        strict_safety: request.strict_safety,
+        profile: request.profile,
+        device_class: device_profile.map(|profile| profile.class),
+    })
+    .await;
+    let phantom_device_check = Some(preflight.summary());
+    warnings.push(format!(
+        "phantom preflight stage={} responsive={}/{} timeout={} avg-latency={}ms",
+        preflight.stage,
+        preflight.responsive_ports,
+        preflight.sampled_ports.len(),
+        preflight.timeout_ports,
+        preflight
+            .avg_latency_ms
+            .map(|latency| latency.to_string())
+            .unwrap_or_else(|| "n/a".to_string())
+    ));
+    safety_actions.push(format!("phantom-preflight:stage={}", preflight.stage));
+    if (preflight.rate_cap_pps as u64) < rate_pps {
+        warnings.push(format!(
+            "phantom preflight tightened raw rate cap: {}pps -> {}pps",
+            rate_pps, preflight.rate_cap_pps
+        ));
+        safety_actions.push(format!(
+            "phantom-preflight:rate-capped:{}->{}pps",
+            rate_pps, preflight.rate_cap_pps
+        ));
+        rate_pps = preflight.rate_cap_pps as u64;
+    }
+    if preflight.concurrency_cap < raw_worker_cap {
+        let previous = raw_worker_cap;
+        raw_worker_cap = preflight.concurrency_cap;
+        warnings.push(format!(
+            "phantom preflight tightened raw worker cap: {} -> {}",
+            previous, raw_worker_cap
+        ));
+        safety_actions.push(format!(
+            "phantom-preflight:concurrency-capped:{}->{}",
+            previous, raw_worker_cap
+        ));
+    }
+    if preflight.delay_floor > chunk_delay {
+        let previous = chunk_delay;
+        chunk_delay = preflight.delay_floor;
+        warnings.push(format!(
+            "phantom preflight raised raw chunk delay floor: {}ms -> {}ms",
+            previous.as_millis(),
+            chunk_delay.as_millis()
+        ));
+        safety_actions.push(format!(
+            "phantom-preflight:delay-raised:{}ms->{}ms",
+            previous.as_millis(),
+            chunk_delay.as_millis()
+        ));
+    }
+    if stage2_service_detection && !preflight.service_detection_allowed {
+        stage2_service_detection = false;
+        warnings.push(
+            "phantom preflight withheld packet-path service detection because the device-check stage did not justify deeper active follow-up"
+                .to_string(),
+        );
+        safety_actions.push("phantom-preflight:passive-follow-up".to_string());
+    }
+    let requested_payload_budget = fingerprint_payload_budget;
+    fingerprint_payload_budget = if stage2_service_detection {
+        requested_payload_budget.min(preflight.fingerprint_payload_budget)
+    } else {
+        0
+    };
+    if fingerprint_payload_budget < requested_payload_budget {
+        warnings.push(format!(
+            "phantom preflight reduced packet-path payload budget: {} -> {}",
+            requested_payload_budget, fingerprint_payload_budget
+        ));
+        safety_actions.push(format!(
+            "phantom-preflight:payload-budget:{}->{}",
+            requested_payload_budget, fingerprint_payload_budget
+        ));
+    }
+    warnings.extend(preflight.notes);
+
     let mut fusion_engine = FusionEngine::default();
     let mut feedback = AdaptiveFusionFeedback::default();
     let mut findings = Vec::<crate::engine_packet::syn_scanner::RawSynResult>::new();
@@ -189,14 +350,23 @@ pub async fn run(
         });
         last_fusion_plan = Some(fusion_plan);
 
-        let window_size = fusion_plan.window_size.min(remaining).max(1);
+        let tx_workers = fusion_plan.tx_workers.min(raw_worker_cap).max(1);
+        let window_size = fusion_plan
+            .window_size
+            .min(remaining)
+            .min(
+                tx_workers
+                    .saturating_mul(fusion_plan.tx_batch_size)
+                    .saturating_mul(4),
+            )
+            .max(1);
         let chunk_targets = scan_targets[scanned..scanned + window_size].to_vec();
         let config = RawSynScannerConfig {
             source_ip,
             source_port,
             rate_pps: fusion_plan.effective_rate_pps,
             burst_size,
-            tx_workers: fusion_plan.tx_workers,
+            tx_workers,
             tx_batch_size: fusion_plan.tx_batch_size,
             rx_grace: scan_timeout,
             scan_seed: seed,
@@ -223,7 +393,7 @@ pub async fn run(
             chunk_elapsed,
             fusion_plan.effective_rate_pps,
             scan_timeout,
-            fusion_plan.tx_workers,
+            tx_workers,
             fusion_plan.tx_batch_size,
         );
 
@@ -238,7 +408,7 @@ pub async fn run(
                 chunk_count,
                 fusion_plan.situation,
                 fusion_plan.effective_rate_pps,
-                fusion_plan.tx_workers,
+                tx_workers,
                 fusion_plan.tx_batch_size,
                 window_size,
                 fusion_plan.rate_multiplier,
@@ -246,6 +416,10 @@ pub async fn run(
                 feedback.packet_drop_ratio * 100.0,
                 feedback.timeout_pressure * 100.0
             ));
+        }
+
+        if scanned < scan_targets.len() && !chunk_delay.is_zero() {
+            tokio::time::sleep(chunk_delay).await;
         }
     }
 
@@ -300,16 +474,16 @@ pub async fn run(
 
     // Stage 2/3: async intelligence pipeline for open TCP ports only.
     let mut stage2_report = MultiStageProbeReport::default();
-    if request.service_detection
+    if stage2_service_detection
         && matches!(
             device_profile.map(|profile| profile.allows_active_fingerprinting()),
             Some(true)
         )
     {
         let stage2_concurrency = match device_profile.map(|profile| profile.class) {
-            Some(DeviceClass::FragileEmbedded) => request.runtime_settings().concurrency.min(4),
-            Some(DeviceClass::PrinterSensitive) => request.runtime_settings().concurrency.min(8),
-            _ => request.runtime_settings().concurrency,
+            Some(DeviceClass::FragileEmbedded) => raw_worker_cap.min(4),
+            Some(DeviceClass::PrinterSensitive) => raw_worker_cap.min(8),
+            _ => raw_worker_cap,
         };
         stage2_report = run_multi_stage_tcp_probe_pipeline(
             target,
@@ -323,6 +497,7 @@ pub async fn run(
                     Some(DeviceClass::FragileEmbedded) | Some(DeviceClass::PrinterSensitive)
                 ),
                 safety_blacklist: safety_blacklist.clone(),
+                payload_budget: fingerprint_payload_budget.max(1),
             },
         )
         .await;
@@ -335,6 +510,12 @@ pub async fn run(
                 stage2_concurrency
             ));
         }
+    } else if request.service_detection && !stage2_service_detection {
+        stage2_report.notes.push(
+            "stage2-intelligence skipped: Phantom device check kept the packet path in passive follow-up mode"
+                .to_string(),
+        );
+        safety_actions.push("phantom-preflight:passive-follow-up".to_string());
     } else if request.service_detection {
         stage2_report.notes.push(
             "stage2-intelligence skipped: defensive guard requires an enterprise-resilient device profile before deeper active fingerprinting"
@@ -385,6 +566,7 @@ pub async fn run(
         observed_mac,
         device_class,
         device_vendor,
+        phantom_device_check,
         safety_actions,
         warnings,
         ports: final_findings,
@@ -491,12 +673,14 @@ fn build_default_findings(ports: &[u16], services: &ServiceRegistry) -> Vec<Port
             protocol: "tcp".to_string(),
             state: PortState::Filtered,
             service: initial_service.clone(),
+            service_identity: None,
             banner: None,
             reason: "no response (raw-syn)".to_string(),
             matched_by: initial_service
                 .as_ref()
                 .map(|_| "nmap-services-port-map".to_string()),
             confidence: initial_service.as_ref().map(|_| 0.44),
+            vulnerability_hints: Vec::new(),
             educational_note: None,
             latency_ms: None,
             explanation: None,
