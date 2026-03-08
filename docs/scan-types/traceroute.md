@@ -1,7 +1,7 @@
 # Traceroute
 
-- Status: `planned`
+- Status: `partial`
 - Category: `enrichment`
 - Flags: `--traceroute`
-- Summary: path tracing is listed in the encyclopedia catalog, but is not yet a dedicated follow-up lane.
+- Summary: bounded traceroute-style follow-up is available through the fetcher plane, but it is not yet a dedicated packet-level tracing engine.
 - Canonical refs: `cooking-reverse-engineering/nmap-scan-encyclopedia.txt`

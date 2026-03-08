@@ -342,10 +342,10 @@ const SCAN_TYPES: &[ScanTypeEntry] = &[
     ScanTypeEntry {
         id: "traceroute",
         category: "enrichment",
-        status: ScanTypeStatus::Planned,
+        status: ScanTypeStatus::Partial,
         flags: &["--traceroute"],
         aliases: &["trace-route"],
-        summary: "path tracing is listed in the encyclopedia catalog, but is not yet a dedicated follow-up lane.",
+        summary: "bounded traceroute-style follow-up is available through the fetcher plane, but it does not yet provide a dedicated packet-level trace engine.",
         docs: &["cooking-reverse-engineering/nmap-scan-encyclopedia.txt"],
     },
     ScanTypeEntry {

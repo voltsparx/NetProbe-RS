@@ -193,6 +193,8 @@ pub struct ScanRequest {
     pub top_ports: Option<usize>,
     #[serde(default)]
     pub ping_scan: bool,
+    #[serde(default)]
+    pub traceroute: bool,
     pub include_udp: bool,
     pub reverse_dns: bool,
     pub service_detection: bool,
@@ -561,6 +563,7 @@ pub struct ScanRequestSummary {
     pub target: String,
     pub port_count: usize,
     pub ping_scan: bool,
+    pub traceroute: bool,
     pub include_udp: bool,
     pub explain: bool,
     pub verbose: bool,

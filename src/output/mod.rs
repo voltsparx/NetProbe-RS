@@ -108,6 +108,39 @@ pub(crate) fn open_service_inventory(host: &HostResult) -> Vec<String> {
     services
 }
 
+pub(crate) fn host_discovery_confirmed(host: &HostResult) -> bool {
+    host.ports
+        .iter()
+        .any(|port| matches!(port.state, PortState::Open | PortState::Closed))
+        || host
+            .safety_actions
+            .iter()
+            .any(|action| action == "host-discovery:confirmed-up")
+}
+
+pub(crate) fn host_discovery_evidence(host: &HostResult) -> Vec<String> {
+    let mut evidence = host
+        .insights
+        .iter()
+        .filter(|line| {
+            line.starts_with("icmp reachability confirmed")
+                || line.starts_with("arp neighbor:")
+                || line.starts_with("tcp discovery:")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    evidence.sort();
+    evidence.dedup();
+    evidence
+}
+
+pub(crate) fn host_traceroute_summary(host: &HostResult) -> Option<String> {
+    host.insights
+        .iter()
+        .find(|line| line.starts_with("traceroute:"))
+        .cloned()
+}
+
 pub(crate) fn key_issue_lines(host: &HostResult) -> Vec<String> {
     top_actionable_items(host)
         .into_iter()
@@ -179,7 +212,10 @@ pub async fn emit(
 
 #[cfg(test)]
 mod tests {
-    use super::open_service_inventory;
+    use super::{
+        host_discovery_confirmed, host_discovery_evidence, host_traceroute_summary,
+        open_service_inventory,
+    };
     use crate::models::{HostResult, PortFinding, PortState, ServiceIdentity};
 
     #[test]
@@ -259,5 +295,70 @@ mod tests {
         assert!(inventory
             .iter()
             .any(|line| line == "443/tcp https [nginx 1.25]"));
+    }
+
+    #[test]
+    fn discovery_helpers_use_safety_actions_and_insights() {
+        let host = HostResult {
+            target: "example".to_string(),
+            ip: "10.0.0.5".to_string(),
+            reverse_dns: None,
+            observed_mac: None,
+            device_class: None,
+            device_vendor: None,
+            operating_system: None,
+            phantom_device_check: None,
+            safety_actions: vec!["host-discovery:confirmed-up".to_string()],
+            warnings: Vec::new(),
+            ports: Vec::new(),
+            risk_score: 0,
+            insights: vec![
+                "icmp reachability confirmed (2.4 ms)".to_string(),
+                "tcp discovery: 10.0.0.5:80 refused a lightweight connect probe, which still confirms the host stack is reachable".to_string(),
+            ],
+            defensive_advice: Vec::new(),
+            learning_notes: Vec::new(),
+            lua_findings: Vec::new(),
+        };
+
+        assert!(host_discovery_confirmed(&host));
+        let evidence = host_discovery_evidence(&host);
+        assert_eq!(evidence.len(), 2);
+        assert!(evidence
+            .iter()
+            .any(|line| line.starts_with("icmp reachability confirmed")));
+        assert!(evidence
+            .iter()
+            .any(|line| line.starts_with("tcp discovery:")));
+    }
+
+    #[test]
+    fn traceroute_helper_surfaces_prefixed_insight() {
+        let host = HostResult {
+            target: "example".to_string(),
+            ip: "10.0.0.9".to_string(),
+            reverse_dns: None,
+            observed_mac: None,
+            device_class: None,
+            device_vendor: None,
+            operating_system: None,
+            phantom_device_check: None,
+            safety_actions: Vec::new(),
+            warnings: Vec::new(),
+            ports: Vec::new(),
+            risk_score: 0,
+            insights: vec![
+                "traceroute: observed 3 hop(s) toward 10.0.0.9 via 10.0.0.1 -> 10.0.0.9"
+                    .to_string(),
+            ],
+            defensive_advice: Vec::new(),
+            learning_notes: Vec::new(),
+            lua_findings: Vec::new(),
+        };
+
+        assert_eq!(
+            host_traceroute_summary(&host).as_deref(),
+            Some("traceroute: observed 3 hop(s) toward 10.0.0.9 via 10.0.0.1 -> 10.0.0.9")
+        );
     }
 }

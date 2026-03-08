@@ -401,6 +401,7 @@ mod tests {
             ports: vec![22, 80, 443],
             top_ports: None,
             ping_scan: false,
+            traceroute: false,
             include_udp: false,
             reverse_dns: false,
             service_detection: true,
@@ -520,6 +521,9 @@ mod tests {
         let strategy = plan(&request, 32, 128);
         assert!(strategy.rate_limit_pps >= 4_000);
         assert!(strategy.recommended_timeout <= Duration::from_millis(900));
-        assert!(strategy.notes.iter().any(|note| note.contains("timing template=T4")));
+        assert!(strategy
+            .notes
+            .iter()
+            .any(|note| note.contains("timing template=T4")));
     }
 }

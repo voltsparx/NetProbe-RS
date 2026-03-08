@@ -5,8 +5,9 @@
 
 use crate::models::ScanReport;
 use crate::output::{
-    actionable_summary_line, good_next_steps, host_os_profile, phantom_device_check_summary,
-    service_detail_lines, service_label, top_actionable_items,
+    actionable_summary_line, good_next_steps, host_discovery_confirmed, host_discovery_evidence,
+    host_os_profile, host_traceroute_summary, phantom_device_check_summary, service_detail_lines,
+    service_label, top_actionable_items,
 };
 
 pub fn render(report: &ScanReport) -> String {
@@ -55,6 +56,16 @@ pub fn render(report: &ScanReport) -> String {
         } else {
             "off"
         }
+    ));
+    html.push_str(&format!(
+        "<div class=\"meta\">Request mode: ping-scan={} | traceroute={} | timing={}</div>",
+        report.request.ping_scan,
+        report.request.traceroute,
+        esc(&report
+            .request
+            .timing_template
+            .map(|level| format!("T{}", level))
+            .unwrap_or_else(|| "default".to_string()))
     ));
     html.push_str(&format!(
         "<div class=\"meta\">Async tasks: {} | Thread tasks: {} | Parallel tasks: {} | Lua hooks: {} | Integrity: {} ({})</div>",
@@ -219,6 +230,24 @@ pub fn render(report: &ScanReport) -> String {
                     .map(|budget| budget.to_string())
                     .unwrap_or_else(|| "n/a".to_string())),
                 if summary.passive_follow_up { "yes" } else { "no" }
+            ));
+        }
+        html.push_str(&format!(
+            "<div class=\"meta\">Discovery confirmed: {}</div>",
+            host_discovery_confirmed(host)
+        ));
+        let discovery_evidence = host_discovery_evidence(host);
+        if !discovery_evidence.is_empty() {
+            html.push_str("<h3>Discovery Evidence</h3><ul>");
+            for line in &discovery_evidence {
+                html.push_str(&format!("<li>{}</li>", esc(line)));
+            }
+            html.push_str("</ul>");
+        }
+        if let Some(traceroute) = host_traceroute_summary(host) {
+            html.push_str(&format!(
+                "<div class=\"meta\">Path trace: {}</div>",
+                esc(&traceroute)
             ));
         }
         if let Some(summary) = actionable_summary_line(host) {

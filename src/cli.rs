@@ -146,6 +146,13 @@ struct ScanArgs {
     ping_scan: bool,
 
     #[arg(
+        long = "traceroute",
+        visible_alias = "trace-route",
+        help = "Run a bounded follow-up path trace after positive host evidence (Nmap: --traceroute)"
+    )]
+    traceroute: bool,
+
+    #[arg(
         short = 'U',
         long = "udp",
         visible_aliases = ["sU", "udp-scan"],
@@ -627,7 +634,7 @@ pub fn maybe_render_quick_help_mode() -> Option<String> {
     }
 
     Some(
-        "Usage:\n  nprobe-rs <target> [options]\n  nprobe-rs interactive\n  nprobe-rs integrity [--reseal]\n  nprobe-rs sessions [--limit N]\n  nprobe-rs sessions --show <session-id>\n  nprobe-rs sessions --diff <older-session-id> <newer-session-id>\n\nCommon options:\n  -p, --ports <list|range>   Select ports (example: -p 22,80,443)\n      --all-ports            Scan ports 1-65535 (Nmap: -p-)\n      --ping-scan            Discovery-only host up check (Nmap: -sn)\n  -U, --udp                  Enable UDP probes (Nmap: -sU)\n  -S, --syn                  Enable privileged TCP probes (Nmap: -sS)\n      --connect              Force user-space TCP connect scanning (Nmap: -sT)\n      --service-detect       Enable banner/service detection (Nmap: -sV, Masscan: --banners)\n      --os-detect            Bias toward richer passive OS correlation (Nmap: -O)\n      --arp                  Enable ARP neighbor discovery (local IPv4)\n      --callback-ping        Record guarded post-discovery callback notes\n      --phantom/--sar/--kis  TBNS defensive scan concepts\n      --idf/--mirror         Additional defensive scan concepts\n      --hybrid               Controlled masscan+nmap fusion mode\n  -A, --aggressive           Aggressive mode (Nmap: -A)\n  -w, --timeout-ms <ms>      Probe timeout in milliseconds\n      --rate [num]           Stabilized raw/firehose target in packets per second (bare flag = 100)\n      --gpu-rate [num]       GPU/parallel crafter ceiling in packets per second (bare flag = 100)\n      --gpu-burst <num>      GPU/parallel crafter burst ceiling\n      --gpu-timestamp        Timestamp-pace the GPU/fused packet scheduler\n      --gpu-schedule-random  Randomize GPU/fused packet scheduling order\n      --assess-hardware      Assess local hardware and print safe raw/GPU ceilings only\n      --override-mode        Ask for explicit confirmations, then bypass adaptive throttles and emergency brakes\n      --scan-type [name]     List framework scan types, or query one specific type\n      --burst-size <num>     Token-bucket burst limit\n      --max-retries <num>    Adaptive retries per probe (0..20)\n      --total-shards <num>   Total shard count for distributed scans\n      --shard-index <num>    Current shard index (requires total-shards)\n      --scan-seed <num>      Deterministic port shuffle seed\n      --resume               Resume from shard checkpoint\n      --fresh-scan           Ignore/reset shard checkpoint for this run\n  -r, --reverse-dns          Enable reverse DNS lookups\n  -n, --no-dns               Disable reverse DNS lookups\n  -e, --explain              Add concise per-port rationale in output\n  -v, --verbose              Show full output sections\n  -f, --file-type <type>     Export format: txt|json|html|csv\n  -o, --output <name>        Output filename\n  -L, --location <dir>       Output directory\n\nLearner mode:\n  nprobe-rs interactive      Guided prompt mode with banner and safe defaults\n  nprobe-rs learn            Alias for interactive mode\n\nScan type catalog:\n  nprobe-rs --scan-type\n  nprobe-rs --scan-type zombie\n  nprobe-rs --scan-type -sI\n\nIntegrity:\n  nprobe-rs integrity\n  nprobe-rs integrity --reseal\n\nSession history:\n  nprobe-rs sessions --limit 20\n  nprobe-rs sessions --show <session-id>\n  nprobe-rs sessions --diff <older-session-id> <newer-session-id>\n      Optional session filters: --profile <name> --updated-after <ts> --updated-before <ts>\n      Optional diff filters:    --ip <addr> --target-contains <text> --severity <level>\n      Optional diff export:     -f txt|json|html -o <name> -L <dir>\n\nNmap-style shortcuts accepted:\n  -sn  -sU  -sS  -sT  -sV  -O  -Pn  -PR  -A  -T0..-T5  -p-\n\nCatalog-only encyclopedia entries:\n  Use `nprobe-rs --scan-type <name|flag>` for scan families that are documented but not executable.\n\nFlag docs mode:\n  nprobe-rs --flag-help --scan\n  nprobe-rs --flag-help -sU\n  nprobe-rs --explain --scan   (legacy alias)\n\nCompatibility:\n  nprobe-rs scan <target> [options] still works.".to_string(),
+        "Usage:\n  nprobe-rs <target> [options]\n  nprobe-rs interactive\n  nprobe-rs integrity [--reseal]\n  nprobe-rs sessions [--limit N]\n  nprobe-rs sessions --show <session-id>\n  nprobe-rs sessions --diff <older-session-id> <newer-session-id>\n\nCommon options:\n  -p, --ports <list|range>   Select ports (example: -p 22,80,443)\n      --all-ports            Scan ports 1-65535 (Nmap: -p-)\n      --ping-scan            Discovery-only host up check (Nmap: -sn)\n  -U, --udp                  Enable UDP probes (Nmap: -sU)\n  -S, --syn                  Enable privileged TCP probes (Nmap: -sS)\n      --connect              Force user-space TCP connect scanning (Nmap: -sT)\n      --service-detect       Enable banner/service detection (Nmap: -sV, Masscan: --banners)\n      --os-detect            Bias toward richer passive OS correlation (Nmap: -O)\n      --arp                  Enable ARP neighbor discovery (local IPv4)\n      --traceroute           Run a bounded follow-up path trace after positive host evidence\n      --callback-ping        Record guarded post-discovery callback notes\n      --phantom/--sar/--kis  TBNS defensive scan concepts\n      --idf/--mirror         Additional defensive scan concepts\n      --hybrid               Controlled masscan+nmap fusion mode\n  -A, --aggressive           Aggressive mode (Nmap: -A)\n  -w, --timeout-ms <ms>      Probe timeout in milliseconds\n      --rate [num]           Stabilized raw/firehose target in packets per second (bare flag = 100)\n      --gpu-rate [num]       GPU/parallel crafter ceiling in packets per second (bare flag = 100)\n      --gpu-burst <num>      GPU/parallel crafter burst ceiling\n      --gpu-timestamp        Timestamp-pace the GPU/fused packet scheduler\n      --gpu-schedule-random  Randomize GPU/fused packet scheduling order\n      --assess-hardware      Assess local hardware and print safe raw/GPU ceilings only\n      --override-mode        Ask for explicit confirmations, then bypass adaptive throttles and emergency brakes\n      --scan-type [name]     List framework scan types, or query one specific type\n      --burst-size <num>     Token-bucket burst limit\n      --max-retries <num>    Adaptive retries per probe (0..20)\n      --total-shards <num>   Total shard count for distributed scans\n      --shard-index <num>    Current shard index (requires total-shards)\n      --scan-seed <num>      Deterministic port shuffle seed\n      --resume               Resume from shard checkpoint\n      --fresh-scan           Ignore/reset shard checkpoint for this run\n  -r, --reverse-dns          Enable reverse DNS lookups\n  -n, --no-dns               Disable reverse DNS lookups\n  -e, --explain              Add concise per-port rationale in output\n  -v, --verbose              Show full output sections\n  -f, --file-type <type>     Export format: txt|json|html|csv\n  -o, --output <name>        Output filename\n  -L, --location <dir>       Output directory\n\nLearner mode:\n  nprobe-rs interactive      Guided prompt mode with banner and safe defaults\n  nprobe-rs learn            Alias for interactive mode\n\nScan type catalog:\n  nprobe-rs --scan-type\n  nprobe-rs --scan-type zombie\n  nprobe-rs --scan-type -sI\n\nIntegrity:\n  nprobe-rs integrity\n  nprobe-rs integrity --reseal\n\nSession history:\n  nprobe-rs sessions --limit 20\n  nprobe-rs sessions --show <session-id>\n  nprobe-rs sessions --diff <older-session-id> <newer-session-id>\n      Optional session filters: --profile <name> --updated-after <ts> --updated-before <ts>\n      Optional diff filters:    --ip <addr> --target-contains <text> --severity <level>\n      Optional diff export:     -f txt|json|html -o <name> -L <dir>\n\nNmap-style shortcuts accepted:\n  -sn  -sU  -sS  -sT  -sV  -O  -Pn  -PR  -A  -T0..-T5  -p-\n\nCatalog-only encyclopedia entries:\n  Use `nprobe-rs --scan-type <name|flag>` for scan families that are documented but not executable.\n\nFlag docs mode:\n  nprobe-rs --flag-help --scan\n  nprobe-rs --flag-help -sU\n  nprobe-rs --explain --scan   (legacy alias)\n\nCompatibility:\n  nprobe-rs scan <target> [options] still works.".to_string(),
     )
 }
 
@@ -754,12 +761,6 @@ const CATALOGED_SCAN_GATES: &[CatalogedScanGate] = &[
         risky: false,
     },
     CatalogedScanGate {
-        token: "--traceroute",
-        scan_id: "traceroute",
-        label: "Traceroute",
-        risky: false,
-    },
-    CatalogedScanGate {
         token: "-sA",
         scan_id: "ack",
         label: "ACK Scan",
@@ -876,7 +877,7 @@ fn detect_cataloged_scan_gate(args: &[String]) -> Option<NProbeError> {
             .unwrap_or(raw.as_str());
         if let Some(gate) = CATALOGED_SCAN_GATES
             .iter()
-            .find(|candidate| candidate.token.eq_ignore_ascii_case(token))
+            .find(|candidate| candidate.token == token)
         {
             let detail = if gate.risky {
                 format!(
@@ -1038,6 +1039,9 @@ fn render_flag_explain(raw_query: Option<&str>) -> String {
             "Bias the run toward richer passive OS/profile reporting (`-O` or `--os-detect`)."
         }
         "arp" => "Enable ARP neighbor discovery for local IPv4 targets (`--arp`).",
+        "traceroute" | "trace-route" => {
+            "Run a bounded traceroute-style follow-up after positive host evidence (`--traceroute`). Aggressive mode also enables it."
+        }
         "callback" | "callbackping" | "callback-ping" | "cbping" | "cb-ping" => {
             "Add a guarded post-discovery callback note using the fetcher plane (`--callback-ping`)."
         }
@@ -1060,7 +1064,7 @@ fn render_flag_explain(raw_query: Option<&str>) -> String {
             "Select the controlled masscan+nmap fusion profile (`--hybrid` or `--masscan-hybrid`)."
         }
         "a" | "aggressive" => {
-            "Aggressive mode (`-A`): enables deeper detection and root-required probe paths."
+            "Aggressive mode (`-A`): enables deeper detection, a bounded traceroute follow-up, and root-required probe paths."
         }
         "t" | "timing" => {
             "Timing profile (`-T0`..`-T5`). NProbe-RS now preserves a dedicated timing template so scan pacing, timeout, retries, and concurrency shift even when the broader scan profile stays the same."
@@ -1292,6 +1296,7 @@ impl ScanArgs {
         let mut lab_mode = self.lab_mode;
         let mut strict_safety = self.strict_safety;
         let ping_scan = self.ping_scan;
+        let traceroute = self.traceroute || self.aggressive;
         let mut service_detection =
             self.service_detect || effective_aggressive_root || !self.no_service_detect;
         if self.os_detect {
@@ -1361,6 +1366,7 @@ impl ScanArgs {
             ports,
             top_ports,
             ping_scan,
+            traceroute,
             include_udp: !ping_scan && (self.udp || effective_aggressive_root),
             reverse_dns: self.reverse_dns && !self.no_dns,
             service_detection,
@@ -1480,6 +1486,7 @@ impl InteractiveArgs {
             ports,
             top_ports,
             ping_scan: false,
+            traceroute: false,
             include_udp: false,
             reverse_dns,
             service_detection,
@@ -2694,6 +2701,30 @@ mod tests {
     }
 
     #[test]
+    fn traceroute_flag_parses_into_request() {
+        let cli = Cli::parse_from(["nprobe-rs", "scan", "10.0.0.5", "--traceroute"]);
+        let action = cli.into_action().expect("cli action should parse");
+        match action {
+            CliAction::Scan(request) => {
+                assert!(request.traceroute);
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn aggressive_mode_enables_traceroute_follow_up() {
+        let cli = Cli::parse_from(["nprobe-rs", "scan", "10.0.0.5", "-A"]);
+        let action = cli.into_action().expect("cli action should parse");
+        match action {
+            CliAction::Scan(request) => {
+                assert!(request.traceroute);
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
     fn stealth_scan_alias_maps_to_syn_lane() {
         let cli = Cli::parse_from(["nprobe-rs", "scan", "10.0.0.5", "--stealth-scan"]);
         let action = cli.into_action().expect("cli action should parse");
@@ -2802,6 +2833,13 @@ mod tests {
     #[test]
     fn detect_cataloged_scan_gate_allows_live_ping_scan_flag() {
         let err = detect_cataloged_scan_gate(&["-sn".to_string(), "192.0.2.10".to_string()]);
+        assert!(err.is_none());
+    }
+
+    #[test]
+    fn detect_cataloged_scan_gate_allows_live_traceroute_flag() {
+        let err =
+            detect_cataloged_scan_gate(&["--traceroute".to_string(), "192.0.2.10".to_string()]);
         assert!(err.is_none());
     }
 

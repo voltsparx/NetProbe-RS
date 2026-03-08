@@ -4,8 +4,9 @@
 
 use crate::models::ScanReport;
 use crate::output::{
-    actionable_summary_line, good_next_steps, host_os_profile, key_issue_lines,
-    open_service_inventory, phantom_device_check_summary, service_detail_lines, service_label,
+    actionable_summary_line, good_next_steps, host_discovery_confirmed, host_discovery_evidence,
+    host_os_profile, host_traceroute_summary, key_issue_lines, open_service_inventory,
+    phantom_device_check_summary, service_detail_lines, service_label,
 };
 
 pub fn render(report: &ScanReport) -> String {
@@ -19,6 +20,16 @@ pub fn render(report: &ScanReport) -> String {
         report.metadata.started_at, report.metadata.finished_at, report.metadata.duration_ms
     ));
     out.push_str(&format!("override_mode={}\n", report.request.override_mode));
+    out.push_str(&format!(
+        "request ping_scan={} traceroute={} timing_template={}\n",
+        report.request.ping_scan,
+        report.request.traceroute,
+        report
+            .request
+            .timing_template
+            .map(|level| format!("T{}", level))
+            .unwrap_or_else(|| "default".to_string())
+    ));
     out.push_str(&format!(
         "async_tasks={} thread_tasks={} parallel_tasks={} lua_hooks={} integrity_checked={} integrity_state={} integrity_manifest={}\n",
         report.metadata.engine_stats.async_engine_tasks,
@@ -152,6 +163,16 @@ pub fn render(report: &ScanReport) -> String {
                     .unwrap_or_else(|| "n/a".to_string()),
                 summary.passive_follow_up
             ));
+        }
+        out.push_str(&format!(
+            "host_discovery_confirmed={}\n",
+            host_discovery_confirmed(host)
+        ));
+        for evidence in host_discovery_evidence(host) {
+            out.push_str(&format!("discovery_evidence={}\n", evidence));
+        }
+        if let Some(traceroute) = host_traceroute_summary(host) {
+            out.push_str(&format!("traceroute={}\n", traceroute));
         }
         if let Some(summary) = actionable_summary_line(host) {
             out.push_str(&format!("actionable_summary={summary}\n"));

@@ -546,6 +546,7 @@ mod tests {
             ports: vec![22, 80, 443],
             top_ports: None,
             ping_scan: false,
+            traceroute: false,
             include_udp: false,
             reverse_dns: false,
             service_detection: true,

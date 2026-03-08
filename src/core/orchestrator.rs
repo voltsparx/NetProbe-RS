@@ -224,6 +224,12 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
                 .to_string(),
         );
     }
+    if request.traceroute {
+        global_warnings.push(
+            "traceroute follow-up active: NProbe-RS will attempt a bounded path trace after positive host evidence is observed"
+                .to_string(),
+        );
+    }
     if request.override_mode {
         global_warnings.push(
             "override mode active: adaptive local throttles, target fragility brakes, and runtime emergency brakes are bypassed for the accelerated lanes on this run"
@@ -545,6 +551,7 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
             target: request.target.clone(),
             port_count: selected_ports.len(),
             ping_scan: request.ping_scan,
+            traceroute: request.traceroute,
             include_udp: request.include_udp,
             explain: request.explain,
             verbose: request.verbose,
@@ -596,12 +603,19 @@ async fn resolve_targets(
             ));
         }
 
-        if request.arp_discovery {
+        let auto_arp_discovery = request.ping_scan && packet_arp::is_lan_ipv4(cidr.network());
+        if request.arp_discovery || auto_arp_discovery {
             if !packet_arp::is_lan_ipv4(cidr.network()) {
                 warnings.push(
                     "arp sweep skipped: target cidr is not private/link-local ipv4".to_string(),
                 );
             } else {
+                if auto_arp_discovery && !request.arp_discovery {
+                    warnings.push(
+                        "ping scan mode auto-enabled ARP-first discovery for this local IPv4 cidr target"
+                            .to_string(),
+                    );
+                }
                 let sweep = tokio::task::spawn_blocking(move || {
                     packet_arp::sweep_ipv4_cidr(cidr, Duration::from_millis(220), MAX_CIDR_HOSTS)
                 })
@@ -1857,8 +1871,8 @@ fn host_parallelism(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_defensive_port_policy, checkpoint_signature, enforce_defensive_scope, run_scan,
-        shard_slice,
+        apply_defensive_port_policy, build_scan_work_items, checkpoint_signature,
+        enforce_defensive_scope, run_scan, shard_slice,
     };
     use crate::error::NProbeError;
     use crate::models::{ReportFormat, ScanProfile, ScanRequest};
@@ -1871,6 +1885,7 @@ mod tests {
             ports: vec![22, 80, 443],
             top_ports: None,
             ping_scan: false,
+            traceroute: false,
             include_udp: false,
             reverse_dns: false,
             service_detection: true,
@@ -1937,6 +1952,15 @@ mod tests {
         let sig_b = checkpoint_signature(&request_b, &hosts, &ports, 4, 2, "hosts");
 
         assert_ne!(sig_a, sig_b);
+    }
+
+    #[test]
+    fn ping_scan_builds_host_only_work_items() {
+        let hosts = vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))];
+        let items = build_scan_work_items(&hosts, &[22, 80], "hosts", true);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].checkpoint_unit, "10.0.0.5");
+        assert!(items[0].ports.is_empty());
     }
 
     #[test]

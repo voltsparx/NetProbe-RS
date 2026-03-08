@@ -4,8 +4,9 @@
 
 use crate::models::{PortFinding, PortState, ScanReport};
 use crate::output::{
-    actionable_summary_line, good_next_steps, host_os_profile, key_issue_lines,
-    open_service_inventory, phantom_device_check_summary, service_detail_lines, service_label,
+    actionable_summary_line, good_next_steps, host_discovery_confirmed, host_discovery_evidence,
+    host_os_profile, host_traceroute_summary, key_issue_lines, open_service_inventory,
+    phantom_device_check_summary, service_detail_lines, service_label,
 };
 
 pub fn render(report: &ScanReport) -> String {
@@ -37,6 +38,24 @@ pub fn render(report: &ScanReport) -> String {
         } else {
             "off"
         }
+    ));
+    out.push_str(&format!(
+        "Request mode: ping-scan={} | traceroute={} | timing={}\n",
+        if report.request.ping_scan {
+            "on"
+        } else {
+            "off"
+        },
+        if report.request.traceroute {
+            "on"
+        } else {
+            "off"
+        },
+        report
+            .request
+            .timing_template
+            .map(|level| format!("T{}", level))
+            .unwrap_or_else(|| "default".to_string())
     ));
     out.push_str(&format!(
         "Role: {} | family: {} | safety model: {} | bundle: {} | resources: {} | integrity: {} ({}) | teaching: {} | safety envelope: {} | public-target policy: {} | profiled hosts: {} | fragile hosts: {} | suppressed ports: {}\n",
@@ -179,14 +198,12 @@ pub fn render(report: &ScanReport) -> String {
             "\nNProbe scan report for {} ({})\n",
             host.target, host.ip
         ));
-        let definite_response = host
-            .ports
-            .iter()
-            .any(|p| matches!(p.state, PortState::Open | PortState::Closed));
+        let definite_response = host_discovery_confirmed(host);
         let ambiguous_response = host
             .ports
             .iter()
             .any(|p| matches!(p.state, PortState::OpenOrFiltered));
+        let discovery_evidence = host_discovery_evidence(host);
 
         if definite_response {
             out.push_str("Host is up.\n");
@@ -227,6 +244,15 @@ pub fn render(report: &ScanReport) -> String {
                     .unwrap_or_else(|| "n/a".to_string()),
                 if summary.passive_follow_up { "yes" } else { "no" }
             ));
+        }
+        if !discovery_evidence.is_empty() {
+            out.push_str("Discovery evidence:\n");
+            for line in &discovery_evidence {
+                out.push_str(&format!("- {line}\n"));
+            }
+        }
+        if let Some(traceroute) = host_traceroute_summary(host) {
+            out.push_str(&format!("Path trace: {traceroute}\n"));
         }
 
         let open_like: Vec<&PortFinding> = host

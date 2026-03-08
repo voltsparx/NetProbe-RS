@@ -1,5 +1,6 @@
 // Fetcher pipeline: lightweight post-scan enrichment inspired by plugin chains.
 
+use std::io;
 use std::net::IpAddr;
 use std::process::Command;
 use std::time::Duration;
@@ -62,18 +63,21 @@ pub async fn run(request: &ScanRequest, host: &HostResult) -> FetcherReport {
         .clamp(Duration::from_millis(180), Duration::from_secs(3));
 
     let mut report = FetcherReport::default();
+    let discovery_only = request.ping_scan || host.ports.is_empty();
 
     // Root nodes in the fetcher DAG.
     let web_task = web_detect_fetcher(ip, &host.ports, timeout_budget);
     let snmp_task = snmp_fetcher(ip, &host.ports, timeout_budget);
     let icmp_task = icmp_probe_fetcher(ip, timeout_budget);
     let arp_task = arp_neighbor_fetcher(request, ip);
+    let tcp_discovery_task = tcp_discovery_fetcher(discovery_only, ip, timeout_budget);
 
-    let (web_outcome, snmp_outcome, icmp_obs, arp_report) =
-        tokio::join!(web_task, snmp_task, icmp_task, arp_task);
+    let (web_outcome, snmp_outcome, icmp_obs, arp_report, tcp_discovery_report) =
+        tokio::join!(web_task, snmp_task, icmp_task, arp_task, tcp_discovery_task);
     report.merge(web_outcome.report);
     report.merge(snmp_outcome.report);
     report.merge(arp_report);
+    report.merge(tcp_discovery_report);
 
     let mut icmp_reachable = false;
     if let Some(icmp) = icmp_obs {
@@ -112,6 +116,20 @@ pub async fn run(request: &ScanRequest, host: &HostResult) -> FetcherReport {
         }
     }
 
+    let discovery_confirmed = icmp_reachable
+        || host
+            .ports
+            .iter()
+            .any(|port| matches!(port.state, PortState::Open | PortState::Closed))
+        || report
+            .insights
+            .iter()
+            .any(|insight| insight.starts_with("arp neighbor:"))
+        || report
+            .insights
+            .iter()
+            .any(|insight| insight.starts_with("tcp discovery:"));
+
     // Dependent fetchers run only when prerequisites succeeded.
     if !web_outcome.detected_ports.is_empty() {
         report.merge(web_header_fetcher(ip, &web_outcome.detected_ports, timeout_budget).await);
@@ -121,11 +139,53 @@ pub async fn run(request: &ScanRequest, host: &HostResult) -> FetcherReport {
         report.merge(snmp_inventory_fetcher(ip, timeout_budget, sysdescr).await);
     }
 
+    if request.traceroute {
+        if discovery_confirmed {
+            report.merge(
+                traceroute_fetcher(ip, timeout_budget, request.verbose || request.explain).await,
+            );
+        } else {
+            report.learning_notes.push(
+                "traceroute follow-up was skipped because no positive host-up evidence was observed yet."
+                    .to_string(),
+            );
+        }
+    }
+
     report.learning_notes.push(format!(
-        "fetcher-dag: icmp={} web={} snmp={} dependents=[web-headers:{}, snmp-inventory:{}]",
+        "fetcher-dag: icmp={} arp={} tcp-discovery={} web={} snmp={} traceroute={} dependents=[web-headers:{}, snmp-inventory:{}]",
         if icmp_reachable { "ok" } else { "none" },
+        if report
+            .insights
+            .iter()
+            .any(|insight| insight.starts_with("arp neighbor:"))
+        {
+            "ok"
+        } else {
+            "none"
+        },
+        if report
+            .insights
+            .iter()
+            .any(|insight| insight.starts_with("tcp discovery:"))
+        {
+            "ok"
+        } else {
+            "none"
+        },
         web_outcome.detected_ports.len(),
         usize::from(snmp_outcome.sysdescr.is_some()),
+        if report
+            .insights
+            .iter()
+            .any(|insight| insight.starts_with("traceroute:"))
+        {
+            "ok"
+        } else if request.traceroute {
+            "requested"
+        } else {
+            "off"
+        },
         if web_outcome.detected_ports.is_empty() {
             "skipped"
         } else {
@@ -149,7 +209,9 @@ pub async fn run(request: &ScanRequest, host: &HostResult) -> FetcherReport {
 
 async fn arp_neighbor_fetcher(request: &ScanRequest, ip: IpAddr) -> FetcherReport {
     let mut report = FetcherReport::default();
-    if !request.arp_discovery || packet_arp::parse_ipv4_cidr(&request.target).is_some() {
+    if (!request.arp_discovery && !request.ping_scan)
+        || packet_arp::parse_ipv4_cidr(&request.target).is_some()
+    {
         return report;
     }
 
@@ -182,6 +244,255 @@ async fn arp_neighbor_fetcher(request: &ScanRequest, ip: IpAddr) -> FetcherRepor
     }
 
     report
+}
+
+async fn tcp_discovery_fetcher(
+    enabled: bool,
+    ip: IpAddr,
+    timeout_budget: Duration,
+) -> FetcherReport {
+    let mut report = FetcherReport::default();
+    if !enabled {
+        return report;
+    }
+
+    const DISCOVERY_PORTS: &[u16] = &[80, 443, 22];
+    report.parallel_tasks += DISCOVERY_PORTS.len();
+    for port in DISCOVERY_PORTS {
+        match probe_tcp_discovery(ip, *port, timeout_budget).await {
+            Some(TcpDiscoverySignal::Open) => {
+                report.insights.push(format!(
+                    "tcp discovery: {ip}:{port} accepted a lightweight connect probe"
+                ));
+                return report;
+            }
+            Some(TcpDiscoverySignal::Refused) => {
+                report.insights.push(format!(
+                    "tcp discovery: {ip}:{port} refused a lightweight connect probe, which still confirms the host stack is reachable"
+                ));
+                return report;
+            }
+            None => {}
+        }
+    }
+
+    report.learning_notes.push(
+        "tcp discovery: no positive connect/refused evidence was observed on the lightweight discovery ports (22, 80, 443)."
+            .to_string(),
+    );
+    report
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TcpDiscoverySignal {
+    Open,
+    Refused,
+}
+
+async fn probe_tcp_discovery(
+    ip: IpAddr,
+    port: u16,
+    timeout_budget: Duration,
+) -> Option<TcpDiscoverySignal> {
+    match timeout(timeout_budget, TcpStream::connect((ip, port))).await {
+        Ok(Ok(stream)) => {
+            drop(stream);
+            Some(TcpDiscoverySignal::Open)
+        }
+        Ok(Err(err)) => classify_tcp_discovery_error(&err),
+        Err(_) => None,
+    }
+}
+
+fn classify_tcp_discovery_error(err: &io::Error) -> Option<TcpDiscoverySignal> {
+    match err.kind() {
+        io::ErrorKind::ConnectionRefused => Some(TcpDiscoverySignal::Refused),
+        _ => None,
+    }
+}
+
+async fn traceroute_fetcher(ip: IpAddr, timeout_budget: Duration, verbose: bool) -> FetcherReport {
+    let mut report = FetcherReport::default();
+    report.parallel_tasks += 1;
+
+    let per_hop_timeout_ms = timeout_budget
+        .clamp(Duration::from_millis(250), Duration::from_secs(1))
+        .as_millis() as u64;
+    let result =
+        tokio::task::spawn_blocking(move || run_system_traceroute(ip, per_hop_timeout_ms)).await;
+
+    match result {
+        Ok(Ok(hops)) if !hops.is_empty() => {
+            let hop_count = hops.len();
+            let preview = hops
+                .iter()
+                .take(5)
+                .map(|hop| hop.label.clone())
+                .collect::<Vec<_>>()
+                .join(" -> ");
+            report.insights.push(format!(
+                "traceroute: observed {} hop(s) toward {} via {}",
+                hop_count, ip, preview
+            ));
+            report.learning_notes.push(
+                "traceroute follow-up used a bounded system path trace with low hop and timeout caps to keep enrichment controlled."
+                    .to_string(),
+            );
+        }
+        Ok(Ok(_)) => report.learning_notes.push(
+            "traceroute follow-up ran, but no stable hop summary could be extracted from the local system traceroute helper."
+                .to_string(),
+        ),
+        Ok(Err(TracerouteError::Unavailable)) => report.warnings.push(
+            "traceroute follow-up was requested, but no local traceroute helper was available on this platform."
+                .to_string(),
+        ),
+        Ok(Err(TracerouteError::NoUsefulOutput)) => report.warnings.push(
+            "traceroute follow-up was requested, but the local traceroute helper did not return any usable hop information."
+                .to_string(),
+        ),
+        Ok(Err(TracerouteError::ExecutionFailed)) if verbose => report.warnings.push(
+            "traceroute follow-up could not complete cleanly on this system, so path details were skipped."
+                .to_string(),
+        ),
+        Ok(Err(TracerouteError::ExecutionFailed)) => report.learning_notes.push(
+            "traceroute follow-up could not complete cleanly on this system, so path details were skipped."
+                .to_string(),
+        ),
+        Err(_) => report.warnings.push(
+            "traceroute follow-up worker failed internally, so path details were skipped while the scan kept going."
+                .to_string(),
+        ),
+    }
+
+    report
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TracerouteHop {
+    label: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TracerouteError {
+    Unavailable,
+    ExecutionFailed,
+    NoUsefulOutput,
+}
+
+fn run_system_traceroute(
+    ip: IpAddr,
+    per_hop_timeout_ms: u64,
+) -> Result<Vec<TracerouteHop>, TracerouteError> {
+    let target = ip.to_string();
+    let output = if cfg!(windows) {
+        Command::new("tracert")
+            .args([
+                "-d",
+                "-h",
+                "8",
+                "-w",
+                &per_hop_timeout_ms.clamp(250, 1000).to_string(),
+                &target,
+            ])
+            .output()
+            .map_err(map_traceroute_io_error)?
+    } else if let Ok(result) = Command::new("traceroute")
+        .args([
+            "-n",
+            "-m",
+            "8",
+            "-w",
+            &format!("{:.1}", per_hop_timeout_ms.clamp(250, 1000) as f32 / 1000.0),
+            &target,
+        ])
+        .output()
+    {
+        result
+    } else if let Ok(result) = Command::new("tracepath").args(["-n", &target]).output() {
+        result
+    } else {
+        return Err(TracerouteError::Unavailable);
+    };
+
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let hops = parse_traceroute_hops(&combined);
+    if !hops.is_empty() {
+        return Ok(hops);
+    }
+    if output.status.success() {
+        Err(TracerouteError::NoUsefulOutput)
+    } else {
+        Err(TracerouteError::ExecutionFailed)
+    }
+}
+
+fn map_traceroute_io_error(err: io::Error) -> TracerouteError {
+    if err.kind() == io::ErrorKind::NotFound {
+        TracerouteError::Unavailable
+    } else {
+        TracerouteError::ExecutionFailed
+    }
+}
+
+fn parse_traceroute_hops(text: &str) -> Vec<TracerouteHop> {
+    let mut hops = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.contains("timed out") {
+            continue;
+        }
+
+        let Some(rest) = trimmed.split_once(char::is_whitespace) else {
+            continue;
+        };
+        if rest.0.parse::<usize>().is_err() {
+            continue;
+        }
+
+        if let Some(label) =
+            parse_windows_traceroute_label(trimmed).or_else(|| parse_unix_traceroute_label(trimmed))
+        {
+            hops.push(TracerouteHop { label });
+        }
+    }
+    hops
+}
+
+fn parse_windows_traceroute_label(line: &str) -> Option<String> {
+    if let Some(open) = line.rfind('[') {
+        let close = line[open..].find(']')?;
+        return Some(line[open + 1..open + close].trim().to_string());
+    }
+
+    let tokens = line.split_whitespace().collect::<Vec<_>>();
+    tokens
+        .iter()
+        .rev()
+        .find(|token| looks_like_ip_literal(token))
+        .map(|token| token.trim().to_string())
+}
+
+fn parse_unix_traceroute_label(line: &str) -> Option<String> {
+    let tokens = line.split_whitespace().collect::<Vec<_>>();
+    if tokens.len() < 2 {
+        return None;
+    }
+    let candidate = tokens[1];
+    if candidate == "*" || candidate.eq_ignore_ascii_case("ms") {
+        None
+    } else {
+        Some(candidate.trim().to_string())
+    }
+}
+
+fn looks_like_ip_literal(token: &str) -> bool {
+    let cleaned = token.trim_matches(|ch| matches!(ch, '[' | ']' | '(' | ')' | ','));
+    cleaned.parse::<IpAddr>().is_ok()
 }
 
 async fn web_detect_fetcher(
@@ -611,8 +922,11 @@ fn os_hint_from_ttl(ttl: u8) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_snmp_get_request, parse_html_title, parse_http_server_header, parse_rtt_ms, parse_ttl,
+        build_snmp_get_request, classify_tcp_discovery_error, parse_html_title,
+        parse_http_server_header, parse_rtt_ms, parse_traceroute_hops, parse_ttl,
+        TcpDiscoverySignal,
     };
+    use std::io;
 
     #[test]
     fn parse_html_title_works() {
@@ -642,5 +956,27 @@ mod tests {
         let packet = build_snmp_get_request(0x1234_5678, &oid).expect("packet");
         assert_eq!(packet.first().copied(), Some(0x30));
         assert!(packet.windows(oid.len()).any(|window| window == oid));
+    }
+
+    #[test]
+    fn tcp_discovery_classifier_accepts_connection_refused() {
+        let err = io::Error::from(io::ErrorKind::ConnectionRefused);
+        assert_eq!(
+            classify_tcp_discovery_error(&err),
+            Some(TcpDiscoverySignal::Refused)
+        );
+    }
+
+    #[test]
+    fn traceroute_parser_handles_windows_and_unix_shapes() {
+        let windows = "  1    <1 ms    <1 ms    <1 ms  192.168.1.1\n  2    10 ms    12 ms    11 ms  198.51.100.7";
+        let unix = " 1  192.168.1.1  1.123 ms  1.012 ms  0.998 ms\n 2  198.51.100.7  8.401 ms  8.392 ms  8.388 ms";
+
+        let mut hops = parse_traceroute_hops(windows);
+        hops.extend(parse_traceroute_hops(unix));
+        let labels = hops.into_iter().map(|hop| hop.label).collect::<Vec<_>>();
+
+        assert!(labels.iter().any(|label| label == "192.168.1.1"));
+        assert!(labels.iter().any(|label| label == "198.51.100.7"));
     }
 }
