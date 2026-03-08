@@ -18,6 +18,7 @@ mod error;
 mod fetchers;
 mod fingerprint_db;
 mod models;
+mod os_fingerprint_db;
 mod output;
 mod platform;
 mod reporter;

@@ -1,7 +1,7 @@
 #----------------------
 # Local build artifacts
 #----------------------
-/target/
+target*/
 .cargo-target/
 build-*/
 **/*.rs.bk

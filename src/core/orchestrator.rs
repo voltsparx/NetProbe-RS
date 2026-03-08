@@ -33,6 +33,7 @@ use crate::models::{
     EngineStats, HostResult, KnowledgeStats, ScanMetadata, ScanProfile, ScanReport, ScanRequest,
     ScanRequestSummary,
 };
+use crate::os_fingerprint_db::OsFingerprintDatabase;
 use crate::platform::capability_registry;
 use crate::service_db::ServiceRegistry;
 
@@ -110,6 +111,7 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
     } else {
         Arc::new(FingerprintDatabase::empty())
     };
+    let os_fingerprint_db = Arc::new(OsFingerprintDatabase::load());
 
     let max_resolved_hosts = if packet_arp::parse_ipv4_cidr(&request.target).is_some() {
         MAX_CIDR_HOSTS
@@ -212,6 +214,7 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
             global_warnings.clone(),
             service_registry.clone(),
             fingerprint_db.clone(),
+            os_fingerprint_db.clone(),
             strategy.clone(),
             defer_host_enrichment,
         ));
@@ -264,6 +267,7 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
                 global_warnings.clone(),
                 service_registry.clone(),
                 fingerprint_db.clone(),
+                os_fingerprint_db.clone(),
                 strategy.clone(),
                 defer_host_enrichment,
             ));
@@ -277,7 +281,7 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
                 break;
             }
             let (extra_thread_pool_tasks, extra_parallel_tasks, extra_lua_hooks_ran) =
-                finalize_host(&request, host).await?;
+                finalize_host(&request, host, os_fingerprint_db.as_ref()).await?;
             thread_pool_tasks += extra_thread_pool_tasks;
             parallel_tasks += extra_parallel_tasks;
             lua_hooks_ran = lua_hooks_ran || extra_lua_hooks_ran;
@@ -317,6 +321,7 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
 
     let finished = Utc::now();
     let fp_stats = fingerprint_db.stats();
+    let os_stats = os_fingerprint_db.stats();
     let platform = capability_registry::summary();
     let profiled_hosts = hosts
         .iter()
@@ -400,6 +405,9 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
                 fingerprint_rules_skipped: fp_stats.rules_skipped,
                 nse_scripts_seen: fp_stats.nse_scripts,
                 nselib_modules_seen: fp_stats.nselib_modules,
+                os_fingerprint_signatures_loaded: os_stats.fingerprints_loaded,
+                os_fingerprint_classes_loaded: os_stats.classes_loaded,
+                os_fingerprint_cpes_loaded: os_stats.cpes_loaded,
             },
             platform,
         },
@@ -509,6 +517,7 @@ async fn process_host(
     global_warnings: Vec<String>,
     service_registry: Arc<ServiceRegistry>,
     fingerprint_db: Arc<FingerprintDatabase>,
+    os_fingerprint_db: Arc<OsFingerprintDatabase>,
     strategy: ScanStrategy,
     defer_enrichment: bool,
 ) -> NProbeResult<HostExecution> {
@@ -582,40 +591,11 @@ async fn process_host(
     let mut lua_hooks_ran = false;
 
     if !defer_enrichment {
-        if request.reverse_dns {
-            if let Some(reverse_dns) = dns::reverse(ip).await {
-                host.reverse_dns = Some(reverse_dns);
-                thread_pool_tasks += 1;
-            }
-        }
-
-        let (analysis_tasks, analysis_warning) = run_analysis_isolated(&mut host, request.explain);
-        parallel_tasks = analysis_tasks;
-        if let Some(warning) = analysis_warning {
-            host.warnings.push(warning);
-        }
-        let fetcher_report = run_fetchers_isolated(&request, &host).await;
-        parallel_tasks += fetcher_report.parallel_tasks;
-        host.warnings.extend(fetcher_report.warnings);
-        host.insights.extend(fetcher_report.insights);
-        host.learning_notes.extend(fetcher_report.learning_notes);
-        dedupe_sort_strings(&mut host.warnings);
-        dedupe_sort_strings(&mut host.insights);
-        dedupe_sort_strings(&mut host.learning_notes);
-        let (lua_findings, lua_ok, lua_warning) =
-            run_lua_isolated(&host, request.lua_script.as_deref());
-        host.lua_findings = lua_findings;
-        if let Some(warning) = lua_warning {
-            host.warnings.push(warning);
-            dedupe_sort_strings(&mut host.warnings);
-        }
-        if !host.lua_findings.is_empty() {
-            host.insights.push(format!(
-                "lua hooks added {} custom findings",
-                host.lua_findings.len()
-            ));
-        }
-        lua_hooks_ran = lua_ok;
+        let (extra_thread_pool_tasks, extra_parallel_tasks, extra_lua_hooks_ran) =
+            finalize_host(&request, &mut host, os_fingerprint_db.as_ref()).await?;
+        thread_pool_tasks += extra_thread_pool_tasks;
+        parallel_tasks += extra_parallel_tasks;
+        lua_hooks_ran = extra_lua_hooks_ran;
     }
 
     Ok(HostExecution {
@@ -649,6 +629,7 @@ fn degraded_host_result(
         observed_mac: None,
         device_class: None,
         device_vendor: None,
+        operating_system: None,
         phantom_device_check: None,
         safety_actions: vec!["fault-isolation:host-scan-degraded".to_string()],
         warnings,
@@ -694,6 +675,7 @@ fn merge_hosts_by_ip(hosts: Vec<HostResult>) -> Vec<HostResult> {
             if existing.device_vendor.is_none() {
                 existing.device_vendor = host.device_vendor.take();
             }
+            merge_host_operating_system(existing, &mut host);
             existing.merge_phantom_device_check(host.phantom_device_check.take());
         } else {
             index_by_ip.insert(host.ip.clone(), merged.len());
@@ -725,9 +707,21 @@ fn dedupe_sort_strings(values: &mut Vec<String>) {
     values.dedup();
 }
 
+fn merge_host_operating_system(existing: &mut HostResult, incoming: &mut HostResult) {
+    let Some(candidate) = incoming.operating_system.take() else {
+        return;
+    };
+
+    match existing.operating_system.as_ref() {
+        Some(current) if current.confidence >= candidate.confidence => {}
+        _ => existing.operating_system = Some(candidate),
+    }
+}
+
 async fn finalize_host(
     request: &ScanRequest,
     host: &mut HostResult,
+    os_fingerprint_db: &OsFingerprintDatabase,
 ) -> NProbeResult<(usize, usize, bool)> {
     let mut thread_pool_tasks = 0usize;
     if request.reverse_dns {
@@ -744,6 +738,7 @@ async fn finalize_host(
     host.defensive_advice.clear();
     host.learning_notes.clear();
     host.lua_findings.clear();
+    host.operating_system = None;
 
     let (analysis_tasks, analysis_warning) = run_analysis_isolated(host, request.explain);
     let mut parallel_tasks = analysis_tasks;
@@ -755,6 +750,20 @@ async fn finalize_host(
     host.warnings.extend(fetcher_report.warnings);
     host.insights.extend(fetcher_report.insights);
     host.learning_notes.extend(fetcher_report.learning_notes);
+    if let Some(operating_system) = os_fingerprint_db.guess_host(host, fetcher_report.observed_ttl)
+    {
+        host.insights.push(format!(
+            "Passive OS/profile signal: {} (source={} confidence={:.2})",
+            operating_system.label, operating_system.source, operating_system.confidence
+        ));
+        if !operating_system.cpes.is_empty() {
+            host.learning_notes.push(format!(
+                "nmap-os-db corroboration: {}",
+                operating_system.cpes.join(", ")
+            ));
+        }
+        host.operating_system = Some(operating_system);
+    }
     dedupe_sort_strings(&mut host.warnings);
     dedupe_sort_strings(&mut host.insights);
     dedupe_sort_strings(&mut host.learning_notes);
@@ -810,6 +819,7 @@ async fn run_fetchers_isolated(request: &ScanRequest, host: &HostResult) -> Fetc
                     .to_string(),
             ],
             parallel_tasks: 0,
+            observed_ttl: None,
         },
     }
 }
@@ -1620,8 +1630,8 @@ fn host_parallelism(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_defensive_port_policy, checkpoint_signature, enforce_defensive_scope, shard_slice,
-        run_scan,
+        apply_defensive_port_policy, checkpoint_signature, enforce_defensive_scope, run_scan,
+        shard_slice,
     };
     use crate::error::NProbeError;
     use crate::models::{ReportFormat, ScanProfile, ScanRequest};

@@ -4,8 +4,8 @@
 
 use crate::models::{PortFinding, PortState, ScanReport};
 use crate::output::{
-    actionable_summary_line, good_next_steps, key_issue_lines, phantom_device_check_summary,
-    service_detail_lines, service_label,
+    actionable_summary_line, good_next_steps, host_os_profile, key_issue_lines,
+    phantom_device_check_summary, service_detail_lines, service_label,
 };
 
 pub fn render(report: &ScanReport) -> String {
@@ -77,6 +77,18 @@ pub fn render(report: &ScanReport) -> String {
             report.metadata.engine_stats.scan_bundle_stages.join(" -> ")
         ));
     }
+    out.push_str(&format!(
+        "Knowledge: services {} | payloads {} | rules {}/{} | NSE {} | nselib {} | OS signatures {} | OS classes {} | OS CPEs {}\n",
+        report.metadata.knowledge.services_loaded,
+        report.metadata.knowledge.probe_payloads_loaded,
+        report.metadata.knowledge.fingerprint_rules_compiled,
+        report.metadata.knowledge.fingerprint_rules_loaded,
+        report.metadata.knowledge.nse_scripts_seen,
+        report.metadata.knowledge.nselib_modules_seen,
+        report.metadata.knowledge.os_fingerprint_signatures_loaded,
+        report.metadata.knowledge.os_fingerprint_classes_loaded,
+        report.metadata.knowledge.os_fingerprint_cpes_loaded
+    ));
 
     if let Some(seed) = report.metadata.engine_stats.scan_seed {
         out.push_str(&format!("Scan seed: {seed}\n"));
@@ -115,6 +127,9 @@ pub fn render(report: &ScanReport) -> String {
 
         if let Some(reverse) = &host.reverse_dns {
             out.push_str(&format!("rDNS: {}\n", reverse));
+        }
+        if let Some(os_profile) = host_os_profile(host) {
+            out.push_str(&format!("OS/profile: {os_profile}\n"));
         }
         if host.device_class.is_some() || host.observed_mac.is_some() {
             out.push_str(&format!(

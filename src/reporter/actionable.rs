@@ -354,6 +354,7 @@ mod tests {
             observed_mac: None,
             device_class: None,
             device_vendor: None,
+            operating_system: None,
             phantom_device_check: None,
             safety_actions: Vec::new(),
             warnings: Vec::new(),

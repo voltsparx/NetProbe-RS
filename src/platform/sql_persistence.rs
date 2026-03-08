@@ -243,6 +243,7 @@ impl HostSnapshotWriter {
         tx.execute(
             "INSERT INTO host_snapshots(
                 session_id, ip, updated_at, target, phase, device_class,
+                host_operating_system, host_os_source, host_os_confidence,
                 phantom_stage, phantom_responsive_ports, phantom_sampled_ports,
                 phantom_timeout_ports, phantom_avg_latency_ms, phantom_payload_budget,
                 phantom_passive_follow_up, service_summary_json, service_count,
@@ -250,12 +251,15 @@ impl HostSnapshotWriter {
                 actionable_summary_json, actionable_count, actionable_critical_count,
                 actionable_high_count, actionable_moderate_count, actionable_review_count,
                 risk_score, open_ports, payload_json
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)
              ON CONFLICT(session_id, ip) DO UPDATE SET
                 updated_at = excluded.updated_at,
                 target = excluded.target,
                 phase = excluded.phase,
                 device_class = excluded.device_class,
+                host_operating_system = excluded.host_operating_system,
+                host_os_source = excluded.host_os_source,
+                host_os_confidence = excluded.host_os_confidence,
                 phantom_stage = excluded.phantom_stage,
                 phantom_responsive_ports = excluded.phantom_responsive_ports,
                 phantom_sampled_ports = excluded.phantom_sampled_ports,
@@ -284,6 +288,11 @@ impl HostSnapshotWriter {
                 host.target,
                 phase,
                 host.device_class.as_deref(),
+                host.operating_system.as_ref().map(|value| value.label.as_str()),
+                host.operating_system.as_ref().map(|value| value.source.as_str()),
+                host.operating_system
+                    .as_ref()
+                    .map(|value| value.confidence as f64),
                 phantom_device_check
                     .as_ref()
                     .map(|summary| summary.stage.as_str()),
@@ -558,6 +567,9 @@ fn open(db_path: &Path) -> NProbeResult<Connection> {
             target TEXT NOT NULL,
             phase TEXT NOT NULL,
             device_class TEXT,
+            host_operating_system TEXT,
+            host_os_source TEXT,
+            host_os_confidence REAL,
             phantom_stage TEXT,
             phantom_responsive_ports INTEGER,
             phantom_sampled_ports INTEGER,
@@ -640,6 +652,18 @@ fn ensure_host_snapshot_columns(conn: &Connection) -> NProbeResult<()> {
     }
 
     for (column, ddl) in [
+        (
+            "host_operating_system",
+            "ALTER TABLE host_snapshots ADD COLUMN host_operating_system TEXT",
+        ),
+        (
+            "host_os_source",
+            "ALTER TABLE host_snapshots ADD COLUMN host_os_source TEXT",
+        ),
+        (
+            "host_os_confidence",
+            "ALTER TABLE host_snapshots ADD COLUMN host_os_confidence REAL",
+        ),
         ("phantom_stage", "ALTER TABLE host_snapshots ADD COLUMN phantom_stage TEXT"),
         (
             "phantom_responsive_ports",

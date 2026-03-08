@@ -358,6 +358,7 @@ pub async fn run(
         observed_mac,
         device_class,
         device_vendor,
+        operating_system: None,
         phantom_device_check,
         safety_actions,
         warnings,

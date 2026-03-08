@@ -82,9 +82,10 @@ pub fn plan(request: &ScanRequest, host_count: usize, port_count: usize) -> Scan
                 ExecutionMode::Async
             }
         }
-        ScanProfile::Turbo | ScanProfile::Aggressive | ScanProfile::RootOnly | ScanProfile::Hybrid => {
-            ExecutionMode::Hybrid
-        }
+        ScanProfile::Turbo
+        | ScanProfile::Aggressive
+        | ScanProfile::RootOnly
+        | ScanProfile::Hybrid => ExecutionMode::Hybrid,
     };
 
     if request.strict_safety && mode == ExecutionMode::PacketBlast {

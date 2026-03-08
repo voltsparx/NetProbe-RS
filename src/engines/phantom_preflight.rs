@@ -130,7 +130,10 @@ pub fn preview(
         ScanProfile::Phantom => 0,
         ScanProfile::Kis | ScanProfile::Sar => 1,
         ScanProfile::Stealth => 2,
-        ScanProfile::Balanced | ScanProfile::Turbo | ScanProfile::Aggressive | ScanProfile::Hybrid => 4,
+        ScanProfile::Balanced
+        | ScanProfile::Turbo
+        | ScanProfile::Aggressive
+        | ScanProfile::Hybrid => 4,
         ScanProfile::RootOnly => 3,
     };
     let mut notes = vec![format!(
@@ -362,7 +365,10 @@ fn derive_decision(
         ScanProfile::Kis => 1,
         ScanProfile::Sar => 1,
         ScanProfile::Stealth => 2,
-        ScanProfile::Balanced | ScanProfile::Turbo | ScanProfile::Aggressive | ScanProfile::Hybrid => 4,
+        ScanProfile::Balanced
+        | ScanProfile::Turbo
+        | ScanProfile::Aggressive
+        | ScanProfile::Hybrid => 4,
         ScanProfile::RootOnly => 3,
     };
 

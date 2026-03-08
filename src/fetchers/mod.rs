@@ -17,6 +17,7 @@ pub struct FetcherReport {
     pub insights: Vec<String>,
     pub learning_notes: Vec<String>,
     pub parallel_tasks: usize,
+    pub observed_ttl: Option<u8>,
 }
 
 impl FetcherReport {
@@ -25,6 +26,9 @@ impl FetcherReport {
         self.insights.append(&mut other.insights);
         self.learning_notes.append(&mut other.learning_notes);
         self.parallel_tasks += other.parallel_tasks;
+        if self.observed_ttl.is_none() {
+            self.observed_ttl = other.observed_ttl;
+        }
     }
 }
 
@@ -81,6 +85,7 @@ pub async fn run(request: &ScanRequest, host: &HostResult) -> FetcherReport {
         }
         if let Some(ttl) = icmp.ttl {
             icmp_reachable = true;
+            report.observed_ttl = Some(ttl);
             report.learning_notes.push(format!(
                 "icmp ttl hint observed: {} ({})",
                 ttl,

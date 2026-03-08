@@ -11,6 +11,9 @@ use serde::Serialize;
 struct Row {
     target: String,
     ip: String,
+    host_operating_system: String,
+    host_os_source: String,
+    host_os_confidence: String,
     port: u16,
     protocol: String,
     state: String,
@@ -28,9 +31,17 @@ pub fn render(report: &ScanReport) -> NProbeResult<String> {
 
     for host in &report.hosts {
         for port in &host.ports {
+            let host_os = host.operating_system.as_ref();
             let row = Row {
                 target: host.target.clone(),
                 ip: host.ip.clone(),
+                host_operating_system: host_os.map(|guess| guess.label.clone()).unwrap_or_default(),
+                host_os_source: host_os
+                    .map(|guess| guess.source.clone())
+                    .unwrap_or_default(),
+                host_os_confidence: host_os
+                    .map(|guess| format!("{:.2}", guess.confidence))
+                    .unwrap_or_default(),
                 port: port.port,
                 protocol: port.protocol.clone(),
                 state: port.state.to_string(),

@@ -26,6 +26,7 @@ It means NProbe-RS should cover the useful framework-level capabilities those to
 ### `nmap`
 
 - service fingerprint databases
+- passive `nmap-os-db` correlation for host OS/profile hints
 - explainable multi-format reporting
 - scan profiles and engine selection
 - controlled scripting and enrichment
@@ -77,5 +78,6 @@ Those areas are intentionally excluded from the default framework scope.
 
 - capability parity is summarized in scan metadata
 - host safety/profile decisions are part of the report model
+- passive OS/profile hints now draw from `nmap-os-db` without claiming active OS-scan parity
 - async and packet paths both apply device-aware safety policy
 - checkpoint/resume already exists and should evolve into durable persistence

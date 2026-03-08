@@ -5,8 +5,8 @@
 
 use crate::models::ScanReport;
 use crate::output::{
-    actionable_summary_line, good_next_steps, phantom_device_check_summary, service_detail_lines,
-    service_label, top_actionable_items,
+    actionable_summary_line, good_next_steps, host_os_profile, phantom_device_check_summary,
+    service_detail_lines, service_label, top_actionable_items,
 };
 
 pub fn render(report: &ScanReport) -> String {
@@ -89,7 +89,7 @@ pub fn render(report: &ScanReport) -> String {
         ));
     }
     html.push_str(&format!(
-        "<div class=\"meta\">Knowledge: services {} | top ports {} | payloads {} | rules {}/{} (skipped {}) | NSE scripts {} | NSE libs {}</div>",
+        "<div class=\"meta\">Knowledge: services {} | top ports {} | payloads {} | rules {}/{} (skipped {}) | NSE scripts {} | NSE libs {} | OS signatures {} | OS classes {} | OS CPEs {}</div>",
         report.metadata.knowledge.services_loaded,
         report.metadata.knowledge.ranked_tcp_ports,
         report.metadata.knowledge.probe_payloads_loaded,
@@ -97,7 +97,10 @@ pub fn render(report: &ScanReport) -> String {
         report.metadata.knowledge.fingerprint_rules_loaded,
         report.metadata.knowledge.fingerprint_rules_skipped,
         report.metadata.knowledge.nse_scripts_seen,
-        report.metadata.knowledge.nselib_modules_seen
+        report.metadata.knowledge.nselib_modules_seen,
+        report.metadata.knowledge.os_fingerprint_signatures_loaded,
+        report.metadata.knowledge.os_fingerprint_classes_loaded,
+        report.metadata.knowledge.os_fingerprint_cpes_loaded
     ));
     html.push_str("</div>");
 
@@ -113,6 +116,12 @@ pub fn render(report: &ScanReport) -> String {
             html.push_str(&format!(
                 "<div class=\"meta\">Reverse DNS: {}</div>",
                 esc(reverse)
+            ));
+        }
+        if let Some(os_profile) = host_os_profile(host) {
+            html.push_str(&format!(
+                "<div class=\"meta\">OS/profile: {}</div>",
+                esc(&os_profile)
             ));
         }
         if host.device_class.is_some() || host.observed_mac.is_some() {

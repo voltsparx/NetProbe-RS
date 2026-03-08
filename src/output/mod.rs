@@ -20,6 +20,15 @@ pub(crate) fn phantom_device_check_summary(host: &HostResult) -> Option<PhantomD
     host.phantom_device_check_summary()
 }
 
+pub(crate) fn host_os_profile(host: &HostResult) -> Option<String> {
+    host.operating_system.as_ref().map(|guess| {
+        format!(
+            "{} (source={} confidence={:.2})",
+            guess.label, guess.source, guess.confidence
+        )
+    })
+}
+
 pub(crate) fn service_label(port: &PortFinding) -> String {
     match (&port.service, &port.service_identity) {
         (Some(service), Some(identity)) => {

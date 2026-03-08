@@ -285,6 +285,15 @@ pub struct ServiceIdentity {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostOsGuess {
+    pub label: String,
+    pub source: String,
+    pub confidence: f32,
+    #[serde(default)]
+    pub cpes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostResult {
     pub target: String,
     pub ip: String,
@@ -292,6 +301,8 @@ pub struct HostResult {
     pub observed_mac: Option<String>,
     pub device_class: Option<String>,
     pub device_vendor: Option<String>,
+    #[serde(default)]
+    pub operating_system: Option<HostOsGuess>,
     #[serde(default)]
     pub phantom_device_check: Option<PhantomDeviceCheckSummary>,
     #[serde(default)]
@@ -542,6 +553,9 @@ pub struct KnowledgeStats {
     pub fingerprint_rules_skipped: usize,
     pub nse_scripts_seen: usize,
     pub nselib_modules_seen: usize,
+    pub os_fingerprint_signatures_loaded: usize,
+    pub os_fingerprint_classes_loaded: usize,
+    pub os_fingerprint_cpes_loaded: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -588,6 +602,7 @@ mod tests {
             observed_mac: None,
             device_class: None,
             device_vendor: None,
+            operating_system: None,
             phantom_device_check: None,
             safety_actions: vec![
                 "phantom-preflight:stage=guarded".to_string(),

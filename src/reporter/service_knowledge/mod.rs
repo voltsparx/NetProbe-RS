@@ -226,6 +226,7 @@ mod tests {
             observed_mac: None,
             device_class: Some("enterprise".to_string()),
             device_vendor: None,
+            operating_system: None,
             phantom_device_check: None,
             safety_actions: Vec::new(),
             warnings: Vec::new(),

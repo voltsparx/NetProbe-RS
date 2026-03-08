@@ -50,6 +50,14 @@ const CAPABILITIES: &[CapabilityEntry] = &[
     },
     CapabilityEntry {
         tool_family: "nmap",
+        domain: "os-fingerprinting",
+        capability: "passive nmap-os-db loading and evidence-backed host OS/profile hints",
+        status: CapabilityStatus::Partial,
+        safe_scope:
+            "limited to passive correlation from service, CPE, and low-confidence TTL evidence",
+    },
+    CapabilityEntry {
+        tool_family: "nmap",
         domain: "reporting",
         capability: "multi-format output and explainable scan results",
         status: CapabilityStatus::Implemented,

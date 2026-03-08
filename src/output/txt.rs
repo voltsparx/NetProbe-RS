@@ -4,8 +4,8 @@
 
 use crate::models::ScanReport;
 use crate::output::{
-    actionable_summary_line, good_next_steps, key_issue_lines, phantom_device_check_summary,
-    service_detail_lines, service_label,
+    actionable_summary_line, good_next_steps, host_os_profile, key_issue_lines,
+    phantom_device_check_summary, service_detail_lines, service_label,
 };
 
 pub fn render(report: &ScanReport) -> String {
@@ -62,7 +62,7 @@ pub fn render(report: &ScanReport) -> String {
         ));
     }
     out.push_str(&format!(
-        "knowledge services={} top_ports={} payloads={} rules_compiled={} rules_total={} rules_skipped={} nse={} nselib={}\n",
+        "knowledge services={} top_ports={} payloads={} rules_compiled={} rules_total={} rules_skipped={} nse={} nselib={} os_signatures={} os_classes={} os_cpes={}\n",
         report.metadata.knowledge.services_loaded,
         report.metadata.knowledge.ranked_tcp_ports,
         report.metadata.knowledge.probe_payloads_loaded,
@@ -70,7 +70,10 @@ pub fn render(report: &ScanReport) -> String {
         report.metadata.knowledge.fingerprint_rules_loaded,
         report.metadata.knowledge.fingerprint_rules_skipped,
         report.metadata.knowledge.nse_scripts_seen,
-        report.metadata.knowledge.nselib_modules_seen
+        report.metadata.knowledge.nselib_modules_seen,
+        report.metadata.knowledge.os_fingerprint_signatures_loaded,
+        report.metadata.knowledge.os_fingerprint_classes_loaded,
+        report.metadata.knowledge.os_fingerprint_cpes_loaded
     ));
 
     for host in &report.hosts {
@@ -78,6 +81,9 @@ pub fn render(report: &ScanReport) -> String {
             "host target={} ip={} risk={}\n",
             host.target, host.ip, host.risk_score
         ));
+        if let Some(os_profile) = host_os_profile(host) {
+            out.push_str(&format!("os_profile={os_profile}\n"));
+        }
         if host.device_class.is_some() || host.observed_mac.is_some() {
             out.push_str(&format!(
                 "device class={} vendor={} mac={}\n",
