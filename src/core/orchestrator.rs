@@ -1584,6 +1584,7 @@ fn host_parallelism(
         ScanProfile::Turbo => 10,
         ScanProfile::Aggressive => 12,
         ScanProfile::RootOnly => 4,
+        ScanProfile::Hybrid => 8,
     };
     let mode_floor = match strategy.mode {
         ExecutionMode::Async => 2,
@@ -1620,6 +1621,7 @@ fn host_parallelism(
 mod tests {
     use super::{
         apply_defensive_port_policy, checkpoint_signature, enforce_defensive_scope, shard_slice,
+        run_scan,
     };
     use crate::error::NProbeError;
     use crate::models::{ReportFormat, ScanProfile, ScanRequest};
@@ -1654,8 +1656,8 @@ mod tests {
             rate_limit_pps: None,
             burst_size: None,
             max_retries: None,
-            total_shards: Some(4),
-            shard_index: Some(1),
+            total_shards: None,
+            shard_index: None,
             scan_seed: Some(99),
             resume_from_checkpoint: true,
             fresh_scan: false,
@@ -1675,12 +1677,16 @@ mod tests {
 
     #[test]
     fn checkpoint_signature_changes_with_shard_index() {
-        let request = base_request();
+        let mut request = base_request();
+        request.total_shards = Some(4);
+        request.shard_index = Some(1);
         let hosts = vec!["10.0.0.1".to_string(), "10.0.0.2".to_string()];
         let ports = vec![22, 80, 443];
 
         let sig_a = checkpoint_signature(&request, &hosts, &ports, 4, 1, "hosts");
-        let sig_b = checkpoint_signature(&request, &hosts, &ports, 4, 2, "hosts");
+        let mut request_b = request;
+        request_b.shard_index = Some(2);
+        let sig_b = checkpoint_signature(&request_b, &hosts, &ports, 4, 2, "hosts");
 
         assert_ne!(sig_a, sig_b);
     }
@@ -1710,6 +1716,18 @@ mod tests {
             .expect("port policy should succeed");
         assert_eq!(ports, vec![22, 80]);
         assert!(!warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn hybrid_scan_executes_successfully() {
+        let mut request = base_request();
+        request.profile = ScanProfile::Hybrid;
+        request.target = "127.0.0.1".to_string();
+        request.top_ports = Some(1);
+        request.ports = Vec::new();
+
+        let report = run_scan(request).await.expect("hybrid scan should succeed");
+        assert!(!report.hosts.is_empty());
     }
 
     #[test]

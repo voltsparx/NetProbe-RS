@@ -63,7 +63,7 @@ pub fn decide(
             concurrency_cap = concurrency_cap.min(48);
             delay_floor = delay_floor.max(Duration::from_millis(20));
         }
-        ScanProfile::Balanced => {
+        ScanProfile::Balanced | ScanProfile::Hybrid => {
             rate_cap_pps = rate_cap_pps.min(8_000);
             concurrency_cap = concurrency_cap.min(96);
         }

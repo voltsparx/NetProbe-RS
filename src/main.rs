@@ -84,9 +84,9 @@ async fn run() -> NProbeResult<()> {
 
     match action {
         CliAction::Integrity(_) => unreachable!("integrity action handled above"),
-        CliAction::Sessions(SessionCommand::List { limit }) => {
-            let records = config::list_scan_sessions(limit)?;
-            println!("{}", cli::render_session_list(&records));
+        CliAction::Sessions(SessionCommand::List { limit, filters }) => {
+            let records = config::list_scan_sessions_filtered(limit, &filters)?;
+            println!("{}", cli::render_session_list(&records, &filters));
             Ok(())
         }
         CliAction::Sessions(SessionCommand::Show { session_id }) => {
@@ -101,6 +101,7 @@ async fn run() -> NProbeResult<()> {
         CliAction::Sessions(SessionCommand::Diff {
             older_session_id,
             newer_session_id,
+            session_filters,
             ip_filter,
             target_filter,
             severity_filter,
@@ -110,6 +111,7 @@ async fn run() -> NProbeResult<()> {
             let diff = config::diff_session_actionables(
                 &older_session_id,
                 &newer_session_id,
+                &session_filters,
                 ip_filter.as_deref(),
                 target_filter.as_deref(),
                 severity_filter,

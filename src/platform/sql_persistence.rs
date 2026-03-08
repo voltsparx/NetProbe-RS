@@ -74,21 +74,55 @@ pub fn save_session(db_path: &Path, record: &ScanSessionRecord) -> NProbeResult<
 
 pub fn list_sessions(db_path: &Path, limit: usize) -> NProbeResult<Vec<ScanSessionRecord>> {
     let conn = open(db_path)?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT payload_json
-             FROM scan_sessions
-             ORDER BY updated_at DESC, session_id DESC
-             LIMIT ?1",
-        )
-        .map_err(sql_err)?;
-    let rows = stmt
-        .query_map(params![limit as i64], |row| row.get::<_, String>(0))
-        .map_err(sql_err)?;
+    load_session_rows(
+        &conn,
+        "SELECT payload_json
+         FROM scan_sessions
+         ORDER BY updated_at DESC, session_id DESC
+         LIMIT ?1",
+        Some(limit as i64),
+    )
+}
+
+pub fn list_all_sessions(db_path: &Path) -> NProbeResult<Vec<ScanSessionRecord>> {
+    let conn = open(db_path)?;
+    load_session_rows(
+        &conn,
+        "SELECT payload_json
+         FROM scan_sessions
+         ORDER BY updated_at DESC, session_id DESC",
+        None,
+    )
+}
+
+fn load_session_rows(
+    conn: &Connection,
+    query: &str,
+    limit: Option<i64>,
+) -> NProbeResult<Vec<ScanSessionRecord>> {
+    let mut stmt = conn.prepare(query).map_err(sql_err)?;
+    let payloads = if let Some(limit) = limit {
+        let rows = stmt
+            .query_map(params![limit], |row| row.get::<_, String>(0))
+            .map_err(sql_err)?;
+        let mut payloads = Vec::new();
+        for row in rows {
+            payloads.push(row.map_err(sql_err)?);
+        }
+        payloads
+    } else {
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(sql_err)?;
+        let mut payloads = Vec::new();
+        for row in rows {
+            payloads.push(row.map_err(sql_err)?);
+        }
+        payloads
+    };
 
     let mut records = Vec::new();
-    for row in rows {
-        let body = row.map_err(sql_err)?;
+    for body in payloads {
         let record = serde_json::from_str::<ScanSessionRecord>(&body).map_err(|err| {
             NProbeError::Config(format!("failed to parse SQL session payload: {err}"))
         })?;

@@ -9,10 +9,12 @@ use std::io::{self, IsTerminal, Write};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
-use chrono::Utc;
+use chrono::{DateTime, NaiveDate, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use crate::config::{ActionableDiffItem, ScanSessionRecord, SessionActionableDiff};
+use crate::config::{
+    ActionableDiffItem, ScanSessionRecord, SessionActionableDiff, SessionRecordFilters,
+};
 use crate::engines::phantom_preflight;
 use crate::error::{NProbeError, NProbeResult};
 use crate::models::{ReportFormat, ScanProfile, ScanRequest};
@@ -76,7 +78,7 @@ enum Commands {
     #[command(visible_alias = "learn", visible_alias = "wizard")]
     Interactive(InteractiveArgs),
     Integrity(IntegrityArgs),
-    Sessions(SessionArgs),
+    Sessions(Box<SessionArgs>),
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +92,7 @@ pub enum CliAction {
 pub enum SessionCommand {
     List {
         limit: usize,
+        filters: SessionRecordFilters,
     },
     Show {
         session_id: String,
@@ -97,6 +100,7 @@ pub enum SessionCommand {
     Diff {
         older_session_id: String,
         newer_session_id: String,
+        session_filters: SessionRecordFilters,
         ip_filter: Option<String>,
         target_filter: Option<String>,
         severity_filter: Option<crate::reporter::actionable::ActionableSeverity>,
@@ -385,6 +389,24 @@ struct SessionArgs {
     target_filter: Option<String>,
 
     #[arg(
+        long = "profile",
+        help = "Filter session history by profile, or require both diff sessions to use this profile"
+    )]
+    profile_filter: Option<String>,
+
+    #[arg(
+        long = "updated-after",
+        help = "Filter sessions updated on or after this RFC3339/date value"
+    )]
+    updated_after: Option<String>,
+
+    #[arg(
+        long = "updated-before",
+        help = "Filter sessions updated on or before this RFC3339/date value"
+    )]
+    updated_before: Option<String>,
+
+    #[arg(
         long = "severity",
         value_enum,
         help = "Minimum severity to include in session diff: review, moderate, high, critical"
@@ -534,7 +556,7 @@ pub fn maybe_render_quick_help_mode() -> Option<String> {
     }
 
     Some(
-        "Usage:\n  nprobe-rs <target> [options]\n  nprobe-rs interactive\n  nprobe-rs integrity [--reseal]\n  nprobe-rs sessions [--limit N]\n  nprobe-rs sessions --show <session-id>\n  nprobe-rs sessions --diff <older-session-id> <newer-session-id>\n\nCommon options:\n  -p, --ports <list|range>   Select ports (example: -p 22,80,443)\n      --all-ports            Scan ports 1-65535 (Nmap: -p-)\n  -U, --udp                  Enable UDP probes (Nmap: -sU)\n  -S, --syn                  Enable privileged TCP probes (Nmap: -sS)\n      --connect              Force user-space TCP connect scanning (Nmap: -sT)\n      --arp                  Enable ARP neighbor discovery (local IPv4)\n  -A, --aggressive           Aggressive mode (Nmap: -A)\n  -w, --timeout-ms <ms>      Probe timeout in milliseconds\n      --rate-pps <num>       Dispatch rate target in packets per second\n      --burst-size <num>     Token-bucket burst limit\n      --max-retries <num>    Adaptive retries per probe (0..20)\n      --total-shards <num>   Total shard count for distributed scans\n      --shard-index <num>    Current shard index (requires total-shards)\n      --scan-seed <num>      Deterministic port shuffle seed\n      --resume               Resume from shard checkpoint\n      --fresh-scan           Ignore/reset shard checkpoint for this run\n  -r, --reverse-dns          Enable reverse DNS lookups\n  -n, --no-dns               Disable reverse DNS lookups\n  -e, --explain              Add concise per-port rationale in output\n  -v, --verbose              Show full output sections\n  -f, --file-type <type>     Export format: txt|json|html|csv\n  -o, --output <name>        Output filename\n  -L, --location <dir>       Output directory\n\nLearner mode:\n  nprobe-rs interactive      Guided prompt mode with banner and safe defaults\n  nprobe-rs learn            Alias for interactive mode\n\nIntegrity:\n  nprobe-rs integrity\n  nprobe-rs integrity --reseal\n\nSession history:\n  nprobe-rs sessions --limit 20\n  nprobe-rs sessions --show <session-id>\n  nprobe-rs sessions --diff <older-session-id> <newer-session-id>\n      Optional diff filters: --ip <addr> --target-contains <text> --severity <level>\n      Optional diff export:  -f txt|json|html -o <name> -L <dir>\n\nNmap-style shortcuts accepted:\n  -sU  -sS  -sT  -sV  -Pn  -A  -T0..-T5  -p-\n\nFlag docs mode:\n  nprobe-rs --flag-help --scan\n  nprobe-rs --flag-help -sU\n  nprobe-rs --explain --scan   (legacy alias)\n\nCompatibility:\n  nprobe-rs scan <target> [options] still works.".to_string(),
+        "Usage:\n  nprobe-rs <target> [options]\n  nprobe-rs interactive\n  nprobe-rs integrity [--reseal]\n  nprobe-rs sessions [--limit N]\n  nprobe-rs sessions --show <session-id>\n  nprobe-rs sessions --diff <older-session-id> <newer-session-id>\n\nCommon options:\n  -p, --ports <list|range>   Select ports (example: -p 22,80,443)\n      --all-ports            Scan ports 1-65535 (Nmap: -p-)\n  -U, --udp                  Enable UDP probes (Nmap: -sU)\n  -S, --syn                  Enable privileged TCP probes (Nmap: -sS)\n      --connect              Force user-space TCP connect scanning (Nmap: -sT)\n      --arp                  Enable ARP neighbor discovery (local IPv4)\n  -A, --aggressive           Aggressive mode (Nmap: -A)\n  -w, --timeout-ms <ms>      Probe timeout in milliseconds\n      --rate-pps <num>       Dispatch rate target in packets per second\n      --burst-size <num>     Token-bucket burst limit\n      --max-retries <num>    Adaptive retries per probe (0..20)\n      --total-shards <num>   Total shard count for distributed scans\n      --shard-index <num>    Current shard index (requires total-shards)\n      --scan-seed <num>      Deterministic port shuffle seed\n      --resume               Resume from shard checkpoint\n      --fresh-scan           Ignore/reset shard checkpoint for this run\n  -r, --reverse-dns          Enable reverse DNS lookups\n  -n, --no-dns               Disable reverse DNS lookups\n  -e, --explain              Add concise per-port rationale in output\n  -v, --verbose              Show full output sections\n  -f, --file-type <type>     Export format: txt|json|html|csv\n  -o, --output <name>        Output filename\n  -L, --location <dir>       Output directory\n\nLearner mode:\n  nprobe-rs interactive      Guided prompt mode with banner and safe defaults\n  nprobe-rs learn            Alias for interactive mode\n\nIntegrity:\n  nprobe-rs integrity\n  nprobe-rs integrity --reseal\n\nSession history:\n  nprobe-rs sessions --limit 20\n  nprobe-rs sessions --show <session-id>\n  nprobe-rs sessions --diff <older-session-id> <newer-session-id>\n      Optional session filters: --profile <name> --updated-after <ts> --updated-before <ts>\n      Optional diff filters:    --ip <addr> --target-contains <text> --severity <level>\n      Optional diff export:     -f txt|json|html -o <name> -L <dir>\n\nNmap-style shortcuts accepted:\n  -sU  -sS  -sT  -sV  -Pn  -A  -T0..-T5  -p-\n\nFlag docs mode:\n  nprobe-rs --flag-help --scan\n  nprobe-rs --flag-help -sU\n  nprobe-rs --explain --scan   (legacy alias)\n\nCompatibility:\n  nprobe-rs scan <target> [options] still works.".to_string(),
     )
 }
 
@@ -545,6 +567,12 @@ impl SessionArgs {
                 "--limit must be greater than 0".to_string(),
             ));
         }
+
+        let session_filters = build_session_record_filters(
+            self.profile_filter,
+            self.updated_after,
+            self.updated_before,
+        )?;
 
         if let Some(values) = self.diff {
             if self.session_id.is_some() {
@@ -583,6 +611,7 @@ impl SessionArgs {
             return Ok(CliAction::Sessions(SessionCommand::Diff {
                 older_session_id: older.to_string(),
                 newer_session_id: newer.to_string(),
+                session_filters,
                 ip_filter: self.ip_filter.filter(|value| !value.trim().is_empty()),
                 target_filter: self.target_filter.filter(|value| !value.trim().is_empty()),
                 severity_filter: self
@@ -612,6 +641,12 @@ impl SessionArgs {
                     "--show requires a non-empty session id".to_string(),
                 ));
             }
+            if session_filters.is_active() {
+                return Err(NProbeError::Cli(
+                    "session history filters require --diff or plain sessions listing, not --show"
+                        .to_string(),
+                ));
+            }
             return Ok(CliAction::Sessions(SessionCommand::Show {
                 session_id: trimmed.to_string(),
             }));
@@ -619,6 +654,7 @@ impl SessionArgs {
 
         Ok(CliAction::Sessions(SessionCommand::List {
             limit: self.limit,
+            filters: session_filters,
         }))
     }
 }
@@ -1208,27 +1244,36 @@ fn looks_like_private_ipv4_target(target: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub fn render_session_list(records: &[ScanSessionRecord]) -> String {
+pub fn render_session_list(
+    records: &[ScanSessionRecord],
+    filters: &SessionRecordFilters,
+) -> String {
     let mut out = String::new();
     out.push_str("nprobe-rs session history\n");
+    append_session_filter_summary(&mut out, filters);
     if records.is_empty() {
-        out.push_str("No persisted sessions found.\n");
+        if filters.is_active() {
+            out.push_str("No persisted sessions matched the active filters.\n");
+        } else {
+            out.push_str("No persisted sessions found.\n");
+        }
         return out;
     }
 
     out.push_str(&format!(
-        "{:<33} {:<12} {:<25} {}\n",
-        "SESSION ID", "STATUS", "UPDATED", "TARGET"
+        "{:<33} {:<12} {:<12} {:<25} {}\n",
+        "SESSION ID", "PROFILE", "STATUS", "UPDATED", "TARGET"
     ));
     out.push_str(&format!(
-        "{:-<33} {:-<12} {:-<25} {:-<20}\n",
-        "", "", "", ""
+        "{:-<33} {:-<12} {:-<12} {:-<25} {:-<20}\n",
+        "", "", "", "", ""
     ));
 
     for record in records {
         out.push_str(&format!(
-            "{:<33} {:<12} {:<25} {}\n",
+            "{:<33} {:<12} {:<12} {:<25} {}\n",
             truncate_cell(&record.session_id, 33),
+            truncate_cell(&record.profile, 12),
             record.status.as_str(),
             truncate_cell(&record.updated_at, 25),
             record.target
@@ -1360,6 +1405,7 @@ pub fn render_session_diff(diff: &SessionActionableDiff) -> String {
         diff.reduced.len(),
         diff.unchanged
     ));
+    append_session_filter_summary(&mut out, &diff.session_filters);
     if let Some(ip_filter) = &diff.ip_filter {
         out.push_str(&format!("ip_filter={ip_filter}\n"));
     }
@@ -1420,6 +1466,7 @@ pub fn render_session_diff_html(diff: &SessionActionableDiff) -> String {
         diff.reduced.len(),
         diff.unchanged
     ));
+    append_session_filter_summary_html(&mut html, &diff.session_filters);
     if let Some(ip_filter) = &diff.ip_filter {
         html.push_str(&format!(
             "<div class=\"meta\">IP filter: <code>{}</code></div>",
@@ -1459,12 +1506,108 @@ fn truncate_cell(value: &str, width: usize) -> String {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct SeverityCounts {
+    critical: usize,
+    high: usize,
+    moderate: usize,
+    review: usize,
+}
+
+impl SeverityCounts {
+    fn add(&mut self, severity: crate::reporter::actionable::ActionableSeverity) {
+        match severity {
+            crate::reporter::actionable::ActionableSeverity::Critical => self.critical += 1,
+            crate::reporter::actionable::ActionableSeverity::High => self.high += 1,
+            crate::reporter::actionable::ActionableSeverity::Moderate => self.moderate += 1,
+            crate::reporter::actionable::ActionableSeverity::Review => self.review += 1,
+        }
+    }
+}
+
+fn append_session_filter_summary(out: &mut String, filters: &SessionRecordFilters) {
+    if !filters.is_active() {
+        return;
+    }
+
+    out.push_str("filters:\n");
+    if let Some(profile_filter) = &filters.profile_filter {
+        out.push_str(&format!("  profile={profile_filter}\n"));
+    }
+    if let Some(updated_after) = filters.updated_after {
+        out.push_str(&format!("  updated_after={}\n", updated_after.to_rfc3339()));
+    }
+    if let Some(updated_before) = filters.updated_before {
+        out.push_str(&format!(
+            "  updated_before={}\n",
+            updated_before.to_rfc3339()
+        ));
+    }
+}
+
+fn append_session_filter_summary_html(html: &mut String, filters: &SessionRecordFilters) {
+    if !filters.is_active() {
+        return;
+    }
+
+    if let Some(profile_filter) = &filters.profile_filter {
+        html.push_str(&format!(
+            "<div class=\"meta\">Profile filter: <code>{}</code></div>",
+            escape_html(profile_filter)
+        ));
+    }
+    if let Some(updated_after) = filters.updated_after {
+        html.push_str(&format!(
+            "<div class=\"meta\">Updated after: <code>{}</code></div>",
+            escape_html(&updated_after.to_rfc3339())
+        ));
+    }
+    if let Some(updated_before) = filters.updated_before {
+        html.push_str(&format!(
+            "<div class=\"meta\">Updated before: <code>{}</code></div>",
+            escape_html(&updated_before.to_rfc3339())
+        ));
+    }
+}
+
+fn diff_section_counts(items: &[ActionableDiffItem]) -> (usize, SeverityCounts) {
+    let mut hosts = BTreeSet::new();
+    let mut counts = SeverityCounts::default();
+    for item in items {
+        hosts.insert((item.ip.as_str(), item.target.as_str()));
+        counts.add(diff_item_effective_severity(item));
+    }
+    (hosts.len(), counts)
+}
+
+fn diff_host_severity_counts(items: &[&ActionableDiffItem]) -> SeverityCounts {
+    let mut counts = SeverityCounts::default();
+    for item in items {
+        counts.add(diff_item_effective_severity(item));
+    }
+    counts
+}
+
+fn render_severity_counts_inline(counts: SeverityCounts) -> String {
+    format!(
+        "critical {} | high {} | moderate {} | review {}",
+        counts.critical, counts.high, counts.moderate, counts.review
+    )
+}
+
 fn append_diff_section(out: &mut String, title: &str, items: &[ActionableDiffItem]) {
     if items.is_empty() {
         return;
     }
 
+    let (host_count, severity_counts) = diff_section_counts(items);
     out.push_str(&format!("{title}:\n"));
+    out.push_str(&format!(
+        "  hosts={} items={} {}\n",
+        host_count,
+        items.len(),
+        render_severity_counts_inline(severity_counts)
+    ));
     for item in items {
         let severity = match (item.severity_before, item.severity_after) {
             (Some(before), Some(after)) if before != after => {
@@ -1499,8 +1642,16 @@ fn append_diff_section_html(html: &mut String, title: &str, items: &[ActionableD
             .push(item);
     }
 
+    let (host_count, section_counts) = diff_section_counts(items);
     html.push_str(&format!("<div class=\"card\"><h2>{}</h2>", title));
+    html.push_str(&format!(
+        "<div class=\"meta\">Hosts: {} | Items: {} | {}</div>",
+        host_count,
+        items.len(),
+        escape_html(&render_severity_counts_inline(section_counts))
+    ));
     for ((ip, target), host_items) in groups {
+        let host_counts = diff_host_severity_counts(&host_items);
         let highest = host_items
             .iter()
             .filter_map(|item| item.severity_after.or(item.severity_before))
@@ -1518,13 +1669,14 @@ fn append_diff_section_html(html: &mut String, title: &str, items: &[ActionableD
         };
 
         html.push_str(&format!(
-            "<details{}><summary><span class=\"sev sev-{}\">{}</span>{} ({}) - {} item(s)</summary><ul>",
+            "<details{}><summary><span class=\"sev sev-{}\">{}</span>{} ({}) - {} item(s) <span class=\"meta\">{}</span></summary><ul>",
             open_attr,
             escape_html(highest.as_str()),
             escape_html(highest.as_str()),
             escape_html(&ip),
             escape_html(&target),
-            host_items.len()
+            host_items.len(),
+            escape_html(&render_severity_counts_inline(host_counts))
         ));
 
         for item in host_items {
@@ -1581,11 +1733,16 @@ fn diff_item_severity_label(item: &ActionableDiffItem) -> String {
     }
 }
 
-fn diff_item_css_severity(item: &ActionableDiffItem) -> &'static str {
+fn diff_item_effective_severity(
+    item: &ActionableDiffItem,
+) -> crate::reporter::actionable::ActionableSeverity {
     item.severity_after
         .or(item.severity_before)
         .unwrap_or(crate::reporter::actionable::ActionableSeverity::Review)
-        .as_str()
+}
+
+fn diff_item_css_severity(item: &ActionableDiffItem) -> &'static str {
+    diff_item_effective_severity(item).as_str()
 }
 
 fn map_timing_to_profile(level: &str) -> Option<&'static str> {
@@ -1640,6 +1797,69 @@ fn build_output_path(
     }
 
     Ok(Some(output_path))
+}
+
+fn build_session_record_filters(
+    profile_filter: Option<String>,
+    updated_after: Option<String>,
+    updated_before: Option<String>,
+) -> NProbeResult<SessionRecordFilters> {
+    let filters = SessionRecordFilters {
+        profile_filter: profile_filter
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty()),
+        updated_after: updated_after
+            .as_deref()
+            .map(|value| parse_session_time_filter(value, false))
+            .transpose()?,
+        updated_before: updated_before
+            .as_deref()
+            .map(|value| parse_session_time_filter(value, true))
+            .transpose()?,
+    };
+
+    if let (Some(updated_after), Some(updated_before)) =
+        (filters.updated_after, filters.updated_before)
+    {
+        if updated_after > updated_before {
+            return Err(NProbeError::Cli(
+                "--updated-after must be earlier than or equal to --updated-before".to_string(),
+            ));
+        }
+    }
+
+    Ok(filters)
+}
+
+fn parse_session_time_filter(raw: &str, end_of_day: bool) -> NProbeResult<DateTime<Utc>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(NProbeError::Cli(
+            "session time filters cannot be empty".to_string(),
+        ));
+    }
+
+    if let Ok(timestamp) = DateTime::parse_from_rfc3339(trimmed) {
+        return Ok(timestamp.with_timezone(&Utc));
+    }
+
+    if let Ok(date) = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
+        let naive = if end_of_day {
+            date.and_hms_milli_opt(23, 59, 59, 999)
+        } else {
+            date.and_hms_opt(0, 0, 0)
+        }
+        .ok_or_else(|| {
+            NProbeError::Cli(format!(
+                "failed to normalize date-only session filter '{trimmed}'"
+            ))
+        })?;
+        return Ok(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc));
+    }
+
+    Err(NProbeError::Cli(format!(
+        "invalid session timestamp '{trimmed}'. Use RFC3339 like 2026-03-07T10:30:00Z or date-only like 2026-03-07"
+    )))
 }
 
 fn parse_ports(raw: &str) -> NProbeResult<Vec<u16>> {
@@ -1744,6 +1964,12 @@ mod tests {
             "--diff",
             "older-session",
             "newer-session",
+            "--profile",
+            "phantom",
+            "--updated-after",
+            "2026-03-01",
+            "--updated-before",
+            "2026-03-07",
             "--severity",
             "high",
         ]);
@@ -1752,12 +1978,40 @@ mod tests {
             CliAction::Sessions(SessionCommand::Diff {
                 older_session_id,
                 newer_session_id,
+                session_filters,
                 severity_filter,
                 ..
             }) => {
                 assert_eq!(older_session_id, "older-session");
                 assert_eq!(newer_session_id, "newer-session");
+                assert_eq!(session_filters.profile_filter.as_deref(), Some("phantom"));
+                assert!(session_filters.updated_after.is_some());
+                assert!(session_filters.updated_before.is_some());
                 assert_eq!(severity_filter, Some(ActionableSeverity::High));
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sessions_list_accepts_profile_and_time_filters() {
+        let cli = Cli::parse_from([
+            "nprobe-rs",
+            "sessions",
+            "--limit",
+            "5",
+            "--profile",
+            "balanced",
+            "--updated-after",
+            "2026-03-01T00:00:00Z",
+        ]);
+        let action = cli.into_action().expect("cli action should parse");
+        match action {
+            CliAction::Sessions(SessionCommand::List { limit, filters }) => {
+                assert_eq!(limit, 5);
+                assert_eq!(filters.profile_filter.as_deref(), Some("balanced"));
+                assert!(filters.updated_after.is_some());
+                assert!(filters.updated_before.is_none());
             }
             other => panic!("unexpected action: {other:?}"),
         }

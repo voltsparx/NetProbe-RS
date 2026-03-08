@@ -82,7 +82,7 @@ pub fn plan(request: &ScanRequest, host_count: usize, port_count: usize) -> Scan
                 ExecutionMode::Async
             }
         }
-        ScanProfile::Turbo | ScanProfile::Aggressive | ScanProfile::RootOnly => {
+        ScanProfile::Turbo | ScanProfile::Aggressive | ScanProfile::RootOnly | ScanProfile::Hybrid => {
             ExecutionMode::Hybrid
         }
     };

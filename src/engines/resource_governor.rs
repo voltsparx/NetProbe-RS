@@ -43,7 +43,7 @@ pub fn plan(
         ScanProfile::Kis => 1,
         ScanProfile::Sar => 2,
         ScanProfile::Stealth => 2,
-        ScanProfile::Balanced => 4,
+        ScanProfile::Balanced | ScanProfile::Hybrid => 4,
         ScanProfile::Turbo => 6,
         ScanProfile::Aggressive => 7,
         ScanProfile::RootOnly => 5,
@@ -62,7 +62,9 @@ pub fn plan(
         ScanProfile::Kis => 96,
         ScanProfile::Sar => 180,
         ScanProfile::Stealth => (cpu_threads as u32 * 450).clamp(600, 4_000),
-        ScanProfile::Balanced => (cpu_threads as u32 * 1_200).clamp(2_000, 14_000),
+        ScanProfile::Balanced | ScanProfile::Hybrid => {
+            (cpu_threads as u32 * 1_200).clamp(2_000, 14_000)
+        }
         ScanProfile::Turbo => (cpu_threads as u32 * 1_600).clamp(4_000, 18_000),
         ScanProfile::Aggressive => (cpu_threads as u32 * 1_900).clamp(5_000, 22_000),
         ScanProfile::RootOnly => (cpu_threads as u32 * 900).clamp(2_000, 10_000),
@@ -72,7 +74,7 @@ pub fn plan(
         ScanProfile::Phantom | ScanProfile::Kis => 1,
         ScanProfile::Sar => 2,
         ScanProfile::Stealth => 24,
-        ScanProfile::Balanced => (cpu_threads * 12).clamp(32, 192),
+        ScanProfile::Balanced | ScanProfile::Hybrid => (cpu_threads * 12).clamp(32, 192),
         ScanProfile::Turbo | ScanProfile::Aggressive => (cpu_threads * 16).clamp(48, 256),
         ScanProfile::RootOnly => (cpu_threads * 10).clamp(24, 128),
     };
@@ -82,7 +84,9 @@ pub fn plan(
             format!("tbns-low-impact/cpu{cpu_threads}")
         }
         ScanProfile::Stealth => format!("cautious-parallel/cpu{cpu_threads}"),
-        ScanProfile::Balanced => format!("balanced-multi-host/cpu{cpu_threads}"),
+        ScanProfile::Balanced | ScanProfile::Hybrid => {
+            format!("balanced-multi-host/cpu{cpu_threads}")
+        }
         ScanProfile::Turbo | ScanProfile::Aggressive => {
             format!("high-coverage-hybrid/cpu{cpu_threads}")
         }

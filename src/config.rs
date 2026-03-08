@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{NProbeError, NProbeResult};
@@ -94,6 +94,13 @@ pub struct ScanSessionRecord {
     pub notes: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionRecordFilters {
+    pub profile_filter: Option<String>,
+    pub updated_after: Option<DateTime<Utc>>,
+    pub updated_before: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ActionableDiffItem {
     pub ip: String,
@@ -109,6 +116,7 @@ pub struct ActionableDiffItem {
 pub struct SessionActionableDiff {
     pub older: ScanSessionRecord,
     pub newer: ScanSessionRecord,
+    pub session_filters: SessionRecordFilters,
     pub ip_filter: Option<String>,
     pub target_filter: Option<String>,
     pub severity_filter: Option<ActionableSeverity>,
@@ -127,6 +135,46 @@ impl ScanSessionStatus {
             ScanSessionStatus::Interrupted => "interrupted",
             ScanSessionStatus::Failed => "failed",
         }
+    }
+}
+
+impl SessionRecordFilters {
+    pub fn is_active(&self) -> bool {
+        self.profile_filter.is_some()
+            || self.updated_after.is_some()
+            || self.updated_before.is_some()
+    }
+
+    pub fn matches(&self, record: &ScanSessionRecord) -> bool {
+        if let Some(profile_filter) = self
+            .profile_filter
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if !record.profile.eq_ignore_ascii_case(profile_filter) {
+                return false;
+            }
+        }
+
+        let updated_at = match parse_session_record_timestamp(&record.updated_at) {
+            Some(timestamp) => timestamp,
+            None => return false,
+        };
+
+        if let Some(updated_after) = self.updated_after {
+            if updated_at < updated_after {
+                return false;
+            }
+        }
+
+        if let Some(updated_before) = self.updated_before {
+            if updated_at > updated_before {
+                return false;
+            }
+        }
+
+        true
     }
 }
 
@@ -306,42 +354,42 @@ pub fn start_scan_session(request: &ScanRequest) -> NProbeResult<ScanSessionReco
     Ok(record)
 }
 
-pub fn list_scan_sessions(limit: usize) -> NProbeResult<Vec<ScanSessionRecord>> {
+pub fn list_scan_sessions_filtered(
+    limit: usize,
+    filters: &SessionRecordFilters,
+) -> NProbeResult<Vec<ScanSessionRecord>> {
     if limit == 0 {
         return Ok(Vec::new());
     }
 
     let config_dir = resolve_config_dir()?;
     let db_path = sql_persistence::database_path(&config_dir);
-    if db_path.exists() {
-        let records = sql_persistence::list_sessions(&db_path, limit)?;
-        if !records.is_empty() {
-            return Ok(records);
+    let mut records = if db_path.exists() {
+        let records = if filters.is_active() {
+            sql_persistence::list_all_sessions(&db_path)?
+        } else {
+            sql_persistence::list_sessions(&db_path, limit)?
+        };
+        if !records.is_empty() || !filters.is_active() {
+            records
+        } else {
+            Vec::new()
         }
+    } else {
+        Vec::new()
+    };
+
+    if records.is_empty() {
+        let session_dir = config_dir.join(SESSION_DIR_NAME);
+        if !session_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        records = load_session_records_from_dir(&session_dir)?;
     }
 
-    let session_dir = config_dir.join(SESSION_DIR_NAME);
-    if !session_dir.exists() {
-        return Ok(Vec::new());
-    }
-
-    let mut records = Vec::new();
-    for entry in fs::read_dir(session_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if !entry.file_type()?.is_file()
-            || path.extension().and_then(|value| value.to_str()) != Some("json")
-        {
-            continue;
-        }
-
-        let Ok(body) = fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(record) = serde_json::from_str::<ScanSessionRecord>(&body) else {
-            continue;
-        };
-        records.push(record);
+    if filters.is_active() {
+        records.retain(|record| filters.matches(record));
     }
 
     records.sort_by(|left, right| {
@@ -380,6 +428,7 @@ pub fn load_scan_session(session_id: &str) -> NProbeResult<Option<ScanSessionRec
 pub fn diff_session_actionables(
     older_session_id: &str,
     newer_session_id: &str,
+    session_filters: &SessionRecordFilters,
     ip_filter: Option<&str>,
     target_filter: Option<&str>,
     severity_filter: Option<ActionableSeverity>,
@@ -388,6 +437,9 @@ pub fn diff_session_actionables(
         .ok_or_else(|| NProbeError::Cli(format!("session '{older_session_id}' was not found")))?;
     let newer = load_scan_session(newer_session_id)?
         .ok_or_else(|| NProbeError::Cli(format!("session '{newer_session_id}' was not found")))?;
+
+    ensure_session_matches_filters("older", &older, session_filters)?;
+    ensure_session_matches_filters("newer", &newer, session_filters)?;
 
     let db_path = sql_persistence::database_path(&resolve_config_dir()?);
     if !db_path.exists() {
@@ -454,6 +506,7 @@ pub fn diff_session_actionables(
     Ok(SessionActionableDiff {
         older,
         newer,
+        session_filters: session_filters.clone(),
         ip_filter: ip_filter.map(str::to_string),
         target_filter: target_filter.map(str::to_string),
         severity_filter,
@@ -463,6 +516,85 @@ pub fn diff_session_actionables(
         reduced,
         unchanged,
     })
+}
+
+fn load_session_records_from_dir(session_dir: &Path) -> NProbeResult<Vec<ScanSessionRecord>> {
+    let mut records = Vec::new();
+    for entry in fs::read_dir(session_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !entry.file_type()?.is_file()
+            || path.extension().and_then(|value| value.to_str()) != Some("json")
+        {
+            continue;
+        }
+
+        let Ok(body) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_str::<ScanSessionRecord>(&body) else {
+            continue;
+        };
+        records.push(record);
+    }
+    Ok(records)
+}
+
+fn parse_session_record_timestamp(raw: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+}
+
+fn ensure_session_matches_filters(
+    label: &str,
+    record: &ScanSessionRecord,
+    filters: &SessionRecordFilters,
+) -> NProbeResult<()> {
+    if let Some(profile_filter) = filters
+        .profile_filter
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if !record.profile.eq_ignore_ascii_case(profile_filter) {
+            return Err(NProbeError::Cli(format!(
+                "{label} session '{}' uses profile '{}', which does not match --profile {}",
+                record.session_id, record.profile, profile_filter
+            )));
+        }
+    }
+
+    let Some(updated_at) = parse_session_record_timestamp(&record.updated_at) else {
+        return Err(NProbeError::Config(format!(
+            "session '{}' has an invalid updated_at timestamp '{}'",
+            record.session_id, record.updated_at
+        )));
+    };
+
+    if let Some(updated_after) = filters.updated_after {
+        if updated_at < updated_after {
+            return Err(NProbeError::Cli(format!(
+                "{label} session '{}' was updated at {} which is earlier than --updated-after {}",
+                record.session_id,
+                record.updated_at,
+                updated_after.to_rfc3339()
+            )));
+        }
+    }
+
+    if let Some(updated_before) = filters.updated_before {
+        if updated_at > updated_before {
+            return Err(NProbeError::Cli(format!(
+                "{label} session '{}' was updated at {} which is later than --updated-before {}",
+                record.session_id,
+                record.updated_at,
+                updated_before.to_rfc3339()
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 pub fn complete_scan_session(
@@ -1019,14 +1151,16 @@ fn parse_profile(raw: &str) -> Option<ScanProfile> {
         "turbo" => Some(ScanProfile::Turbo),
         "aggressive" => Some(ScanProfile::Aggressive),
         "root-only" | "root_only" | "rootonly" => Some(ScanProfile::RootOnly),
+        "hybrid" => Some(ScanProfile::Hybrid),
         _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_profile;
+    use super::{parse_profile, ScanSessionRecord, ScanSessionStatus, SessionRecordFilters};
     use crate::models::ScanProfile;
+    use chrono::{DateTime, Utc};
 
     #[test]
     fn parse_profile_accepts_low_impact_concepts() {
@@ -1036,5 +1170,49 @@ mod tests {
         ));
         assert!(matches!(parse_profile("sar-scan"), Some(ScanProfile::Sar)));
         assert!(matches!(parse_profile("kis_scan"), Some(ScanProfile::Kis)));
+    }
+
+    #[test]
+    fn session_record_filters_match_profile_and_time_window() {
+        let record = ScanSessionRecord {
+            version: 1,
+            session_id: "sess-1".to_string(),
+            status: ScanSessionStatus::Completed,
+            target: "10.0.0.5".to_string(),
+            profile: "phantom".to_string(),
+            report_format: "txt".to_string(),
+            started_at: "2026-03-06T10:00:00Z".to_string(),
+            updated_at: "2026-03-06T10:10:00Z".to_string(),
+            finished_at: Some("2026-03-06T10:12:00Z".to_string()),
+            scan_seed: None,
+            total_shards: None,
+            shard_index: None,
+            rate_limit_pps: None,
+            burst_size: None,
+            max_retries: None,
+            output_path: None,
+            host_count: None,
+            responded_hosts: None,
+            duration_ms: None,
+            host_snapshot_count: None,
+            failure_category: None,
+            recovery_hint: None,
+            notes: Vec::new(),
+        };
+        let filters = SessionRecordFilters {
+            profile_filter: Some("phantom".to_string()),
+            updated_after: Some(
+                DateTime::parse_from_rfc3339("2026-03-06T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            updated_before: Some(
+                DateTime::parse_from_rfc3339("2026-03-06T23:59:59Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+        };
+
+        assert!(filters.matches(&record));
     }
 }

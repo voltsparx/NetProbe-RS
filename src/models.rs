@@ -53,6 +53,7 @@ pub enum ScanProfile {
     Turbo,
     Aggressive,
     RootOnly,
+    Hybrid,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -73,6 +74,7 @@ impl ScanProfile {
             ScanProfile::Turbo => "turbo",
             ScanProfile::Aggressive => "aggressive",
             ScanProfile::RootOnly => "root-only",
+            ScanProfile::Hybrid => "hybrid",
         }
     }
 
@@ -150,6 +152,11 @@ impl ScanProfile {
                 concurrency: 72,
                 timeout_ms: 1800,
                 delay_ms: 8,
+            },
+            ScanProfile::Hybrid => ProfileDefaults {
+                concurrency: 128,
+                timeout_ms: 1200,
+                delay_ms: 5,
             },
         }
     }
