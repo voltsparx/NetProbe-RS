@@ -14,7 +14,7 @@ impl Default for StabilizerEngine {
             smoothing: 0.78,
             max_step_up: 0.20,
             max_step_down: 0.35,
-            min_rate_floor: 64,
+            min_rate_floor: 1,
         }
     }
 }

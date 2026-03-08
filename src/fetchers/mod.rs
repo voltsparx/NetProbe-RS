@@ -94,6 +94,24 @@ pub async fn run(request: &ScanRequest, host: &HostResult) -> FetcherReport {
         }
     }
 
+    if request.callback_ping {
+        if icmp_reachable {
+            report.insights.push(
+                "callback ping: guarded post-discovery reachability confirmation succeeded"
+                    .to_string(),
+            );
+            report.learning_notes.push(
+                "callback ping mode reused the low-impact fetcher plane instead of adding a separate active reflex path."
+                    .to_string(),
+            );
+        } else {
+            report.warnings.push(
+                "callback ping: no guarded reachability confirmation was observed for this host"
+                    .to_string(),
+            );
+        }
+    }
+
     // Dependent fetchers run only when prerequisites succeeded.
     if !web_outcome.detected_ports.is_empty() {
         report.merge(web_header_fetcher(ip, &web_outcome.detected_ports, timeout_budget).await);

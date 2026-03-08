@@ -7,6 +7,7 @@ mod cli;
 mod config;
 mod core;
 mod engine_async;
+mod engine_gpu;
 mod engine_intel;
 mod engine_packet;
 mod engine_parallel;

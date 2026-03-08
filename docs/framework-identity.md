@@ -12,7 +12,7 @@ NProbe-RS is a defensive network audit framework, not just a port scanner.
 ## What Makes It Enterprise-Oriented
 
 - `TBNS` for low-impact first contact on unknown devices
-- multi-stage scan bundles so the framework can sequence first touch, discovery, and narrow enrichment without forcing one scan style everywhere
+- multi-stage scan bundles so the framework can sequence first touch, masscan-style discovery, and nmap-style enrichment without forcing one scan style everywhere
 - adaptive multi-host coverage instead of raw packet blasting
 - integrity enforcement and reseal workflow
 - session persistence and resumable work
@@ -25,7 +25,7 @@ NProbe-RS is a defensive network audit framework, not just a port scanner.
 NProbe-RS is optimized for balanced defensive throughput:
 
 - faster coverage through controlled parallelism
-- hybrid async execution where it stays safe
+- hybrid execution where masscan-style discovery can hand off to nmap-style knowledge correlation when it stays safe
 - device-aware throttling and suppression
 - staged enrichment so expensive checks happen only when justified
 - bio-response governor decisions that can soften or widen coverage per host based on resilience signals

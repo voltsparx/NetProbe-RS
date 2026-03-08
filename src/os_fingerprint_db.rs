@@ -224,7 +224,7 @@ impl OsClassRecord {
         if precision >= 3 {
             push_unique_part(&mut parts, &self.generation);
         }
-        if precision >= 2 {
+        if precision >= 2 && !generic_device_type(&self.device_type) {
             push_unique_part(&mut parts, &self.device_type);
         }
 
@@ -573,6 +573,13 @@ fn push_unique_part(parts: &mut Vec<String>, value: &str) {
         return;
     }
     parts.push(value.trim().to_string());
+}
+
+fn generic_device_type(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "" | "general purpose" | "specialized"
+    )
 }
 
 fn candidate_nmap_roots() -> [PathBuf; 2] {

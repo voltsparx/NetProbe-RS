@@ -48,6 +48,16 @@ pub fn decide(
                     .to_string(),
             );
         }
+        ScanProfile::Idf => {
+            rate_cap_pps = rate_cap_pps.min(48);
+            concurrency_cap = concurrency_cap.min(2);
+            delay_floor = delay_floor.max(Duration::from_millis(180));
+            service_detection_allowed = false;
+            notes.push(
+                "bio-response: idf profile stayed in inert-decoy-fog pacing with no active follow-up payloads"
+                    .to_string(),
+            );
+        }
         ScanProfile::Sar => {
             rate_cap_pps = rate_cap_pps.min(144);
             concurrency_cap = concurrency_cap.min(6);
@@ -62,6 +72,15 @@ pub fn decide(
             rate_cap_pps = rate_cap_pps.min(2_000);
             concurrency_cap = concurrency_cap.min(48);
             delay_floor = delay_floor.max(Duration::from_millis(20));
+        }
+        ScanProfile::Mirror => {
+            rate_cap_pps = rate_cap_pps.min(3_000);
+            concurrency_cap = concurrency_cap.min(48);
+            delay_floor = delay_floor.max(Duration::from_millis(12));
+            notes.push(
+                "bio-response: mirror profile kept hybrid correlation enabled but inside a guarded rate envelope"
+                    .to_string(),
+            );
         }
         ScanProfile::Balanced | ScanProfile::Hybrid => {
             rate_cap_pps = rate_cap_pps.min(8_000);

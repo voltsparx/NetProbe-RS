@@ -82,6 +82,15 @@ pub fn render(report: &ScanReport) -> String {
         report.metadata.platform.intentionally_excluded
     ));
     html.push_str("<div class=\"meta\">Workflow lanes: learners=interactive | fragile/unknown=phantom/kis/sar | specialists=nmap-style safe flags | audits=balanced/stealth</div>");
+    html.push_str(&format!(
+        "<div class=\"meta\">Hybrid acceleration: {} | Backend: {} | Tier: {} | Visualizer: {} | Shader: {} | Action triggers: {}</div>",
+        esc(&report.metadata.engine_stats.gpu_hybrid_lane),
+        esc(&report.metadata.engine_stats.gpu_hybrid_backend),
+        esc(&report.metadata.engine_stats.gpu_platform_tier),
+        esc(&report.metadata.engine_stats.gpu_visualizer_mode),
+        esc(&report.metadata.engine_stats.gpu_shader_kernel),
+        report.metadata.engine_stats.gpu_action_triggers_loaded
+    ));
     if !report.metadata.engine_stats.scan_bundle_stages.is_empty() {
         html.push_str(&format!(
             "<div class=\"meta\">Bundle stages: {}</div>",

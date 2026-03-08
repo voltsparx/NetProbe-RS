@@ -129,7 +129,9 @@ pub fn preview(
     let initial_payload_budget = match profile {
         ScanProfile::Phantom => 0,
         ScanProfile::Kis | ScanProfile::Sar => 1,
+        ScanProfile::Idf => 0,
         ScanProfile::Stealth => 2,
+        ScanProfile::Mirror => 3,
         ScanProfile::Balanced
         | ScanProfile::Turbo
         | ScanProfile::Aggressive
@@ -275,8 +277,10 @@ fn derive_decision(
     let force_soft = matches!(
         device_class,
         Some(DeviceClass::FragileEmbedded) | Some(DeviceClass::PrinterSensitive)
-    ) || matches!(profile, ScanProfile::Phantom | ScanProfile::Kis)
-        || responsive_ports == 0
+    ) || matches!(
+        profile,
+        ScanProfile::Phantom | ScanProfile::Kis | ScanProfile::Idf
+    ) || responsive_ports == 0
         || timeout_ports >= sample_count.saturating_sub(1);
 
     let mut stage = if force_soft {
@@ -364,7 +368,9 @@ fn derive_decision(
         ScanProfile::Phantom => 0,
         ScanProfile::Kis => 1,
         ScanProfile::Sar => 1,
+        ScanProfile::Idf => 0,
         ScanProfile::Stealth => 2,
+        ScanProfile::Mirror => 3,
         ScanProfile::Balanced
         | ScanProfile::Turbo
         | ScanProfile::Aggressive
@@ -409,7 +415,7 @@ fn derive_decision(
 
 fn sample_budget(profile: ScanProfile, device_class: Option<DeviceClass>) -> usize {
     match (profile, device_class) {
-        (ScanProfile::Phantom | ScanProfile::Kis, _) => 2,
+        (ScanProfile::Phantom | ScanProfile::Kis | ScanProfile::Idf, _) => 2,
         (_, Some(DeviceClass::FragileEmbedded) | Some(DeviceClass::PrinterSensitive)) => 2,
         (_, Some(DeviceClass::Enterprise)) => 4,
         _ => 3,
@@ -421,6 +427,7 @@ fn preflight_delay(profile: ScanProfile, device_class: Option<DeviceClass>) -> D
         (_, Some(DeviceClass::FragileEmbedded)) => Duration::from_millis(60),
         (_, Some(DeviceClass::PrinterSensitive)) => Duration::from_millis(45),
         (ScanProfile::Phantom | ScanProfile::Kis, _) => Duration::from_millis(35),
+        (ScanProfile::Idf, _) => Duration::from_millis(55),
         _ => Duration::from_millis(15),
     }
 }

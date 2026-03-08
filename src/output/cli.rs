@@ -5,7 +5,7 @@
 use crate::models::{PortFinding, PortState, ScanReport};
 use crate::output::{
     actionable_summary_line, good_next_steps, host_os_profile, key_issue_lines,
-    phantom_device_check_summary, service_detail_lines, service_label,
+    open_service_inventory, phantom_device_check_summary, service_detail_lines, service_label,
 };
 
 pub fn render(report: &ScanReport) -> String {
@@ -71,6 +71,15 @@ pub fn render(report: &ScanReport) -> String {
     out.push_str(
         "Workflow lanes: learners=interactive | fragile/unknown=phantom/kis/sar | specialists=nmap-style flags with safe semantics | audits=balanced/stealth\n",
     );
+    out.push_str(&format!(
+        "Hybrid acceleration: {} | backend: {} | tier: {} | visualizer: {} | shader: {} | action triggers: {}\n",
+        report.metadata.engine_stats.gpu_hybrid_lane,
+        report.metadata.engine_stats.gpu_hybrid_backend,
+        report.metadata.engine_stats.gpu_platform_tier,
+        report.metadata.engine_stats.gpu_visualizer_mode,
+        report.metadata.engine_stats.gpu_shader_kernel,
+        report.metadata.engine_stats.gpu_action_triggers_loaded
+    ));
     if !report.metadata.engine_stats.scan_bundle_stages.is_empty() {
         out.push_str(&format!(
             "Bundle stages: {}\n",
@@ -185,6 +194,14 @@ pub fn render(report: &ScanReport) -> String {
                     p.state,
                     service_label(p)
                 ));
+            }
+        }
+
+        let service_inventory = open_service_inventory(host);
+        if !service_inventory.is_empty() {
+            out.push_str("Discovered services:\n");
+            for service in &service_inventory {
+                out.push_str(&format!("- {service}\n"));
             }
         }
 

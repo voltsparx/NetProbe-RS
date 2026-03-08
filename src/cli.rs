@@ -64,7 +64,7 @@ impl FileType {
     version,
     about = "NProbe-RS: Reverse-Engineered scanner in safe, explainable Rust",
     override_usage = "nprobe-rs <target> [OPTIONS]\n       nprobe-rs scan <target> [OPTIONS]\n       nprobe-rs interactive\n       nprobe-rs integrity [OPTIONS]\n       nprobe-rs sessions [OPTIONS]",
-    after_help = "Nmap-style shortcuts supported: -sU, -sS, -A, -T0..-T5, -p-",
+    after_help = "Nmap-style shortcuts supported: -sU, -sS, -sV, -O, -A, -T0..-T5, -p-",
     arg_required_else_help = true
 )]
 pub struct Cli {
@@ -140,7 +140,7 @@ struct ScanArgs {
     #[arg(
         short = 'U',
         long = "udp",
-        visible_alias = "sU",
+        visible_aliases = ["sU", "udp-scan"],
         help = "Add UDP probing (Nmap: -sU)"
     )]
     udp: bool,
@@ -148,7 +148,7 @@ struct ScanArgs {
     #[arg(
         short = 'S',
         long = "syn",
-        visible_alias = "sS",
+        visible_aliases = ["sS", "syn-scan", "half-open"],
         conflicts_with = "connect",
         help = "Use privileged TCP probing (Nmap: -sS). Will auto-prompt for sudo/su if required"
     )]
@@ -156,7 +156,7 @@ struct ScanArgs {
 
     #[arg(
         long = "connect",
-        visible_alias = "sT",
+        visible_aliases = ["sT", "connect-scan", "tcp-connect"],
         conflicts_with_all = ["syn", "aggressive", "aggressive_root", "privileged_probes", "root_only"],
         help = "Use user-space TCP connect scanning (Nmap: -sT)"
     )]
@@ -164,6 +164,7 @@ struct ScanArgs {
 
     #[arg(
         long = "arp",
+        visible_alias = "arp-scan",
         help = "Enable ARP neighbor discovery for local IPv4 targets"
     )]
     arp: bool,
@@ -199,10 +200,17 @@ struct ScanArgs {
 
     #[arg(
         long = "service-detect",
-        visible_alias = "sV",
+        visible_aliases = ["sV", "banners", "service-version", "version-detect"],
         help = "Enable banner/service detection (Nmap: -sV)"
     )]
     service_detect: bool,
+
+    #[arg(
+        long = "os-detect",
+        visible_aliases = ["os-fingerprint", "fingerprint-os"],
+        help = "Bias the run toward richer passive OS/profile correlation (Nmap: -O)"
+    )]
+    os_detect: bool,
 
     #[arg(
         short = 'e',
@@ -305,6 +313,13 @@ struct ScanArgs {
     #[arg(short = 'x', long = "lua-script", help = "Lua hook file path")]
     lua_script: Option<PathBuf>,
 
+    #[arg(
+        long = "callback-ping",
+        visible_aliases = ["callback", "cb-ping"],
+        help = "Record a guarded reachability callback note after host discovery"
+    )]
+    callback_ping: bool,
+
     #[arg(short = 'w', long = "timeout-ms", help = "Probe timeout in ms")]
     timeout_ms: Option<u64>,
 
@@ -319,11 +334,40 @@ struct ScanArgs {
     delay_ms: Option<u64>,
 
     #[arg(
-        long = "rate-pps",
-        visible_aliases = ["max-rate", "min-rate"],
-        help = "Probe dispatch rate target (packets per second)"
+        long = "rate",
+        visible_aliases = ["rate-pps", "max-rate", "min-rate"],
+        num_args = 0..=1,
+        default_missing_value = "100",
+        help = "Probe dispatch rate target in packets per second (bare --rate defaults to 100)"
     )]
     rate_limit_pps: Option<u32>,
+
+    #[arg(
+        long = "gpu-rate",
+        num_args = 0..=1,
+        default_missing_value = "100",
+        help = "Rate ceiling for GPU/parallel packet crafters (bare --gpu-rate defaults to 100); currently also caps the fused packet-crafter path"
+    )]
+    gpu_rate_pps: Option<u32>,
+
+    #[arg(
+        long = "gpu-burst",
+        visible_alias = "gpu-burst-size",
+        help = "Burst ceiling for GPU/parallel packet crafters; currently also caps the fused packet-crafter path"
+    )]
+    gpu_burst_size: Option<usize>,
+
+    #[arg(
+        long = "gpu-timestamp",
+        help = "Enable timestamp-paced scheduling for GPU/parallel packet crafters; currently also paces the fused packet-crafter path"
+    )]
+    gpu_timestamp: bool,
+
+    #[arg(
+        long = "gpu-schedule-random",
+        help = "Randomize GPU/parallel crafter scheduling order; currently also randomizes the fused packet-crafter path"
+    )]
+    gpu_schedule_random: bool,
 
     #[arg(long = "burst-size", help = "Token-bucket burst size for rate control")]
     burst_size: Option<usize>,
@@ -556,7 +600,7 @@ pub fn maybe_render_quick_help_mode() -> Option<String> {
     }
 
     Some(
-        "Usage:\n  nprobe-rs <target> [options]\n  nprobe-rs interactive\n  nprobe-rs integrity [--reseal]\n  nprobe-rs sessions [--limit N]\n  nprobe-rs sessions --show <session-id>\n  nprobe-rs sessions --diff <older-session-id> <newer-session-id>\n\nCommon options:\n  -p, --ports <list|range>   Select ports (example: -p 22,80,443)\n      --all-ports            Scan ports 1-65535 (Nmap: -p-)\n  -U, --udp                  Enable UDP probes (Nmap: -sU)\n  -S, --syn                  Enable privileged TCP probes (Nmap: -sS)\n      --connect              Force user-space TCP connect scanning (Nmap: -sT)\n      --arp                  Enable ARP neighbor discovery (local IPv4)\n  -A, --aggressive           Aggressive mode (Nmap: -A)\n  -w, --timeout-ms <ms>      Probe timeout in milliseconds\n      --rate-pps <num>       Dispatch rate target in packets per second\n      --burst-size <num>     Token-bucket burst limit\n      --max-retries <num>    Adaptive retries per probe (0..20)\n      --total-shards <num>   Total shard count for distributed scans\n      --shard-index <num>    Current shard index (requires total-shards)\n      --scan-seed <num>      Deterministic port shuffle seed\n      --resume               Resume from shard checkpoint\n      --fresh-scan           Ignore/reset shard checkpoint for this run\n  -r, --reverse-dns          Enable reverse DNS lookups\n  -n, --no-dns               Disable reverse DNS lookups\n  -e, --explain              Add concise per-port rationale in output\n  -v, --verbose              Show full output sections\n  -f, --file-type <type>     Export format: txt|json|html|csv\n  -o, --output <name>        Output filename\n  -L, --location <dir>       Output directory\n\nLearner mode:\n  nprobe-rs interactive      Guided prompt mode with banner and safe defaults\n  nprobe-rs learn            Alias for interactive mode\n\nIntegrity:\n  nprobe-rs integrity\n  nprobe-rs integrity --reseal\n\nSession history:\n  nprobe-rs sessions --limit 20\n  nprobe-rs sessions --show <session-id>\n  nprobe-rs sessions --diff <older-session-id> <newer-session-id>\n      Optional session filters: --profile <name> --updated-after <ts> --updated-before <ts>\n      Optional diff filters:    --ip <addr> --target-contains <text> --severity <level>\n      Optional diff export:     -f txt|json|html -o <name> -L <dir>\n\nNmap-style shortcuts accepted:\n  -sU  -sS  -sT  -sV  -Pn  -A  -T0..-T5  -p-\n\nFlag docs mode:\n  nprobe-rs --flag-help --scan\n  nprobe-rs --flag-help -sU\n  nprobe-rs --explain --scan   (legacy alias)\n\nCompatibility:\n  nprobe-rs scan <target> [options] still works.".to_string(),
+        "Usage:\n  nprobe-rs <target> [options]\n  nprobe-rs interactive\n  nprobe-rs integrity [--reseal]\n  nprobe-rs sessions [--limit N]\n  nprobe-rs sessions --show <session-id>\n  nprobe-rs sessions --diff <older-session-id> <newer-session-id>\n\nCommon options:\n  -p, --ports <list|range>   Select ports (example: -p 22,80,443)\n      --all-ports            Scan ports 1-65535 (Nmap: -p-)\n  -U, --udp                  Enable UDP probes (Nmap: -sU)\n  -S, --syn                  Enable privileged TCP probes (Nmap: -sS)\n      --connect              Force user-space TCP connect scanning (Nmap: -sT)\n      --service-detect       Enable banner/service detection (Nmap: -sV, Masscan: --banners)\n      --os-detect            Bias toward richer passive OS correlation (Nmap: -O)\n      --arp                  Enable ARP neighbor discovery (local IPv4)\n      --callback-ping        Record guarded post-discovery callback notes\n      --phantom/--sar/--kis  TBNS defensive scan concepts\n      --idf/--mirror         Additional defensive scan concepts\n      --hybrid               Controlled masscan+nmap fusion mode\n  -A, --aggressive           Aggressive mode (Nmap: -A)\n  -w, --timeout-ms <ms>      Probe timeout in milliseconds\n      --rate [num]           Stabilized raw/firehose target in packets per second (bare flag = 100)\n      --gpu-rate [num]       GPU/parallel crafter ceiling in packets per second (bare flag = 100)\n      --gpu-burst <num>      GPU/parallel crafter burst ceiling\n      --gpu-timestamp        Timestamp-pace the GPU/fused packet scheduler\n      --gpu-schedule-random  Randomize GPU/fused packet scheduling order\n      --burst-size <num>     Token-bucket burst limit\n      --max-retries <num>    Adaptive retries per probe (0..20)\n      --total-shards <num>   Total shard count for distributed scans\n      --shard-index <num>    Current shard index (requires total-shards)\n      --scan-seed <num>      Deterministic port shuffle seed\n      --resume               Resume from shard checkpoint\n      --fresh-scan           Ignore/reset shard checkpoint for this run\n  -r, --reverse-dns          Enable reverse DNS lookups\n  -n, --no-dns               Disable reverse DNS lookups\n  -e, --explain              Add concise per-port rationale in output\n  -v, --verbose              Show full output sections\n  -f, --file-type <type>     Export format: txt|json|html|csv\n  -o, --output <name>        Output filename\n  -L, --location <dir>       Output directory\n\nLearner mode:\n  nprobe-rs interactive      Guided prompt mode with banner and safe defaults\n  nprobe-rs learn            Alias for interactive mode\n\nIntegrity:\n  nprobe-rs integrity\n  nprobe-rs integrity --reseal\n\nSession history:\n  nprobe-rs sessions --limit 20\n  nprobe-rs sessions --show <session-id>\n  nprobe-rs sessions --diff <older-session-id> <newer-session-id>\n      Optional session filters: --profile <name> --updated-after <ts> --updated-before <ts>\n      Optional diff filters:    --ip <addr> --target-contains <text> --severity <level>\n      Optional diff export:     -f txt|json|html -o <name> -L <dir>\n\nNmap-style shortcuts accepted:\n  -sU  -sS  -sT  -sV  -O  -Pn  -A  -T0..-T5  -p-\n\nFlag docs mode:\n  nprobe-rs --flag-help --scan\n  nprobe-rs --flag-help -sU\n  nprobe-rs --explain --scan   (legacy alias)\n\nCompatibility:\n  nprobe-rs scan <target> [options] still works.".to_string(),
     )
 }
 
@@ -689,7 +733,34 @@ fn render_flag_explain(raw_query: Option<&str>) -> String {
         "ss" | "syn" => {
             "Enable privileged TCP probing (`-sS` or `--syn`). If needed, the tool re-runs with sudo/su."
         }
+        "sv" | "servicedetect" | "service-detect" | "banners" => {
+            "Enable banner/service detection (`-sV`, `--service-detect`, or Masscan-style `--banners`)."
+        }
+        "o" | "osdetect" | "os-detect" => {
+            "Bias the run toward richer passive OS/profile reporting (`-O` or `--os-detect`)."
+        }
         "arp" => "Enable ARP neighbor discovery for local IPv4 targets (`--arp`).",
+        "callback" | "callbackping" | "callback-ping" | "cbping" | "cb-ping" => {
+            "Add a guarded post-discovery callback note using the fetcher plane (`--callback-ping`)."
+        }
+        "phantom" | "phantomscan" | "phantom-scan" => {
+            "Select the TBNS Phantom first-touch profile (`--phantom` or `--phantom-scan`)."
+        }
+        "sar" | "sars" | "sarscan" | "sar-scan" => {
+            "Select the TBNS SAR observation profile (`--sar`, `--sar-scan`, or `--sars`)."
+        }
+        "kis" | "kisscan" | "kis-scan" => {
+            "Select the TBNS KIS timing-observation profile (`--kis` or `--kis-scan`)."
+        }
+        "idf" | "idfscan" | "idf-scan" | "dummyscan" | "dummy-scan" | "fogscan" | "fog-scan" => {
+            "Select the inert-decoy-fog defensive profile (`--idf`, `--idf-scan`, or `--dummy-scan`)."
+        }
+        "mirror" | "mirrorscan" | "mirror-scan" => {
+            "Select the reflective hybrid correlation profile (`--mirror` or `--mirror-scan`)."
+        }
+        "hybrid" | "hybridscan" | "hybrid-scan" | "masscanhybrid" | "masscan-hybrid" | "masscancontrolled" | "masscan-controlled" => {
+            "Select the controlled masscan+nmap fusion profile (`--hybrid` or `--masscan-hybrid`)."
+        }
         "a" | "aggressive" => {
             "Aggressive mode (`-A`): enables deeper detection and root-required probe paths."
         }
@@ -697,8 +768,20 @@ fn render_flag_explain(raw_query: Option<&str>) -> String {
             "Timing profile (`-T0`..`-T5`). Mapped to internal profiles from stealth to aggressive."
         }
         "p-" | "all-ports" => "Scan all TCP ports 1-65535 (`-p-` or `--all-ports`).",
-        "ratepps" | "rate-pps" | "maxrate" | "max-rate" | "minrate" | "min-rate" => {
-            "Set probe dispatch rate target in packets/sec (`--rate-pps`, `--max-rate`, or `--min-rate`). Lower values reduce scan pressure."
+        "rate" | "ratepps" | "rate-pps" | "maxrate" | "max-rate" | "minrate" | "min-rate" => {
+            "Set the stabilized probe/firehose target in packets/sec (`--rate`, `--rate-pps`, `--max-rate`, or `--min-rate`). If you pass bare `--rate` without a number, it defaults to 100 PPS. Lower values reduce scan pressure."
+        }
+        "gpurate" | "gpu-rate" => {
+            "Set the GPU/parallel crafter rate ceiling (`--gpu-rate`). If you pass bare `--gpu-rate` without a number, it defaults to 100 PPS. On current builds it still caps the fused packet-crafter path even without a dedicated GPU backend."
+        }
+        "gpuburst" | "gpu-burst" | "gpu-burst-size" => {
+            "Set the GPU/parallel crafter burst ceiling (`--gpu-burst`). On current builds it also caps the fused packet-crafter token bucket."
+        }
+        "gputimestamp" | "gpu-timestamp" => {
+            "Enable timestamp-paced GPU/parallel scheduling (`--gpu-timestamp`). On current builds it also adds timestamp pacing to the fused packet-crafter path."
+        }
+        "gpuschedulerandom" | "gpu-schedule-random" => {
+            "Randomize GPU/parallel scheduling order (`--gpu-schedule-random`). On current builds it also randomizes the fused packet-crafter chunk order."
         }
         "burstsize" | "burst-size" => {
             "Set token-bucket burst size (`--burst-size`) to smooth short-term packet bursts."
@@ -761,7 +844,17 @@ impl ScanArgs {
     fn into_request(self) -> NProbeResult<ScanRequest> {
         if matches!(self.rate_limit_pps, Some(0)) {
             return Err(NProbeError::Cli(
-                "--rate-pps must be greater than 0".to_string(),
+                "--rate must be greater than 0".to_string(),
+            ));
+        }
+        if matches!(self.gpu_rate_pps, Some(0)) {
+            return Err(NProbeError::Cli(
+                "--gpu-rate must be greater than 0".to_string(),
+            ));
+        }
+        if matches!(self.gpu_burst_size, Some(0)) {
+            return Err(NProbeError::Cli(
+                "--gpu-burst must be greater than 0".to_string(),
             ));
         }
         if matches!(self.burst_size, Some(0)) {
@@ -865,7 +958,13 @@ impl ScanArgs {
         let mut timeout_ms = self.timeout_ms;
         let mut concurrency = self.concurrency;
         let mut delay_ms = self.delay_ms;
+        let rate_explicit = self.rate_limit_pps.is_some();
         let mut rate_limit_pps = self.rate_limit_pps;
+        let gpu_rate_explicit = self.gpu_rate_pps.is_some();
+        let gpu_rate_pps = self.gpu_rate_pps;
+        let gpu_burst_size = self.gpu_burst_size;
+        let gpu_timestamp = self.gpu_timestamp;
+        let gpu_schedule_random = self.gpu_schedule_random;
         let mut burst_size = self.burst_size;
         let mut max_retries = self.max_retries;
         let total_shards = self.total_shards;
@@ -874,6 +973,30 @@ impl ScanArgs {
         let resume_from_checkpoint = self.resume || !self.fresh_scan;
         let fresh_scan = self.fresh_scan;
         let mut top_ports = top_ports;
+        let mut lab_mode = self.lab_mode;
+        let mut strict_safety = self.strict_safety;
+        let mut service_detection =
+            self.service_detect || effective_aggressive_root || !self.no_service_detect;
+        if self.os_detect {
+            service_detection = true;
+        }
+        if matches!(profile, ScanProfile::Mirror) && !self.no_service_detect {
+            service_detection = true;
+        }
+        if matches!(profile, ScanProfile::Idf) {
+            lab_mode = true;
+            strict_safety = true;
+            service_detection = false;
+        }
+        if ports.is_empty() && top_ports.is_none() {
+            top_ports = match profile {
+                ScanProfile::Idf => profile.concept_port_budget(),
+                ScanProfile::Mirror => Some(64),
+                _ => top_ports,
+            };
+        }
+        let explain = self.explain || self.os_detect;
+        let callback_ping = self.callback_ping || matches!(profile, ScanProfile::Mirror);
 
         if root_only {
             if timeout_ms.is_none() {
@@ -906,10 +1029,8 @@ impl ScanArgs {
             top_ports,
             include_udp: self.udp || effective_aggressive_root,
             reverse_dns: self.reverse_dns && !self.no_dns,
-            service_detection: self.service_detect
-                || effective_aggressive_root
-                || !self.no_service_detect,
-            explain: self.explain,
+            service_detection,
+            explain,
             verbose: self.verbose,
             report_format,
             profile,
@@ -918,15 +1039,22 @@ impl ScanArgs {
             aggressive_root: effective_aggressive_root,
             privileged_probes: effective_privileged_probes,
             arp_discovery: self.arp,
-            lab_mode: self.lab_mode,
+            callback_ping,
+            lab_mode,
             allow_external: self.allow_external,
-            strict_safety: self.strict_safety,
+            strict_safety,
             output_path,
             lua_script: self.lua_script,
             timeout_ms,
             concurrency,
             delay_ms,
             rate_limit_pps,
+            rate_explicit,
+            gpu_rate_pps,
+            gpu_rate_explicit,
+            gpu_burst_size,
+            gpu_timestamp,
+            gpu_schedule_random,
             burst_size,
             max_retries,
             total_shards,
@@ -1026,6 +1154,7 @@ impl InteractiveArgs {
             aggressive_root: false,
             privileged_probes: false,
             arp_discovery,
+            callback_ping: false,
             lab_mode,
             allow_external: false,
             strict_safety,
@@ -1035,6 +1164,12 @@ impl InteractiveArgs {
             concurrency: None,
             delay_ms: None,
             rate_limit_pps: None,
+            rate_explicit: false,
+            gpu_rate_pps: None,
+            gpu_rate_explicit: false,
+            gpu_burst_size: None,
+            gpu_timestamp: false,
+            gpu_schedule_random: false,
             burst_size: None,
             max_retries: None,
             total_shards: None,
@@ -1063,10 +1198,35 @@ fn normalize_args(args: Vec<OsString>) -> Vec<OsString> {
             "-sU" => mapped.push("--udp".into()),
             "-sS" => mapped.push("--syn".into()),
             "-sT" => mapped.push("--connect".into()),
+            "-O" => mapped.push("--os-detect".into()),
             "-A" => mapped.push("--aggressive".into()),
             "-p-" => mapped.push("--all-ports".into()),
             "-sV" => mapped.push("--service-detect".into()),
             "-Pn" => mapped.push("--no-host-discovery".into()),
+            "--phantom" | "--phantom-scan" => {
+                mapped.push("--profile".into());
+                mapped.push("phantom".into());
+            }
+            "--sar" | "--sar-scan" | "--sars" => {
+                mapped.push("--profile".into());
+                mapped.push("sar".into());
+            }
+            "--kis" | "--kis-scan" => {
+                mapped.push("--profile".into());
+                mapped.push("kis".into());
+            }
+            "--idf" | "--idf-scan" | "--dummy-scan" | "--fog-scan" => {
+                mapped.push("--profile".into());
+                mapped.push("idf".into());
+            }
+            "--mirror" | "--mirror-scan" => {
+                mapped.push("--profile".into());
+                mapped.push("mirror".into());
+            }
+            "--hybrid" | "--hybrid-scan" | "--masscan-hybrid" | "--masscan-controlled" => {
+                mapped.push("--profile".into());
+                mapped.push("hybrid".into());
+            }
             "-T" => {
                 if idx + 1 < args.len() {
                     let level = args[idx + 1].to_string_lossy().to_string();
@@ -1163,10 +1323,12 @@ fn prompt_profile_choice() -> NProbeResult<ScanProfile> {
     println!("  1. phantom  (TBNS device-check, least-contact, recommended)");
     println!("  2. kis      (TBNS identity hints, timing-focused)");
     println!("  3. sar      (TBNS logic observation, timing-delta)");
-    println!("  4. stealth  (core cautious scan)");
-    println!("  5. balanced (core general scan)");
+    println!("  4. idf      (TBNS inert-decoy-fog, sparse low-impact)");
+    println!("  5. mirror   (core reflective hybrid correlation)");
+    println!("  6. stealth  (core cautious scan)");
+    println!("  7. balanced (core general scan)");
     loop {
-        let value = prompt_line("Choose profile [1-5]")?;
+        let value = prompt_line("Choose profile [1-7]")?;
         let normalized = if value.is_empty() {
             "1"
         } else {
@@ -1176,14 +1338,16 @@ fn prompt_profile_choice() -> NProbeResult<ScanProfile> {
             "1" | "phantom" => Some(ScanProfile::Phantom),
             "2" | "kis" => Some(ScanProfile::Kis),
             "3" | "sar" => Some(ScanProfile::Sar),
-            "4" | "stealth" => Some(ScanProfile::Stealth),
-            "5" | "balanced" => Some(ScanProfile::Balanced),
+            "4" | "idf" => Some(ScanProfile::Idf),
+            "5" | "mirror" => Some(ScanProfile::Mirror),
+            "6" | "stealth" => Some(ScanProfile::Stealth),
+            "7" | "balanced" => Some(ScanProfile::Balanced),
             _ => None,
         };
         if let Some(profile) = profile {
             return Ok(profile);
         }
-        println!("[!] Choose one of: 1, 2, 3, 4, 5.");
+        println!("[!] Choose one of: 1, 2, 3, 4, 5, 6, 7.");
     }
 }
 
@@ -1906,6 +2070,7 @@ mod tests {
         looks_like_private_ipv4_target, normalize_args, render_integrity_status,
         should_inject_scan, Cli, CliAction, SessionCommand,
     };
+    use crate::models::ScanProfile;
     use crate::platform::self_integrity::IntegrityStatus;
     use crate::reporter::actionable::ActionableSeverity;
     use clap::Parser;
@@ -1949,6 +2114,26 @@ mod tests {
     }
 
     #[test]
+    fn normalize_args_maps_profile_and_os_aliases() {
+        let args = vec![
+            OsString::from("nprobe-rs"),
+            OsString::from("--idf-scan"),
+            OsString::from("--mirror-scan"),
+            OsString::from("-O"),
+            OsString::from("10.0.0.5"),
+        ];
+        let normalized = normalize_args(args);
+        let rendered = normalized
+            .iter()
+            .map(|value| value.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert!(rendered.contains(&"--profile".to_string()));
+        assert!(rendered.contains(&"idf".to_string()));
+        assert!(rendered.contains(&"mirror".to_string()));
+        assert!(rendered.contains(&"--os-detect".to_string()));
+    }
+
+    #[test]
     fn normalize_args_keeps_integrity_subcommand() {
         let args = vec![OsString::from("nprobe-rs"), OsString::from("integrity")];
         let normalized = normalize_args(args);
@@ -1988,6 +2173,108 @@ mod tests {
                 assert!(session_filters.updated_after.is_some());
                 assert!(session_filters.updated_before.is_some());
                 assert_eq!(severity_filter, Some(ActionableSeverity::High));
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn callback_ping_and_mirror_profile_parse_into_request() {
+        let argv = normalize_args(vec![
+            OsString::from("nprobe-rs"),
+            OsString::from("10.0.0.5"),
+            OsString::from("--mirror-scan"),
+            OsString::from("--callback-ping"),
+        ]);
+        let cli = Cli::parse_from(argv);
+        let action = cli.into_action().expect("cli action should parse");
+        match action {
+            CliAction::Scan(request) => {
+                assert_eq!(request.profile, ScanProfile::Mirror);
+                assert!(request.callback_ping);
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn traditional_scan_aliases_parse_directly() {
+        let cli = Cli::parse_from([
+            "nprobe-rs",
+            "scan",
+            "10.0.0.5",
+            "--syn-scan",
+            "--udp-scan",
+            "--service-version",
+            "--os-fingerprint",
+        ]);
+        let action = cli.into_action().expect("cli action should parse");
+        match action {
+            CliAction::Scan(request) => {
+                assert!(request.privileged_probes);
+                assert!(request.include_udp);
+                assert!(request.service_detection);
+                assert!(request.explain);
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rate_flags_parse_into_explicit_caps() {
+        let cli = Cli::parse_from([
+            "nprobe-rs",
+            "scan",
+            "10.0.0.5",
+            "--rate",
+            "250",
+            "--gpu-rate",
+            "120",
+        ]);
+        let action = cli.into_action().expect("cli action should parse");
+        match action {
+            CliAction::Scan(request) => {
+                assert_eq!(request.rate_limit_pps, Some(250));
+                assert!(request.rate_explicit);
+                assert_eq!(request.gpu_rate_pps, Some(120));
+                assert!(request.gpu_rate_explicit);
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bare_rate_flags_default_to_100_pps() {
+        let cli = Cli::parse_from(["nprobe-rs", "scan", "10.0.0.5", "--rate", "--gpu-rate"]);
+        let action = cli.into_action().expect("cli action should parse");
+        match action {
+            CliAction::Scan(request) => {
+                assert_eq!(request.rate_limit_pps, Some(100));
+                assert!(request.rate_explicit);
+                assert_eq!(request.gpu_rate_pps, Some(100));
+                assert!(request.gpu_rate_explicit);
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gpu_control_flags_parse_into_request() {
+        let cli = Cli::parse_from([
+            "nprobe-rs",
+            "scan",
+            "10.0.0.5",
+            "--gpu-burst",
+            "3",
+            "--gpu-timestamp",
+            "--gpu-schedule-random",
+        ]);
+        let action = cli.into_action().expect("cli action should parse");
+        match action {
+            CliAction::Scan(request) => {
+                assert_eq!(request.gpu_burst_size, Some(3));
+                assert!(request.gpu_timestamp);
+                assert!(request.gpu_schedule_random);
             }
             other => panic!("unexpected action: {other:?}"),
         }

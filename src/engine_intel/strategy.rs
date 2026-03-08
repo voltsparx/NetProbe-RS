@@ -29,6 +29,8 @@ pub enum ScanPersona {
     PhantomMinimal,
     SarObserve,
     KisObserve,
+    IdfFog,
+    MirrorReflective,
     Discovery,
     Audit,
     MassScan,
@@ -41,6 +43,8 @@ impl ScanPersona {
             ScanPersona::PhantomMinimal => "phantom-minimal",
             ScanPersona::SarObserve => "sar-observe",
             ScanPersona::KisObserve => "kis-observe",
+            ScanPersona::IdfFog => "idf-fog",
+            ScanPersona::MirrorReflective => "mirror-reflective",
             ScanPersona::Discovery => "discovery",
             ScanPersona::Audit => "audit",
             ScanPersona::MassScan => "mass-scan",
@@ -74,7 +78,10 @@ pub fn plan(request: &ScanRequest, host_count: usize, port_count: usize) -> Scan
 
     let mut mode = match request.profile {
         ScanProfile::Stealth => ExecutionMode::Async,
-        ScanProfile::Phantom | ScanProfile::Sar | ScanProfile::Kis => ExecutionMode::Async,
+        ScanProfile::Phantom | ScanProfile::Sar | ScanProfile::Kis | ScanProfile::Idf => {
+            ExecutionMode::Async
+        }
+        ScanProfile::Mirror => ExecutionMode::Hybrid,
         ScanProfile::Balanced => {
             if probe_volume >= 6_000 {
                 ExecutionMode::Hybrid
@@ -96,6 +103,8 @@ pub fn plan(request: &ScanRequest, host_count: usize, port_count: usize) -> Scan
         ScanProfile::Phantom => ScanPersona::PhantomMinimal,
         ScanProfile::Sar => ScanPersona::SarObserve,
         ScanProfile::Kis => ScanPersona::KisObserve,
+        ScanProfile::Idf => ScanPersona::IdfFog,
+        ScanProfile::Mirror => ScanPersona::MirrorReflective,
         _ => {
             if matches!(request.profile, ScanProfile::Stealth)
                 || request.strict_safety
@@ -172,6 +181,22 @@ pub fn plan(request: &ScanRequest, host_count: usize, port_count: usize) -> Scan
             recommended_timeout = Duration::from_millis(3200);
             recommended_concurrency = 4;
         }
+        ScanPersona::IdfFog => {
+            rate_limit_pps = 48;
+            burst_size = 1;
+            max_retries = 1;
+            recommended_delay = Duration::from_millis(180);
+            recommended_timeout = Duration::from_millis(2800);
+            recommended_concurrency = 2;
+        }
+        ScanPersona::MirrorReflective => {
+            rate_limit_pps = rate_limit_pps.min(3_000);
+            burst_size = burst_size.min(48);
+            max_retries = max_retries.max(2);
+            recommended_delay = recommended_delay.max(Duration::from_millis(12));
+            recommended_timeout = recommended_timeout.max(Duration::from_millis(1400));
+            recommended_concurrency = recommended_concurrency.min(64);
+        }
         ScanPersona::Discovery => {
             rate_limit_pps = rate_limit_pps.min(20_000);
             burst_size = burst_size.min(256);
@@ -211,6 +236,20 @@ pub fn plan(request: &ScanRequest, host_count: usize, port_count: usize) -> Scan
             mode.as_str(),
             persona.as_str(),
             probe_volume
+        ),
+        format!(
+            "hybrid fusion lane: {}",
+            match mode {
+                ExecutionMode::Async => {
+                    "nmap-style controlled discovery and fingerprinting"
+                }
+                ExecutionMode::Hybrid => {
+                    "masscan-style discovery front-end plus nmap-style service and OS correlation"
+                }
+                ExecutionMode::PacketBlast => {
+                    "masscan-style raw discovery with later nmap-style knowledge follow-up disabled in this defensive mode"
+                }
+            }
         ),
         format!(
             "packet-blast allowed={} (privileged={} strict-safety={} service-detection={})",
@@ -298,6 +337,7 @@ mod tests {
             aggressive_root: false,
             privileged_probes: false,
             arp_discovery: false,
+            callback_ping: false,
             lab_mode: false,
             allow_external: false,
             strict_safety: false,
@@ -307,6 +347,12 @@ mod tests {
             concurrency: None,
             delay_ms: None,
             rate_limit_pps: None,
+            rate_explicit: false,
+            gpu_rate_pps: None,
+            gpu_rate_explicit: false,
+            gpu_burst_size: None,
+            gpu_timestamp: false,
+            gpu_schedule_random: false,
             burst_size: None,
             max_retries: None,
             total_shards: None,
@@ -343,6 +389,27 @@ mod tests {
         assert_eq!(strategy.persona, ScanPersona::PhantomMinimal);
         assert_eq!(strategy.burst_size, 1);
         assert_eq!(strategy.max_retries, 1);
+    }
+
+    #[test]
+    fn idf_profile_stays_async_and_soft() {
+        let mut request = base_request();
+        request.profile = ScanProfile::Idf;
+        request.lab_mode = true;
+        request.strict_safety = true;
+        let strategy = plan(&request, 16, 12);
+        assert_eq!(strategy.mode, ExecutionMode::Async);
+        assert_eq!(strategy.persona, ScanPersona::IdfFog);
+        assert!(strategy.rate_limit_pps <= 64);
+    }
+
+    #[test]
+    fn mirror_profile_prefers_hybrid_correlation() {
+        let mut request = base_request();
+        request.profile = ScanProfile::Mirror;
+        let strategy = plan(&request, 32, 128);
+        assert_eq!(strategy.mode, ExecutionMode::Hybrid);
+        assert_eq!(strategy.persona, ScanPersona::MirrorReflective);
     }
 
     #[test]

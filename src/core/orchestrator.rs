@@ -17,6 +17,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use crate::config::{self, ShardCheckpointArgs, ShardCheckpointState};
 use crate::core::stop_signal;
 use crate::engine_async::port_scan as async_port_scan;
+use crate::engine_gpu;
 use crate::engine_intel::{
     analysis,
     strategy::{self, ExecutionMode, ScanStrategy},
@@ -156,12 +157,30 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
         };
     }
     strategy::apply_runtime_overrides(&mut request, &strategy);
+    let gpu_plan = engine_gpu::plan_hybrid_runtime(
+        &request,
+        strategy.mode.as_str(),
+        work_items.len(),
+        selected_ports.len(),
+    );
     if let Some(chapter) = request.profile.tbns_chapter() {
         global_warnings.push(format!(
             "tbns active: tri-blue-network-scans chapter={} profile={} safety-bus engaged for low-impact discovery",
             chapter,
             request.profile.as_str()
         ));
+    }
+    if matches!(request.profile, ScanProfile::Mirror) {
+        global_warnings.push(
+            "mirror profile active: reflective hybrid correlation enabled without active deception responses"
+                .to_string(),
+        );
+    }
+    if request.callback_ping {
+        global_warnings.push(
+            "callback ping active: post-discovery reachability confirmations will be recorded through the guarded fetcher plane"
+                .to_string(),
+        );
     }
     global_warnings.extend(strategy.notes.iter().cloned());
     if request.rate_limit_pps != Some(strategy.rate_limit_pps) {
@@ -170,6 +189,31 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
             request.rate_limit_pps.unwrap_or(strategy.rate_limit_pps)
         ));
     }
+    if request.gpu_rate_explicit {
+        global_warnings.push(format!(
+            "gpu rate ceiling active: {} pps",
+            request.gpu_rate_pps.unwrap_or(100)
+        ));
+    }
+    if let Some(gpu_burst_size) = request.gpu_burst_size {
+        global_warnings.push(format!(
+            "gpu burst ceiling active: {} packets",
+            gpu_burst_size
+        ));
+    }
+    if request.gpu_timestamp {
+        global_warnings.push(
+            "gpu timestamp pacing active: fused packet scheduler will respect timestamp-based cool-down slots"
+                .to_string(),
+        );
+    }
+    if request.gpu_schedule_random {
+        global_warnings.push(
+            "gpu schedule randomization active: fused packet scheduler order will be permuted"
+                .to_string(),
+        );
+    }
+    global_warnings.extend(gpu_plan.notes.iter().cloned());
     if request.max_retries != Some(strategy.max_retries) {
         global_warnings.push(format!(
             "custom retry override active: {}",
@@ -181,6 +225,7 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
     let mut host_queue = VecDeque::from(work_items);
     let bundle_plan = scan_bundle::plan(
         request.profile,
+        strategy.mode,
         request.service_detection,
         request.strict_safety,
     );
@@ -380,6 +425,12 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
                 configured_rate_pps: request.rate_limit_pps.unwrap_or(strategy.rate_limit_pps),
                 configured_burst_size: request.burst_size.unwrap_or(strategy.burst_size),
                 max_retries: request.max_retries.unwrap_or(strategy.max_retries),
+                gpu_hybrid_lane: gpu_plan.lane.as_str().to_string(),
+                gpu_hybrid_backend: gpu_plan.backend_label.clone(),
+                gpu_platform_tier: gpu_plan.platform_tier.as_str().to_string(),
+                gpu_visualizer_mode: gpu_plan.visualizer_mode.clone(),
+                gpu_shader_kernel: gpu_plan.shader_kernel.clone(),
+                gpu_action_triggers_loaded: gpu_plan.action_trigger_count,
                 host_parallelism: host_concurrency,
                 total_shards,
                 shard_index,
@@ -424,6 +475,7 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
             arp_discovery: request.arp_discovery,
             report_format: request.report_format,
             lab_mode: request.lab_mode,
+            callback_ping: request.callback_ping,
             total_shards: request.total_shards,
             shard_index: request.shard_index,
             scan_seed: request.scan_seed,
@@ -522,46 +574,55 @@ async fn process_host(
     defer_enrichment: bool,
 ) -> NProbeResult<HostExecution> {
     let ip = work_item.ip;
-    let engine_result: NProbeResult<(HostResult, usize)> =
-        if matches!(strategy.mode, ExecutionMode::PacketBlast) && !request.include_udp {
-            match packet_port_scan::run(
-                &request,
-                ip,
-                work_item.ports.clone(),
-                service_registry.clone(),
-                fingerprint_db.clone(),
-                &strategy,
-            )
-            .await
-            {
-                Ok(value) => Ok(value),
-                Err(raw_err) => {
-                    let (mut fallback_host, fallback_tasks) = async_port_scan::run(
-                        &request,
-                        ip,
-                        work_item.ports,
-                        service_registry,
-                        fingerprint_db,
-                        &strategy,
-                    )
-                    .await?;
-                    fallback_host.warnings.push(format!(
-                        "packet-blast raw backend unavailable, fallback to async engine: {raw_err}"
-                    ));
-                    Ok((fallback_host, fallback_tasks))
-                }
-            }
-        } else {
-            async_port_scan::run(
-                &request,
-                ip,
-                work_item.ports,
-                service_registry,
-                fingerprint_db,
-                &strategy,
-            )
-            .await
+    let prefer_packet_frontend = matches!(
+        strategy.mode,
+        ExecutionMode::Hybrid | ExecutionMode::PacketBlast
+    ) && !request.include_udp
+        && request.effective_privileged_probes();
+    let engine_result: NProbeResult<(HostResult, usize)> = if prefer_packet_frontend {
+        let frontend_label = match strategy.mode {
+            ExecutionMode::Hybrid => "hybrid packet frontend",
+            ExecutionMode::PacketBlast => "packet-blast raw backend",
+            ExecutionMode::Async => "async backend",
         };
+        match packet_port_scan::run(
+            &request,
+            ip,
+            work_item.ports.clone(),
+            service_registry.clone(),
+            fingerprint_db.clone(),
+            &strategy,
+        )
+        .await
+        {
+            Ok(value) => Ok(value),
+            Err(raw_err) => {
+                let (mut fallback_host, fallback_tasks) = async_port_scan::run(
+                    &request,
+                    ip,
+                    work_item.ports,
+                    service_registry,
+                    fingerprint_db,
+                    &strategy,
+                )
+                .await?;
+                fallback_host.warnings.push(format!(
+                    "{frontend_label} unavailable, fallback to async engine: {raw_err}"
+                ));
+                Ok((fallback_host, fallback_tasks))
+            }
+        }
+    } else {
+        async_port_scan::run(
+            &request,
+            ip,
+            work_item.ports,
+            service_registry,
+            fingerprint_db,
+            &strategy,
+        )
+        .await
+    };
     let (mut host, async_tasks) = match engine_result {
         Ok(result) => result,
         Err(err) => {
@@ -1103,6 +1164,7 @@ fn apply_low_impact_concept_limits(request: &mut ScanRequest, warnings: &mut Vec
             ScanProfile::Phantom => (4usize, 120u64, 2_600u64, 96u32, 1usize, 1u8),
             ScanProfile::Sar => (6usize, 80u64, 2_400u64, 144u32, 2usize, 1u8),
             ScanProfile::Kis => (4usize, 150u64, 3_200u64, 72u32, 1usize, 1u8),
+            ScanProfile::Idf => (2usize, 180u64, 2_800u64, 48u32, 1usize, 1u8),
             _ => return,
         };
 
@@ -1590,6 +1652,8 @@ fn host_parallelism(
         ScanProfile::Phantom => 1,
         ScanProfile::Sar => 2,
         ScanProfile::Kis => 1,
+        ScanProfile::Idf => 1,
+        ScanProfile::Mirror => 4,
         ScanProfile::Balanced => 6,
         ScanProfile::Turbo => 10,
         ScanProfile::Aggressive => 12,
@@ -1655,6 +1719,7 @@ mod tests {
             aggressive_root: false,
             privileged_probes: false,
             arp_discovery: false,
+            callback_ping: false,
             lab_mode: false,
             allow_external: false,
             strict_safety: false,
@@ -1664,6 +1729,12 @@ mod tests {
             concurrency: None,
             delay_ms: None,
             rate_limit_pps: None,
+            rate_explicit: false,
+            gpu_rate_pps: None,
+            gpu_rate_explicit: false,
+            gpu_burst_size: None,
+            gpu_timestamp: false,
+            gpu_schedule_random: false,
             burst_size: None,
             max_retries: None,
             total_shards: None,

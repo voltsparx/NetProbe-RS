@@ -49,6 +49,8 @@ pub enum ScanProfile {
     Phantom,
     Sar,
     Kis,
+    Idf,
+    Mirror,
     Balanced,
     Turbo,
     Aggressive,
@@ -70,6 +72,8 @@ impl ScanProfile {
             ScanProfile::Phantom => "phantom",
             ScanProfile::Sar => "sar",
             ScanProfile::Kis => "kis",
+            ScanProfile::Idf => "idf",
+            ScanProfile::Mirror => "mirror",
             ScanProfile::Balanced => "balanced",
             ScanProfile::Turbo => "turbo",
             ScanProfile::Aggressive => "aggressive",
@@ -81,7 +85,7 @@ impl ScanProfile {
     pub fn is_low_impact_concept(self) -> bool {
         matches!(
             self,
-            ScanProfile::Phantom | ScanProfile::Sar | ScanProfile::Kis
+            ScanProfile::Phantom | ScanProfile::Sar | ScanProfile::Kis | ScanProfile::Idf
         )
     }
 
@@ -98,6 +102,7 @@ impl ScanProfile {
             ScanProfile::Phantom => Some("device-check"),
             ScanProfile::Sar => Some("logic"),
             ScanProfile::Kis => Some("identity"),
+            ScanProfile::Idf => Some("fog"),
             _ => None,
         }
     }
@@ -107,6 +112,7 @@ impl ScanProfile {
             ScanProfile::Phantom => Some(24),
             ScanProfile::Sar => Some(32),
             ScanProfile::Kis => Some(16),
+            ScanProfile::Idf => Some(12),
             _ => None,
         }
     }
@@ -132,6 +138,16 @@ impl ScanProfile {
                 concurrency: 6,
                 timeout_ms: 3200,
                 delay_ms: 150,
+            },
+            ScanProfile::Idf => ProfileDefaults {
+                concurrency: 2,
+                timeout_ms: 2800,
+                delay_ms: 180,
+            },
+            ScanProfile::Mirror => ProfileDefaults {
+                concurrency: 48,
+                timeout_ms: 1600,
+                delay_ms: 12,
             },
             ScanProfile::Balanced => ProfileDefaults {
                 concurrency: 128,
@@ -192,10 +208,19 @@ pub struct ScanRequest {
     pub strict_safety: bool,
     pub output_path: Option<PathBuf>,
     pub lua_script: Option<PathBuf>,
+    pub callback_ping: bool,
     pub timeout_ms: Option<u64>,
     pub concurrency: Option<usize>,
     pub delay_ms: Option<u64>,
     pub rate_limit_pps: Option<u32>,
+    pub rate_explicit: bool,
+    pub gpu_rate_pps: Option<u32>,
+    pub gpu_rate_explicit: bool,
+    pub gpu_burst_size: Option<usize>,
+    #[serde(default)]
+    pub gpu_timestamp: bool,
+    #[serde(default)]
+    pub gpu_schedule_random: bool,
     pub burst_size: Option<usize>,
     pub max_retries: Option<u8>,
     pub total_shards: Option<u16>,
@@ -494,6 +519,18 @@ pub struct EngineStats {
     pub configured_rate_pps: u32,
     pub configured_burst_size: usize,
     pub max_retries: u8,
+    #[serde(default)]
+    pub gpu_hybrid_lane: String,
+    #[serde(default)]
+    pub gpu_hybrid_backend: String,
+    #[serde(default)]
+    pub gpu_platform_tier: String,
+    #[serde(default)]
+    pub gpu_visualizer_mode: String,
+    #[serde(default)]
+    pub gpu_shader_kernel: String,
+    #[serde(default)]
+    pub gpu_action_triggers_loaded: usize,
     pub host_parallelism: usize,
     pub total_shards: u16,
     pub shard_index: u16,
@@ -523,6 +560,7 @@ pub struct ScanRequestSummary {
     pub aggressive_root: bool,
     pub privileged_probes: bool,
     pub arp_discovery: bool,
+    pub callback_ping: bool,
     pub report_format: ReportFormat,
     pub lab_mode: bool,
     pub total_shards: Option<u16>,
@@ -586,9 +624,11 @@ mod tests {
         assert_eq!(ScanProfile::Phantom.scan_family(), "tbns");
         assert_eq!(ScanProfile::Kis.scan_family(), "tbns");
         assert_eq!(ScanProfile::Sar.scan_family(), "tbns");
+        assert_eq!(ScanProfile::Idf.scan_family(), "tbns");
         assert_eq!(ScanProfile::Phantom.tbns_chapter(), Some("device-check"));
         assert_eq!(ScanProfile::Kis.tbns_chapter(), Some("identity"));
         assert_eq!(ScanProfile::Sar.tbns_chapter(), Some("logic"));
+        assert_eq!(ScanProfile::Idf.tbns_chapter(), Some("fog"));
         assert_eq!(ScanProfile::Balanced.scan_family(), "core");
         assert_eq!(ScanProfile::Balanced.tbns_chapter(), None);
     }

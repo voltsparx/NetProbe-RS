@@ -1145,8 +1145,10 @@ fn parse_profile(raw: &str) -> Option<ScanProfile> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "stealth" => Some(ScanProfile::Stealth),
         "phantom" | "phantom-scan" | "phantom_scan" => Some(ScanProfile::Phantom),
-        "sar" | "sar-scan" | "sar_scan" => Some(ScanProfile::Sar),
+        "sar" | "sar-scan" | "sar_scan" | "sars" => Some(ScanProfile::Sar),
         "kis" | "kis-scan" | "kis_scan" => Some(ScanProfile::Kis),
+        "idf" | "idf-scan" | "idf_scan" | "dummy-scan" | "fog-scan" => Some(ScanProfile::Idf),
+        "mirror" | "mirror-scan" | "mirror_scan" => Some(ScanProfile::Mirror),
         "balanced" => Some(ScanProfile::Balanced),
         "turbo" => Some(ScanProfile::Turbo),
         "aggressive" => Some(ScanProfile::Aggressive),
@@ -1170,6 +1172,11 @@ mod tests {
         ));
         assert!(matches!(parse_profile("sar-scan"), Some(ScanProfile::Sar)));
         assert!(matches!(parse_profile("kis_scan"), Some(ScanProfile::Kis)));
+        assert!(matches!(parse_profile("idf-scan"), Some(ScanProfile::Idf)));
+        assert!(matches!(
+            parse_profile("mirror_scan"),
+            Some(ScanProfile::Mirror)
+        ));
     }
 
     #[test]

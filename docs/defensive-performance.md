@@ -5,7 +5,7 @@ NProbe-RS is intentionally not optimized for raw packet blasting. It is optimize
 ## What "Fast" Means Here
 
 - parallel scanning across multiple authorized hosts
-- hybrid async scheduling for higher throughput
+- hybrid scheduling that can pair masscan-style discovery with nmap-style fingerprinting for higher throughput
 - device-aware rate and concurrency limits
 - bio-response governor decisions per host
 - workload-aware host parallelism based on CPU and port volume

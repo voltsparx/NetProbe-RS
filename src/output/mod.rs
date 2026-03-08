@@ -6,7 +6,9 @@ use std::path::Path;
 
 use crate::engines::thread_pool;
 use crate::error::NProbeResult;
-use crate::models::{HostResult, PhantomDeviceCheckSummary, PortFinding, ReportFormat, ScanReport};
+use crate::models::{
+    HostResult, PhantomDeviceCheckSummary, PortFinding, PortState, ReportFormat, ScanReport,
+};
 use crate::reporter::actionable;
 use crate::reporter::actionable::ActionableItem;
 
@@ -94,6 +96,18 @@ pub(crate) fn service_detail_lines(port: &PortFinding) -> Vec<String> {
     lines
 }
 
+pub(crate) fn open_service_inventory(host: &HostResult) -> Vec<String> {
+    let mut services = host
+        .ports
+        .iter()
+        .filter(|port| matches!(port.state, PortState::Open | PortState::OpenOrFiltered))
+        .map(|port| format!("{}/{} {}", port.port, port.protocol, service_label(port)))
+        .collect::<Vec<_>>();
+    services.sort();
+    services.dedup();
+    services
+}
+
 pub(crate) fn key_issue_lines(host: &HostResult) -> Vec<String> {
     top_actionable_items(host)
         .into_iter()
@@ -161,4 +175,89 @@ pub async fn emit(
         None => println!("{body}"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::open_service_inventory;
+    use crate::models::{HostResult, PortFinding, PortState, ServiceIdentity};
+
+    #[test]
+    fn open_service_inventory_lists_open_ports_with_labels() {
+        let host = HostResult {
+            target: "example".to_string(),
+            ip: "10.0.0.5".to_string(),
+            reverse_dns: None,
+            observed_mac: None,
+            device_class: None,
+            device_vendor: None,
+            operating_system: None,
+            phantom_device_check: None,
+            safety_actions: Vec::new(),
+            warnings: Vec::new(),
+            ports: vec![
+                PortFinding {
+                    port: 22,
+                    protocol: "tcp".to_string(),
+                    state: PortState::Open,
+                    service: Some("ssh".to_string()),
+                    service_identity: None,
+                    banner: None,
+                    reason: "open".to_string(),
+                    matched_by: None,
+                    confidence: None,
+                    vulnerability_hints: Vec::new(),
+                    educational_note: None,
+                    latency_ms: None,
+                    explanation: None,
+                },
+                PortFinding {
+                    port: 443,
+                    protocol: "tcp".to_string(),
+                    state: PortState::Open,
+                    service: Some("https".to_string()),
+                    service_identity: Some(ServiceIdentity {
+                        product: Some("nginx".to_string()),
+                        version: Some("1.25".to_string()),
+                        ..ServiceIdentity::default()
+                    }),
+                    banner: None,
+                    reason: "open".to_string(),
+                    matched_by: None,
+                    confidence: None,
+                    vulnerability_hints: Vec::new(),
+                    educational_note: None,
+                    latency_ms: None,
+                    explanation: None,
+                },
+                PortFinding {
+                    port: 53,
+                    protocol: "udp".to_string(),
+                    state: PortState::Closed,
+                    service: Some("domain".to_string()),
+                    service_identity: None,
+                    banner: None,
+                    reason: "closed".to_string(),
+                    matched_by: None,
+                    confidence: None,
+                    vulnerability_hints: Vec::new(),
+                    educational_note: None,
+                    latency_ms: None,
+                    explanation: None,
+                },
+            ],
+            risk_score: 0,
+            insights: Vec::new(),
+            defensive_advice: Vec::new(),
+            learning_notes: Vec::new(),
+            lua_findings: Vec::new(),
+        };
+
+        let inventory = open_service_inventory(&host);
+        assert_eq!(inventory.len(), 2);
+        assert!(inventory.iter().any(|line| line == "22/tcp ssh"));
+        assert!(inventory
+            .iter()
+            .any(|line| line == "443/tcp https [nginx 1.25]"));
+    }
 }

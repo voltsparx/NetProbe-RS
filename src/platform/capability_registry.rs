@@ -42,6 +42,27 @@ const CAPABILITIES: &[CapabilityEntry] = &[
         safe_scope: "always-on safety guardrails remain enabled",
     },
     CapabilityEntry {
+        tool_family: "gpu-hybrid",
+        domain: "packet-crafting",
+        capability: "GPU-aware hybrid packet staging and workgroup-aligned dispatch planning",
+        status: CapabilityStatus::Partial,
+        safe_scope: "stays bounded by the same defensive rate, burst, and scope governance as the raw packet path",
+    },
+    CapabilityEntry {
+        tool_family: "gpu-hybrid",
+        domain: "visualization",
+        capability: "instance-buffer convergence visualizer and live discovery staging",
+        status: CapabilityStatus::Planned,
+        safe_scope: "planned as an operator-facing observability surface, not an autonomous execution plane",
+    },
+    CapabilityEntry {
+        tool_family: "gpu-hybrid",
+        domain: "automation",
+        capability: "YAML-like action trigger system for shell, notify, and UI effects",
+        status: CapabilityStatus::Partial,
+        safe_scope: "triggers are intended for local automation and operator-defined responses only",
+    },
+    CapabilityEntry {
         tool_family: "nmap",
         domain: "fingerprinting",
         capability: "database-driven service fingerprinting and banner correlation",

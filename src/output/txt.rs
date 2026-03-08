@@ -5,7 +5,7 @@
 use crate::models::ScanReport;
 use crate::output::{
     actionable_summary_line, good_next_steps, host_os_profile, key_issue_lines,
-    phantom_device_check_summary, service_detail_lines, service_label,
+    open_service_inventory, phantom_device_check_summary, service_detail_lines, service_label,
 };
 
 pub fn render(report: &ScanReport) -> String {
@@ -55,6 +55,15 @@ pub fn render(report: &ScanReport) -> String {
     out.push_str(
         "workflow_lanes=learners:interactive,fragile_unknown:tbns,specialists:nmap-compatible-safe-flags,audits:balanced-stealth\n",
     );
+    out.push_str(&format!(
+        "hybrid_acceleration={} backend={} tier={} visualizer={} shader={} action_triggers={}\n",
+        report.metadata.engine_stats.gpu_hybrid_lane,
+        report.metadata.engine_stats.gpu_hybrid_backend,
+        report.metadata.engine_stats.gpu_platform_tier,
+        report.metadata.engine_stats.gpu_visualizer_mode,
+        report.metadata.engine_stats.gpu_shader_kernel,
+        report.metadata.engine_stats.gpu_action_triggers_loaded
+    ));
     if !report.metadata.engine_stats.scan_bundle_stages.is_empty() {
         out.push_str(&format!(
             "scan_bundle_stages={}\n",
@@ -112,6 +121,9 @@ pub fn render(report: &ScanReport) -> String {
         }
         if let Some(summary) = actionable_summary_line(host) {
             out.push_str(&format!("actionable_summary={summary}\n"));
+        }
+        for service in open_service_inventory(host) {
+            out.push_str(&format!("open_service={service}\n"));
         }
         for action in &host.safety_actions {
             out.push_str(&format!("safety_action={}\n", action));
