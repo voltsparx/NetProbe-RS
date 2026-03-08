@@ -23,6 +23,7 @@ mod os_fingerprint_db;
 mod output;
 mod platform;
 mod reporter;
+mod scan_types;
 mod scheduler;
 mod service_db;
 mod tasks;
@@ -67,6 +68,15 @@ async fn run() -> NProbeResult<()> {
     if let Some(explain_text) = cli::maybe_render_flag_explain_mode() {
         println!("{explain_text}");
         return Ok(());
+    }
+
+    if let Some(scan_type_text) = cli::maybe_render_scan_type_mode() {
+        println!("{scan_type_text}");
+        return Ok(());
+    }
+
+    if let Some(err) = cli::maybe_reject_cataloged_scan_mode() {
+        return Err(err);
     }
 
     let cli = Cli::parse_normalized();

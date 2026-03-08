@@ -18,6 +18,7 @@ pub fn render(report: &ScanReport) -> String {
         "started={} finished={} duration_ms={}\n",
         report.metadata.started_at, report.metadata.finished_at, report.metadata.duration_ms
     ));
+    out.push_str(&format!("override_mode={}\n", report.request.override_mode));
     out.push_str(&format!(
         "async_tasks={} thread_tasks={} parallel_tasks={} lua_hooks={} integrity_checked={} integrity_state={} integrity_manifest={}\n",
         report.metadata.engine_stats.async_engine_tasks,
@@ -64,6 +65,39 @@ pub fn render(report: &ScanReport) -> String {
         report.metadata.engine_stats.gpu_shader_kernel,
         report.metadata.engine_stats.gpu_action_triggers_loaded
     ));
+    out.push_str(&format!(
+        "local_system assessment_mode={} hardware_profile={} health_stage={} platform_tier={} raw_packet_supported={} gpu_hybrid_supported={} fault_isolation={} cpu_threads={} cpu_usage_pct={:.0} total_memory_mib={} available_memory_mib={} safe_raw_rate_pps={} safe_raw_burst={} safe_gpu_rate_pps={} safe_gpu_burst={} safe_concurrency={} safe_delay_ms={} emergency_brake_triggered={} emergency_brake_reason={}\n",
+        report.metadata.local_system.assessment_mode,
+        report.metadata.local_system.hardware_profile,
+        report.metadata.local_system.health_stage,
+        report.metadata.local_system.platform_tier,
+        report.metadata.local_system.raw_packet_supported,
+        report.metadata.local_system.gpu_hybrid_supported,
+        report.metadata.local_system.fault_isolation_mode,
+        report.metadata.local_system.cpu_threads,
+        report.metadata.local_system.cpu_usage_pct,
+        report.metadata.local_system.total_memory_mib,
+        report.metadata.local_system.available_memory_mib,
+        report.metadata.local_system.recommended_raw_rate_pps,
+        report.metadata.local_system.recommended_raw_burst,
+        report.metadata.local_system.recommended_gpu_rate_pps,
+        report.metadata.local_system.recommended_gpu_burst,
+        report.metadata.local_system.recommended_concurrency,
+        report.metadata.local_system.recommended_delay_ms,
+        report.metadata.local_system.emergency_brake_triggered,
+        report
+            .metadata
+            .local_system
+            .emergency_brake_reason
+            .as_deref()
+            .unwrap_or("n/a")
+    ));
+    for note in &report.metadata.local_system.compatibility_notes {
+        out.push_str(&format!("local_compatibility={}\n", note));
+    }
+    for note in &report.metadata.local_system.adjustments {
+        out.push_str(&format!("local_adjustment={}\n", note));
+    }
     if !report.metadata.engine_stats.scan_bundle_stages.is_empty() {
         out.push_str(&format!(
             "scan_bundle_stages={}\n",

@@ -191,6 +191,8 @@ pub struct ScanRequest {
     pub session_id: Option<String>,
     pub ports: Vec<u16>,
     pub top_ports: Option<usize>,
+    #[serde(default)]
+    pub ping_scan: bool,
     pub include_udp: bool,
     pub reverse_dns: bool,
     pub service_detection: bool,
@@ -212,6 +214,8 @@ pub struct ScanRequest {
     pub timeout_ms: Option<u64>,
     pub concurrency: Option<usize>,
     pub delay_ms: Option<u64>,
+    #[serde(default)]
+    pub timing_template: Option<u8>,
     pub rate_limit_pps: Option<u32>,
     pub rate_explicit: bool,
     pub gpu_rate_pps: Option<u32>,
@@ -221,6 +225,10 @@ pub struct ScanRequest {
     pub gpu_timestamp: bool,
     #[serde(default)]
     pub gpu_schedule_random: bool,
+    #[serde(default)]
+    pub assess_hardware: bool,
+    #[serde(default)]
+    pub override_mode: bool,
     pub burst_size: Option<usize>,
     pub max_retries: Option<u8>,
     pub total_shards: Option<u16>,
@@ -552,6 +560,7 @@ pub struct EngineStats {
 pub struct ScanRequestSummary {
     pub target: String,
     pub port_count: usize,
+    pub ping_scan: bool,
     pub include_udp: bool,
     pub explain: bool,
     pub verbose: bool,
@@ -561,6 +570,9 @@ pub struct ScanRequestSummary {
     pub privileged_probes: bool,
     pub arp_discovery: bool,
     pub callback_ping: bool,
+    pub assess_hardware: bool,
+    pub override_mode: bool,
+    pub timing_template: Option<u8>,
     pub report_format: ReportFormat,
     pub lab_mode: bool,
     pub total_shards: Option<u16>,
@@ -578,7 +590,37 @@ pub struct ScanMetadata {
     pub duration_ms: i64,
     pub engine_stats: EngineStats,
     pub knowledge: KnowledgeStats,
+    #[serde(default)]
+    pub local_system: LocalSystemStats,
     pub platform: PlatformStats,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LocalSystemStats {
+    pub assessment_mode: bool,
+    pub hardware_profile: String,
+    pub health_stage: String,
+    pub platform_tier: String,
+    pub raw_packet_supported: bool,
+    pub gpu_hybrid_supported: bool,
+    pub fault_isolation_mode: String,
+    pub cpu_threads: usize,
+    pub cpu_usage_pct: f32,
+    pub total_memory_mib: u64,
+    pub available_memory_mib: u64,
+    pub recommended_raw_rate_pps: u32,
+    pub recommended_raw_burst: usize,
+    pub recommended_gpu_rate_pps: u32,
+    pub recommended_gpu_burst: usize,
+    pub recommended_concurrency: usize,
+    pub recommended_delay_ms: u64,
+    pub emergency_brake_armed: bool,
+    pub emergency_brake_triggered: bool,
+    pub emergency_brake_reason: Option<String>,
+    #[serde(default)]
+    pub compatibility_notes: Vec<String>,
+    #[serde(default)]
+    pub adjustments: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

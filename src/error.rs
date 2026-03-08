@@ -24,6 +24,8 @@ pub enum NProbeError {
     Parse(String),
     #[error("safety check blocked scan: {0}")]
     Safety(String),
+    #[error("gpu hybrid error: {0}")]
+    Gpu(String),
     #[error("config error: {0}")]
     Config(String),
 }
@@ -38,6 +40,7 @@ impl NProbeError {
             NProbeError::Cli(_) => "operator-input",
             NProbeError::Parse(_) => "input-parse",
             NProbeError::Safety(_) => "safety-guardrail",
+            NProbeError::Gpu(_) => "gpu-hybrid",
             NProbeError::Config(_) => "configuration",
         }
     }
@@ -55,6 +58,9 @@ impl NProbeError {
             NProbeError::Safety(_) => {
                 "adjust target scope or explicit safety flags to satisfy guardrails"
             }
+            NProbeError::Gpu(_) => {
+                "verify platform support, GPU-related configuration, permissions, and action-trigger manifests before retrying"
+            }
             NProbeError::Config(_) => {
                 "inspect configuration and session files under .nprobe-rs-config"
             }
@@ -69,6 +75,7 @@ impl NProbeError {
             NProbeError::Safety(_) => {
                 "NProbe-RS stopped this run to protect the target, the network, or your system."
             }
+            NProbeError::Gpu(_) => "NProbe-RS could not prepare the GPU hybrid lane cleanly.",
             NProbeError::Config(_) => {
                 "NProbe-RS could not use part of its saved configuration or runtime state."
             }
@@ -89,6 +96,7 @@ impl NProbeError {
             NProbeError::Json(message) => format!("JSON detail: {message}"),
             NProbeError::Lua(message) => format!("Lua detail: {message}"),
             NProbeError::Join(message) => format!("Task detail: {message}"),
+            NProbeError::Gpu(message) => format!("GPU hybrid detail: {message}"),
             NProbeError::Cli(message)
             | NProbeError::Parse(message)
             | NProbeError::Safety(message)
@@ -103,5 +111,22 @@ impl NProbeError {
             self.friendly_detail(),
             self.recovery_hint()
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NProbeError;
+
+    #[test]
+    fn gpu_error_has_clear_user_message() {
+        let err = NProbeError::Gpu(
+            "GPU action trigger manifest is malformed: missing action.type for trigger 'demo'"
+                .to_string(),
+        );
+        let rendered = err.user_message();
+        assert!(rendered.contains("GPU hybrid"));
+        assert!(rendered.contains("missing action.type"));
+        assert!(rendered.contains("verify platform support"));
     }
 }

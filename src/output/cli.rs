@@ -31,6 +31,14 @@ pub fn render(report: &ScanReport) -> String {
         report.metadata.engine_stats.shard_dimension
     ));
     out.push_str(&format!(
+        "Override mode: {}\n",
+        if report.request.override_mode {
+            "active"
+        } else {
+            "off"
+        }
+    ));
+    out.push_str(&format!(
         "Role: {} | family: {} | safety model: {} | bundle: {} | resources: {} | integrity: {} ({}) | teaching: {} | safety envelope: {} | public-target policy: {} | profiled hosts: {} | fragile hosts: {} | suppressed ports: {}\n",
         report.metadata.engine_stats.framework_role,
         report.metadata.engine_stats.scan_family,
@@ -80,6 +88,60 @@ pub fn render(report: &ScanReport) -> String {
         report.metadata.engine_stats.gpu_shader_kernel,
         report.metadata.engine_stats.gpu_action_triggers_loaded
     ));
+    out.push_str(&format!(
+        "Local system: profile={} | health={} | platform={} | raw={} | gpu={} | cpu={:.0}% across {} threads | memory={} MiB free / {} MiB total | safe raw={}pps burst {} | safe gpu={}pps burst {} | safe concurrency={} | delay floor={}ms | fault isolation={} | emergency brake={}\n",
+        report.metadata.local_system.hardware_profile,
+        report.metadata.local_system.health_stage,
+        report.metadata.local_system.platform_tier,
+        if report.metadata.local_system.raw_packet_supported {
+            "ready"
+        } else {
+            "not-ready"
+        },
+        if report.metadata.local_system.gpu_hybrid_supported {
+            "scaffold-ready"
+        } else {
+            "fallback"
+        },
+        report.metadata.local_system.cpu_usage_pct,
+        report.metadata.local_system.cpu_threads,
+        report.metadata.local_system.available_memory_mib,
+        report.metadata.local_system.total_memory_mib,
+        report.metadata.local_system.recommended_raw_rate_pps,
+        report.metadata.local_system.recommended_raw_burst,
+        report.metadata.local_system.recommended_gpu_rate_pps,
+        report.metadata.local_system.recommended_gpu_burst,
+        report.metadata.local_system.recommended_concurrency,
+        report.metadata.local_system.recommended_delay_ms,
+        report.metadata.local_system.fault_isolation_mode,
+        if report.metadata.local_system.emergency_brake_triggered {
+            report
+                .metadata
+                .local_system
+                .emergency_brake_reason
+                .as_deref()
+                .unwrap_or("triggered")
+        } else {
+            "armed/not-triggered"
+        }
+    ));
+    if report.metadata.local_system.assessment_mode {
+        out.push_str(
+            "Hardware assessment mode: no scan packets were transmitted; the lines below are local compatibility and safety guidance only.\n",
+        );
+    }
+    if !report.metadata.local_system.compatibility_notes.is_empty() {
+        out.push_str("Local compatibility notes:\n");
+        for note in &report.metadata.local_system.compatibility_notes {
+            out.push_str(&format!("- {note}\n"));
+        }
+    }
+    if !report.metadata.local_system.adjustments.is_empty() {
+        out.push_str("Local safety adjustments:\n");
+        for note in &report.metadata.local_system.adjustments {
+            out.push_str(&format!("- {note}\n"));
+        }
+    }
     if !report.metadata.engine_stats.scan_bundle_stages.is_empty() {
         out.push_str(&format!(
             "Bundle stages: {}\n",
@@ -304,6 +366,11 @@ pub fn render(report: &ScanReport) -> String {
     }
 
     let scanned = report.hosts.len();
+    if report.metadata.local_system.assessment_mode {
+        out.push_str(
+            "\nHardware assessment complete: no remote hosts were scanned because --assess-hardware requested a local-only safety evaluation.\n",
+        );
+    }
     let hosts_responded = report
         .hosts
         .iter()

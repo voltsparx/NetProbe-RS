@@ -6,6 +6,7 @@ pub mod async_engine;
 pub mod bio_response_governor;
 pub mod fusion_engine;
 pub mod intelligence_engine;
+pub mod local_system_guard;
 pub mod lua_engine;
 pub mod packet_crafter;
 pub mod parallel;

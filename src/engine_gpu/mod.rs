@@ -72,6 +72,7 @@ impl ActionTriggerKind {
         }
     }
 
+    #[allow(dead_code)]
     pub fn as_str(&self) -> &str {
         match self {
             ActionTriggerKind::Shell => "shell",
@@ -134,6 +135,7 @@ impl Default for HybridGpuPlan {
     }
 }
 
+#[allow(dead_code)]
 pub fn hybrid_shader_source() -> &'static str {
     include_str!("hybrid_syn_scaffold.wgsl")
 }
@@ -150,7 +152,7 @@ pub fn plan_hybrid_runtime(
     execution_mode: &str,
     target_count: usize,
     port_count: usize,
-) -> HybridGpuPlan {
+) -> NProbeResult<HybridGpuPlan> {
     let requested = gpu_requested(request);
     let platform_tier = current_platform_tier();
     let backend_label = preferred_backend_label(platform_tier, execution_mode);
@@ -159,7 +161,11 @@ pub fn plan_hybrid_runtime(
     } else {
         "inactive"
     };
-    let action_manifest = discover_action_triggers().ok().flatten();
+    let action_manifest = if requested {
+        discover_action_triggers()?
+    } else {
+        None
+    };
     let mut notes = Vec::new();
 
     if requested {
@@ -205,7 +211,7 @@ pub fn plan_hybrid_runtime(
         (0, None)
     };
 
-    HybridGpuPlan {
+    Ok(HybridGpuPlan {
         requested,
         lane: preferred_lane(requested, execution_mode, platform_tier),
         platform_tier,
@@ -215,7 +221,7 @@ pub fn plan_hybrid_runtime(
         action_trigger_count,
         action_trigger_source,
         notes,
-    }
+    })
 }
 
 pub fn derive_dispatch_plan(
@@ -291,7 +297,14 @@ fn current_platform_tier() -> GpuPlatformTier {
 
 fn discover_action_triggers() -> NProbeResult<Option<ActionTriggerManifest>> {
     if let Some(path) = env::var_os("NPROBE_RS_GPU_ACTIONS") {
-        return load_action_triggers(Path::new(&path)).map(Some);
+        let path = PathBuf::from(path);
+        if !path.exists() {
+            return Err(NProbeError::Gpu(format!(
+                "GPU action trigger manifest was requested via NPROBE_RS_GPU_ACTIONS, but no file was found at {}. Point the variable to a readable manifest or unset it.",
+                path.display()
+            )));
+        }
+        return load_action_triggers(&path).map(Some);
     }
 
     let candidates = [
@@ -313,12 +326,24 @@ fn discover_action_triggers() -> NProbeResult<Option<ActionTriggerManifest>> {
 
 fn load_action_triggers(path: &Path) -> NProbeResult<ActionTriggerManifest> {
     let raw = fs::read_to_string(path).map_err(|err| {
-        NProbeError::Config(format!(
-            "failed to read gpu action trigger manifest {}: {err}",
+        NProbeError::Gpu(format!(
+            "Could not read GPU action trigger manifest {}. Check file permissions and path validity. Root cause: {err}",
             path.display()
         ))
     })?;
-    let triggers = parse_action_triggers(&raw)?;
+    let triggers = parse_action_triggers(&raw).map_err(|err| {
+        NProbeError::Gpu(format!(
+            "GPU action trigger manifest {} is malformed. {}",
+            path.display(),
+            gpu_error_detail(err)
+        ))
+    })?;
+    if triggers.is_empty() {
+        return Err(NProbeError::Gpu(format!(
+            "GPU action trigger manifest {} did not define any valid triggers. Expected entries under 'triggers:' with name, condition, and action sections.",
+            path.display()
+        )));
+    }
     Ok(ActionTriggerManifest {
         path: path.to_path_buf(),
         triggers,
@@ -362,10 +387,13 @@ fn parse_action_triggers(raw: &str) -> NProbeResult<Vec<ActionTrigger>> {
             current.kind = Some(ActionTriggerKind::from_raw(value));
         } else if let Some(value) = trimmed.strip_prefix("exec:") {
             current.payload = Some(clean_scalar(value).to_string());
+            current.payload_source = Some("exec".to_string());
         } else if let Some(value) = trimmed.strip_prefix("message:") {
             current.payload = Some(clean_scalar(value).to_string());
+            current.payload_source = Some("message".to_string());
         } else if let Some(value) = trimmed.strip_prefix("effect:") {
             current.payload = Some(clean_scalar(value).to_string());
+            current.payload_source = Some("effect".to_string());
         }
     }
 
@@ -376,8 +404,38 @@ fn parse_action_triggers(raw: &str) -> NProbeResult<Vec<ActionTrigger>> {
     Ok(triggers)
 }
 
+fn gpu_error_detail(err: NProbeError) -> String {
+    match err {
+        NProbeError::Gpu(message)
+        | NProbeError::Cli(message)
+        | NProbeError::Parse(message)
+        | NProbeError::Safety(message)
+        | NProbeError::Config(message) => message,
+        other => other.to_string(),
+    }
+}
+
 fn clean_scalar(raw: &str) -> &str {
-    raw.trim().trim_matches('"').trim_matches('\'')
+    strip_inline_comment(raw)
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+}
+
+fn strip_inline_comment(raw: &str) -> &str {
+    let mut in_single = false;
+    let mut in_double = false;
+
+    for (idx, ch) in raw.char_indices() {
+        match ch {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '#' if !in_single && !in_double => return &raw[..idx],
+            _ => {}
+        }
+    }
+
+    raw
 }
 
 #[derive(Debug, Default)]
@@ -389,6 +447,7 @@ struct ParsedTrigger {
     total_found: Option<usize>,
     kind: Option<ActionTriggerKind>,
     payload: Option<String>,
+    payload_source: Option<String>,
 }
 
 impl ParsedTrigger {
@@ -398,17 +457,40 @@ impl ParsedTrigger {
         }
 
         let kind = self.kind.clone().ok_or_else(|| {
-            NProbeError::Config(format!(
-                "gpu action trigger '{}' is missing action.type",
+            NProbeError::Gpu(format!(
+                "trigger '{}' is missing action.type. Expected one of: shell, notify, ui_effect.",
                 self.name
             ))
         })?;
+        if let ActionTriggerKind::Unknown(value) = &kind {
+            return Err(NProbeError::Gpu(format!(
+                "trigger '{}' uses unsupported action.type '{}'. Expected one of: shell, notify, ui_effect.",
+                self.name, value
+            )));
+        }
         let payload = self.payload.clone().ok_or_else(|| {
-            NProbeError::Config(format!(
-                "gpu action trigger '{}' is missing an action payload",
+            NProbeError::Gpu(format!(
+                "trigger '{}' is missing an action payload. Expected exec, message, or effect under action.",
                 self.name
             ))
         })?;
+        let payload_source = self.payload_source.clone().ok_or_else(|| {
+            NProbeError::Gpu(format!(
+                "trigger '{}' is missing an action payload field. Expected action.exec, action.message, or action.effect.",
+                self.name
+            ))
+        })?;
+        validate_trigger_payload(&self.name, &kind, &payload_source)?;
+        if self.port.is_none()
+            && self.state.is_none()
+            && self.ip_range.is_none()
+            && self.total_found.is_none()
+        {
+            return Err(NProbeError::Gpu(format!(
+                "trigger '{}' does not define any condition fields. Add port/state, ip_range, or total_found so the GPU hybrid lane knows when to fire it.",
+                self.name
+            )));
+        }
         let trigger = ActionTrigger {
             name: std::mem::take(&mut self.name),
             condition: ActionTriggerCondition {
@@ -422,13 +504,39 @@ impl ParsedTrigger {
         };
         self.kind = None;
         self.payload = None;
+        self.payload_source = None;
         Ok(Some(trigger))
     }
+}
+
+fn validate_trigger_payload(
+    name: &str,
+    kind: &ActionTriggerKind,
+    payload_source: &str,
+) -> NProbeResult<()> {
+    let expected = match kind {
+        ActionTriggerKind::Shell => "exec",
+        ActionTriggerKind::Notify => "message",
+        ActionTriggerKind::UiEffect => "effect",
+        ActionTriggerKind::Unknown(_) => return Ok(()),
+    };
+    if payload_source == expected {
+        return Ok(());
+    }
+
+    Err(NProbeError::Gpu(format!(
+        "trigger '{}' uses action.{} but action.type '{}' requires action.{}.",
+        name,
+        payload_source,
+        kind.as_str(),
+        expected
+    )))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{derive_dispatch_plan, parse_action_triggers, plan_hybrid_runtime};
+    use crate::error::NProbeError;
     use crate::models::{ReportFormat, ScanProfile, ScanRequest};
 
     fn base_request() -> ScanRequest {
@@ -437,6 +545,7 @@ mod tests {
             session_id: None,
             ports: vec![22, 80, 443],
             top_ports: None,
+            ping_scan: false,
             include_udp: false,
             reverse_dns: false,
             service_detection: true,
@@ -458,6 +567,7 @@ mod tests {
             timeout_ms: None,
             concurrency: None,
             delay_ms: None,
+            timing_template: None,
             rate_limit_pps: None,
             rate_explicit: false,
             gpu_rate_pps: None,
@@ -465,6 +575,8 @@ mod tests {
             gpu_burst_size: None,
             gpu_timestamp: false,
             gpu_schedule_random: false,
+            assess_hardware: false,
+            override_mode: false,
             burst_size: None,
             max_retries: None,
             total_shards: None,
@@ -478,7 +590,7 @@ mod tests {
     #[test]
     fn hybrid_plan_stays_inactive_without_gpu_request() {
         let request = base_request();
-        let plan = plan_hybrid_runtime(&request, "hybrid", 8, 128);
+        let plan = plan_hybrid_runtime(&request, "hybrid", 8, 128).expect("hybrid plan");
         assert!(!plan.requested);
         assert_eq!(plan.lane.as_str(), "inactive");
     }
@@ -488,7 +600,7 @@ mod tests {
         let mut request = base_request();
         request.gpu_rate_pps = Some(100);
         request.gpu_rate_explicit = true;
-        let plan = plan_hybrid_runtime(&request, "packet-blast", 16, 256);
+        let plan = plan_hybrid_runtime(&request, "packet-blast", 16, 256).expect("hybrid plan");
         assert!(plan.requested);
         assert!(plan.backend_label.contains("wgsl-scaffold"));
     }
@@ -525,5 +637,62 @@ triggers:
         assert_eq!(triggers[0].condition.port, Some(80));
         assert_eq!(triggers[1].condition.total_found, Some(100));
         assert_eq!(triggers[1].kind.as_str(), "ui_effect");
+    }
+
+    #[test]
+    fn action_trigger_parser_reports_missing_type_clearly() {
+        let raw = r#"
+triggers:
+  - name: "Broken Trigger"
+    condition:
+      port: 80
+    action:
+      exec: "curl -I http://{ip}"
+"#;
+        let err = parse_action_triggers(raw).expect_err("parser should fail");
+        match err {
+            NProbeError::Gpu(message) => {
+                assert!(message.contains("missing action.type"));
+                assert!(message.contains("shell, notify, ui_effect"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn action_trigger_parser_reports_wrong_payload_field_clearly() {
+        let raw = r#"
+triggers:
+  - name: "Wrong Payload"
+    condition:
+      total_found: 5
+    action:
+      type: "notify"
+      exec: "curl -I http://{ip}"
+"#;
+        let err = parse_action_triggers(raw).expect_err("parser should fail");
+        match err {
+            NProbeError::Gpu(message) => {
+                assert!(message.contains("action.exec"));
+                assert!(message.contains("requires action.message"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn action_trigger_parser_allows_inline_comments_after_values() {
+        let raw = r#"
+triggers:
+  - name: "GPU Convergence Event"
+    condition:
+      total_found: 100 # Trigger when 100 targets are found
+    action:
+      type: "ui_effect"
+      effect: "flash_screen"
+"#;
+        let triggers = parse_action_triggers(raw).expect("parsed triggers");
+        assert_eq!(triggers.len(), 1);
+        assert_eq!(triggers[0].condition.total_found, Some(100));
     }
 }

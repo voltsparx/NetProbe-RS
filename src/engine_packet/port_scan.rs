@@ -23,6 +23,7 @@ use crate::engine_packet::syn_scanner::{
 use crate::engines::async_engine::AsyncPacketEngine;
 use crate::engines::bio_response_governor;
 use crate::engines::fusion_engine::{FusionEngine, PacketFusionInput, PacketFusionPlan};
+use crate::engines::local_system_guard;
 use crate::engines::phantom_preflight;
 use crate::error::{NProbeError, NProbeResult};
 use crate::fingerprint_db::FingerprintDatabase;
@@ -189,6 +190,36 @@ impl PacketFirehoseBudget {
     }
 }
 
+fn target_emergency_brake_reason(
+    device_profile: Option<DeviceProfile>,
+    preflight: &phantom_preflight::PhantomPreflightDecision,
+) -> Option<String> {
+    let Some(class) = device_profile.map(|profile| profile.class) else {
+        return None;
+    };
+    if !matches!(
+        class,
+        DeviceClass::FragileEmbedded | DeviceClass::PrinterSensitive
+    ) {
+        return None;
+    }
+    if preflight.stage != "soft" {
+        return None;
+    }
+
+    let sampled = preflight.sampled_ports.len().max(1);
+    if preflight.timeout_ports.saturating_mul(100) < sampled.saturating_mul(75) {
+        return None;
+    }
+
+    Some(format!(
+        "phantom preflight classified the host as soft-risk after {} timeout(s) across {} sample probes on a {} device",
+        preflight.timeout_ports,
+        sampled,
+        class
+    ))
+}
+
 pub async fn run(
     request: &ScanRequest,
     target: IpAddr,
@@ -230,6 +261,7 @@ pub async fn run(
     let mut observed_mac = None::<String>;
     let mut device_class = None::<String>;
     let mut device_vendor = None::<String>;
+    let override_mode = request.override_mode;
     let base_rate_pps = request.rate_limit_pps.unwrap_or(strategy.rate_limit_pps) as u64;
     let mut rate_pps = base_rate_pps;
     let runtime = request.runtime_settings();
@@ -262,7 +294,16 @@ pub async fn run(
                 device_class = Some(profile.class.to_string());
                 device_vendor = profile.vendor.map(str::to_string);
                 if let Some(max_pps) = profile.max_pps {
-                    rate_pps = rate_pps.min(max_pps as u64);
+                    if override_mode {
+                        warnings.push(format!(
+                            "override mode bypassed device-profile raw rate cap of {}pps for detected {} hardware",
+                            max_pps, profile.class
+                        ));
+                        safety_actions
+                            .push("override-mode:device-profile-rate-cap-bypassed".to_string());
+                    } else {
+                        rate_pps = rate_pps.min(max_pps as u64);
+                    }
                 }
                 warnings.push(format!(
                     "device-profile active: mac={} {}",
@@ -290,8 +331,26 @@ pub async fn run(
         }
     }
 
-    let mut firehose_budget =
-        PacketFirehoseBudget::baseline(ports.len(), device_profile, request.strict_safety);
+    if override_mode {
+        warnings.push(
+            "override mode active: raw lane bypassing adaptive device-profile, bio-response, phantom, and local-health safety governors at operator request"
+                .to_string(),
+        );
+        safety_actions.push("override-mode:raw-governors-bypassed".to_string());
+    }
+
+    let mut firehose_budget = if override_mode {
+        PacketFirehoseBudget {
+            coverage_cap: ports.len().max(1),
+            tx_worker_cap: raw_worker_cap.max(1),
+            tx_batch_cap: burst_size.max(1),
+            window_cap: ports.len().max(1),
+            cooldown_delay: Duration::ZERO,
+            atomic_probing: false,
+        }
+    } else {
+        PacketFirehoseBudget::baseline(ports.len(), device_profile, request.strict_safety)
+    };
     if request.rate_explicit {
         firehose_budget.tighten_for_operator_rate(rate_pps);
         warnings.push(format!(
@@ -436,10 +495,12 @@ pub async fn run(
         ));
     }
 
-    if !matches!(
-        device_profile.map(|profile| profile.class),
-        Some(DeviceClass::Enterprise)
-    ) && rate_pps > 500
+    if !override_mode
+        && !matches!(
+            device_profile.map(|profile| profile.class),
+            Some(DeviceClass::Enterprise)
+        )
+        && rate_pps > 500
     {
         warnings.push(format!(
             "defensive guard applied conservative raw rate cap: {}pps -> 500pps",
@@ -449,66 +510,74 @@ pub async fn run(
         rate_pps = 500;
     }
 
-    let bio_response = bio_response_governor::decide(
-        request.profile,
-        request.strict_safety,
-        device_profile.map(|profile| profile.class),
-        rate_pps.min(u32::MAX as u64) as u32,
-        raw_worker_cap,
-        chunk_delay,
-    );
-    if (bio_response.rate_cap_pps as u64) < rate_pps {
-        warnings.push(format!(
-            "bio-response governor applied raw rate cap: {}pps -> {}pps",
-            rate_pps, bio_response.rate_cap_pps
-        ));
-        safety_actions.push(format!(
-            "bio-response:rate-capped:{}->{}pps",
-            rate_pps, bio_response.rate_cap_pps
-        ));
-        rate_pps = bio_response.rate_cap_pps as u64;
-    }
-    if bio_response.concurrency_cap < raw_worker_cap {
-        let previous = raw_worker_cap;
-        raw_worker_cap = bio_response.concurrency_cap;
-        warnings.push(format!(
-            "bio-response governor applied raw worker cap: {} -> {}",
-            previous, raw_worker_cap
-        ));
-        safety_actions.push(format!(
-            "bio-response:concurrency-capped:{}->{}",
-            previous, raw_worker_cap
-        ));
-    }
-    if bio_response.delay_floor > chunk_delay {
-        let previous = chunk_delay;
-        chunk_delay = bio_response.delay_floor;
-        warnings.push(format!(
-            "bio-response governor raised raw chunk delay floor: {}ms -> {}ms",
-            previous.as_millis(),
-            chunk_delay.as_millis()
-        ));
-        safety_actions.push(format!(
-            "bio-response:delay-raised:{}ms->{}ms",
-            previous.as_millis(),
-            chunk_delay.as_millis()
-        ));
-    }
-    if stage2_service_detection && !bio_response.service_detection_allowed {
-        stage2_service_detection = false;
-        fingerprint_payload_budget = 0;
+    if override_mode {
         warnings.push(
-            "bio-response governor withheld deeper packet-path service detection until the host proved resilient enough for safe follow-up"
+            "override mode bypassed bio-response governor for the raw lane; rate, concurrency, and service follow-up remained operator-controlled"
                 .to_string(),
         );
-        safety_actions.push("bio-response:passive-stage1".to_string());
+        safety_actions.push("override-mode:bio-response-bypassed".to_string());
+    } else {
+        let bio_response = bio_response_governor::decide(
+            request.profile,
+            request.strict_safety,
+            device_profile.map(|profile| profile.class),
+            rate_pps.min(u32::MAX as u64) as u32,
+            raw_worker_cap,
+            chunk_delay,
+        );
+        if (bio_response.rate_cap_pps as u64) < rate_pps {
+            warnings.push(format!(
+                "bio-response governor applied raw rate cap: {}pps -> {}pps",
+                rate_pps, bio_response.rate_cap_pps
+            ));
+            safety_actions.push(format!(
+                "bio-response:rate-capped:{}->{}pps",
+                rate_pps, bio_response.rate_cap_pps
+            ));
+            rate_pps = bio_response.rate_cap_pps as u64;
+        }
+        if bio_response.concurrency_cap < raw_worker_cap {
+            let previous = raw_worker_cap;
+            raw_worker_cap = bio_response.concurrency_cap;
+            warnings.push(format!(
+                "bio-response governor applied raw worker cap: {} -> {}",
+                previous, raw_worker_cap
+            ));
+            safety_actions.push(format!(
+                "bio-response:concurrency-capped:{}->{}",
+                previous, raw_worker_cap
+            ));
+        }
+        if bio_response.delay_floor > chunk_delay {
+            let previous = chunk_delay;
+            chunk_delay = bio_response.delay_floor;
+            warnings.push(format!(
+                "bio-response governor raised raw chunk delay floor: {}ms -> {}ms",
+                previous.as_millis(),
+                chunk_delay.as_millis()
+            ));
+            safety_actions.push(format!(
+                "bio-response:delay-raised:{}ms->{}ms",
+                previous.as_millis(),
+                chunk_delay.as_millis()
+            ));
+        }
+        if stage2_service_detection && !bio_response.service_detection_allowed {
+            stage2_service_detection = false;
+            fingerprint_payload_budget = 0;
+            warnings.push(
+                "bio-response governor withheld deeper packet-path service detection until the host proved resilient enough for safe follow-up"
+                    .to_string(),
+            );
+            safety_actions.push("bio-response:passive-stage1".to_string());
+        }
+        safety_actions.push(format!("bio-response:stage={}", bio_response.stage));
+        warnings.push(format!(
+            "bio-response governor stage={} policy active for the packet path",
+            bio_response.stage
+        ));
+        warnings.extend(bio_response.notes);
     }
-    safety_actions.push(format!("bio-response:stage={}", bio_response.stage));
-    warnings.push(format!(
-        "bio-response governor stage={} policy active for the packet path",
-        bio_response.stage
-    ));
-    warnings.extend(bio_response.notes);
 
     let safety_blacklist = device_profile
         .map(|profile| profile.safety_blacklist.to_vec())
@@ -536,19 +605,38 @@ pub async fn run(
         .iter()
         .map(|(_, port)| *port)
         .collect::<Vec<_>>();
-    let preflight = phantom_preflight::run(phantom_preflight::PhantomPreflightInput {
-        target,
-        ports: &preflight_ports,
-        requested_timeout: scan_timeout,
-        requested_rate_pps: rate_pps.min(u32::MAX as u64) as u32,
-        requested_concurrency: raw_worker_cap,
-        requested_delay: chunk_delay,
-        service_detection_requested: stage2_service_detection,
-        strict_safety: request.strict_safety,
-        profile: request.profile,
-        device_class: device_profile.map(|profile| profile.class),
-    })
-    .await;
+    let preflight = if override_mode {
+        safety_actions.push("override-mode:phantom-preflight-bypassed".to_string());
+        phantom_preflight::PhantomPreflightDecision {
+            stage: "override".to_string(),
+            sampled_ports: preflight_ports.iter().copied().take(4).collect(),
+            responsive_ports: 0,
+            timeout_ports: 0,
+            avg_latency_ms: None,
+            rate_cap_pps: rate_pps.min(u32::MAX as u64) as u32,
+            concurrency_cap: raw_worker_cap,
+            delay_floor: chunk_delay,
+            fingerprint_payload_budget,
+            service_detection_allowed: stage2_service_detection,
+            notes: vec![
+                "override mode kept phantom device-check advisory only; no automatic raw-lane throttles were applied from the preflight stage".to_string(),
+            ],
+        }
+    } else {
+        phantom_preflight::run(phantom_preflight::PhantomPreflightInput {
+            target,
+            ports: &preflight_ports,
+            requested_timeout: scan_timeout,
+            requested_rate_pps: rate_pps.min(u32::MAX as u64) as u32,
+            requested_concurrency: raw_worker_cap,
+            requested_delay: chunk_delay,
+            service_detection_requested: stage2_service_detection,
+            strict_safety: request.strict_safety,
+            profile: request.profile,
+            device_class: device_profile.map(|profile| profile.class),
+        })
+        .await
+    };
     let phantom_device_check = Some(preflight.summary());
     warnings.push(format!(
         "phantom preflight stage={} responsive={}/{} timeout={} avg-latency={}ms",
@@ -562,7 +650,7 @@ pub async fn run(
             .unwrap_or_else(|| "n/a".to_string())
     ));
     safety_actions.push(format!("phantom-preflight:stage={}", preflight.stage));
-    if (preflight.rate_cap_pps as u64) < rate_pps {
+    if !override_mode && (preflight.rate_cap_pps as u64) < rate_pps {
         warnings.push(format!(
             "phantom preflight tightened raw rate cap: {}pps -> {}pps",
             rate_pps, preflight.rate_cap_pps
@@ -573,7 +661,7 @@ pub async fn run(
         ));
         rate_pps = preflight.rate_cap_pps as u64;
     }
-    if preflight.concurrency_cap < raw_worker_cap {
+    if !override_mode && preflight.concurrency_cap < raw_worker_cap {
         let previous = raw_worker_cap;
         raw_worker_cap = preflight.concurrency_cap;
         warnings.push(format!(
@@ -585,7 +673,7 @@ pub async fn run(
             previous, raw_worker_cap
         ));
     }
-    if preflight.delay_floor > chunk_delay {
+    if !override_mode && preflight.delay_floor > chunk_delay {
         let previous = chunk_delay;
         chunk_delay = preflight.delay_floor;
         warnings.push(format!(
@@ -599,7 +687,7 @@ pub async fn run(
             chunk_delay.as_millis()
         ));
     }
-    if stage2_service_detection && !preflight.service_detection_allowed {
+    if !override_mode && stage2_service_detection && !preflight.service_detection_allowed {
         stage2_service_detection = false;
         warnings.push(
             "phantom preflight withheld packet-path service detection because the device-check stage did not justify deeper active follow-up"
@@ -609,11 +697,15 @@ pub async fn run(
     }
     let requested_payload_budget = fingerprint_payload_budget;
     fingerprint_payload_budget = if stage2_service_detection {
-        requested_payload_budget.min(preflight.fingerprint_payload_budget)
+        if override_mode {
+            requested_payload_budget
+        } else {
+            requested_payload_budget.min(preflight.fingerprint_payload_budget)
+        }
     } else {
         0
     };
-    if fingerprint_payload_budget < requested_payload_budget {
+    if !override_mode && fingerprint_payload_budget < requested_payload_budget {
         warnings.push(format!(
             "phantom preflight reduced packet-path payload budget: {} -> {}",
             requested_payload_budget, fingerprint_payload_budget
@@ -623,11 +715,13 @@ pub async fn run(
             requested_payload_budget, fingerprint_payload_budget
         ));
     }
-    warnings.extend(preflight.notes);
+    warnings.extend(preflight.notes.clone());
 
     let previous_budget = firehose_budget;
-    firehose_budget.tighten_for_stage(&preflight.stage, device_profile);
-    if firehose_budget.tx_worker_cap < raw_worker_cap {
+    if !override_mode {
+        firehose_budget.tighten_for_stage(&preflight.stage, device_profile);
+    }
+    if !override_mode && firehose_budget.tx_worker_cap < raw_worker_cap {
         let previous = raw_worker_cap;
         raw_worker_cap = firehose_budget.tx_worker_cap;
         warnings.push(format!(
@@ -639,7 +733,7 @@ pub async fn run(
             previous, raw_worker_cap
         ));
     }
-    if firehose_budget.tx_batch_cap < burst_size {
+    if !override_mode && firehose_budget.tx_batch_cap < burst_size {
         let previous = burst_size;
         burst_size = firehose_budget.tx_batch_cap.max(1);
         warnings.push(format!(
@@ -651,7 +745,7 @@ pub async fn run(
             previous, burst_size
         ));
     }
-    if firehose_budget.cooldown_delay > chunk_delay {
+    if !override_mode && firehose_budget.cooldown_delay > chunk_delay {
         let previous = chunk_delay;
         chunk_delay = firehose_budget.cooldown_delay;
         warnings.push(format!(
@@ -693,6 +787,29 @@ pub async fn run(
                 chunk_delay.as_millis()
             ));
         }
+    }
+
+    let target_emergency_brake = if override_mode {
+        warnings.push(
+            "override mode bypassed the fragile-target emergency brake for the raw lane; operator accepted the risk explicitly"
+                .to_string(),
+        );
+        safety_actions.push("override-mode:target-emergency-brake-bypassed".to_string());
+        None
+    } else {
+        target_emergency_brake_reason(device_profile, &preflight)
+    };
+    if let Some(reason) = &target_emergency_brake {
+        warnings.push(format!(
+            "emergency brake engaged for this host: {}. Raw packet crafting stopped before the main firehose phase.",
+            reason
+        ));
+        warnings.push(
+            "intelligence stopped raw packet crafting because the device-check stage indicated the host was too fragile for continued packet pressure"
+                .to_string(),
+        );
+        safety_actions.push("emergency-brake:fragile-target".to_string());
+        safety_actions.push("fault-isolation:target-firehose-halted".to_string());
     }
 
     let mut scan_targets = select_controlled_firehose_targets(
@@ -761,6 +878,8 @@ pub async fn run(
         "token-bucket:rate={}pps:burst={}",
         rate_pps, burst_size
     ));
+    let mut local_runtime_monitor =
+        (!override_mode).then(local_system_guard::RuntimeHealthMonitor::new);
 
     let mut fusion_engine = FusionEngine::default();
     let mut feedback = AdaptiveFusionFeedback::default();
@@ -774,8 +893,38 @@ pub async fn run(
     let mut rate_sum_pps = 0u64;
     let mut next_timestamp_slot = gpu_timestamp_pacing.then(Instant::now);
     let operator_rate_locked = request.rate_explicit || request.gpu_rate_explicit;
+    let mut runtime_emergency_brake_reason = target_emergency_brake.clone();
 
-    while scanned < scan_targets.len() {
+    while scanned < scan_targets.len() && runtime_emergency_brake_reason.is_none() {
+        if let Some(monitor) = local_runtime_monitor.as_mut() {
+            if let Some(adjustment) =
+                monitor.sample_raw_path(rate_pps, burst_size, raw_worker_cap, chunk_delay)
+            {
+                if (adjustment.rate_cap_pps as u64) < rate_pps {
+                    rate_pps = adjustment.rate_cap_pps as u64;
+                }
+                if adjustment.burst_cap < burst_size {
+                    burst_size = adjustment.burst_cap;
+                }
+                if adjustment.worker_cap < raw_worker_cap {
+                    raw_worker_cap = adjustment.worker_cap;
+                }
+                if adjustment.delay_floor > chunk_delay {
+                    chunk_delay = adjustment.delay_floor;
+                }
+                for note in adjustment.notes {
+                    warnings.push(note);
+                }
+                safety_actions.push(format!("local-health-monitor:{}", adjustment.health_stage));
+                if let Some(reason) = adjustment.emergency_brake_reason {
+                    runtime_emergency_brake_reason = Some(reason);
+                    safety_actions.push("emergency-brake:local-health-monitor".to_string());
+                    safety_actions.push("fault-isolation:local-firehose-halted".to_string());
+                    break;
+                }
+            }
+        }
+
         let remaining = scan_targets.len().saturating_sub(scanned);
         let gpu_window_cap = gpu_dispatch_plan
             .map(|dispatch| dispatch.dispatch_window.min(remaining).max(1))
@@ -891,6 +1040,27 @@ pub async fn run(
         }
     }
 
+    let runtime_deferred_ports = if scanned < scan_targets.len() {
+        scan_targets[scanned..]
+            .iter()
+            .map(|(_, port)| *port)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    if let Some(reason) = &runtime_emergency_brake_reason {
+        warnings.push(format!(
+            "emergency brake halted raw packet crafting after {} of {} active targets because {}",
+            scanned,
+            scan_targets.len(),
+            reason
+        ));
+        warnings.push(
+            "intelligence isolated the unstable firehose lane and left the rest of the scan/report pipeline intact"
+                .to_string(),
+        );
+    }
+
     let mut final_findings = build_default_findings(&ports, &services);
     let mut index_by_port = HashMap::<u16, usize>::with_capacity(final_findings.len());
     for (idx, finding) in final_findings.iter().enumerate() {
@@ -920,6 +1090,23 @@ pub async fn run(
             entry.confidence = Some(1.0);
             entry.educational_note = Some(
                 "the raw packet engine intentionally deferred this port to keep coverage safe for the detected device profile"
+                    .to_string(),
+            );
+        }
+    }
+
+    for port in &runtime_deferred_ports {
+        if let Some(idx) = index_by_port.get(port).copied() {
+            let entry = &mut final_findings[idx];
+            entry.state = PortState::Filtered;
+            entry.reason = runtime_emergency_brake_reason
+                .as_ref()
+                .map(|reason| format!("deferred after emergency brake: {reason}"))
+                .unwrap_or_else(|| "deferred after emergency brake".to_string());
+            entry.matched_by = Some("local-emergency-brake".to_string());
+            entry.confidence = Some(1.0);
+            entry.educational_note = Some(
+                "nprobe-rs stopped packet crafting on this host to protect either the target or the local system once the safety monitor crossed its emergency threshold"
                     .to_string(),
             );
         }

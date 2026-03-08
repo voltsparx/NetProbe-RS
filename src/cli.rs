@@ -19,6 +19,7 @@ use crate::engines::phantom_preflight;
 use crate::error::{NProbeError, NProbeResult};
 use crate::models::{ReportFormat, ScanProfile, ScanRequest};
 use crate::platform::self_integrity::IntegrityStatus;
+use crate::scan_types;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum FileType {
@@ -138,6 +139,13 @@ struct ScanArgs {
     top_ports: Option<usize>,
 
     #[arg(
+        long = "ping-scan",
+        visible_aliases = ["host-discovery", "discovery-only"],
+        help = "Discovery-only host up check; do not perform a port scan (Nmap: -sn)"
+    )]
+    ping_scan: bool,
+
+    #[arg(
         short = 'U',
         long = "udp",
         visible_aliases = ["sU", "udp-scan"],
@@ -148,7 +156,7 @@ struct ScanArgs {
     #[arg(
         short = 'S',
         long = "syn",
-        visible_aliases = ["sS", "syn-scan", "half-open"],
+        visible_aliases = ["sS", "syn-scan", "half-open", "stealth", "stealth-scan"],
         conflicts_with = "connect",
         help = "Use privileged TCP probing (Nmap: -sS). Will auto-prompt for sudo/su if required"
     )]
@@ -334,6 +342,13 @@ struct ScanArgs {
     delay_ms: Option<u64>,
 
     #[arg(
+        long = "timing-template",
+        hide = true,
+        value_parser = clap::value_parser!(u8).range(0..=5)
+    )]
+    timing_template: Option<u8>,
+
+    #[arg(
         long = "rate",
         visible_aliases = ["rate-pps", "max-rate", "min-rate"],
         num_args = 0..=1,
@@ -368,6 +383,18 @@ struct ScanArgs {
         help = "Randomize GPU/parallel crafter scheduling order; currently also randomizes the fused packet-crafter path"
     )]
     gpu_schedule_random: bool,
+
+    #[arg(
+        long = "assess-hardware",
+        help = "Assess local hardware compatibility, health, and safe raw/GPU ceilings without transmitting scan packets"
+    )]
+    assess_hardware: bool,
+
+    #[arg(
+        long = "override-mode",
+        help = "Power-user override that disables adaptive auto-throttles and emergency brakes after explicit interactive confirmations"
+    )]
+    override_mode: bool,
 
     #[arg(long = "burst-size", help = "Token-bucket burst size for rate control")]
     burst_size: Option<usize>,
@@ -600,8 +627,276 @@ pub fn maybe_render_quick_help_mode() -> Option<String> {
     }
 
     Some(
-        "Usage:\n  nprobe-rs <target> [options]\n  nprobe-rs interactive\n  nprobe-rs integrity [--reseal]\n  nprobe-rs sessions [--limit N]\n  nprobe-rs sessions --show <session-id>\n  nprobe-rs sessions --diff <older-session-id> <newer-session-id>\n\nCommon options:\n  -p, --ports <list|range>   Select ports (example: -p 22,80,443)\n      --all-ports            Scan ports 1-65535 (Nmap: -p-)\n  -U, --udp                  Enable UDP probes (Nmap: -sU)\n  -S, --syn                  Enable privileged TCP probes (Nmap: -sS)\n      --connect              Force user-space TCP connect scanning (Nmap: -sT)\n      --service-detect       Enable banner/service detection (Nmap: -sV, Masscan: --banners)\n      --os-detect            Bias toward richer passive OS correlation (Nmap: -O)\n      --arp                  Enable ARP neighbor discovery (local IPv4)\n      --callback-ping        Record guarded post-discovery callback notes\n      --phantom/--sar/--kis  TBNS defensive scan concepts\n      --idf/--mirror         Additional defensive scan concepts\n      --hybrid               Controlled masscan+nmap fusion mode\n  -A, --aggressive           Aggressive mode (Nmap: -A)\n  -w, --timeout-ms <ms>      Probe timeout in milliseconds\n      --rate [num]           Stabilized raw/firehose target in packets per second (bare flag = 100)\n      --gpu-rate [num]       GPU/parallel crafter ceiling in packets per second (bare flag = 100)\n      --gpu-burst <num>      GPU/parallel crafter burst ceiling\n      --gpu-timestamp        Timestamp-pace the GPU/fused packet scheduler\n      --gpu-schedule-random  Randomize GPU/fused packet scheduling order\n      --burst-size <num>     Token-bucket burst limit\n      --max-retries <num>    Adaptive retries per probe (0..20)\n      --total-shards <num>   Total shard count for distributed scans\n      --shard-index <num>    Current shard index (requires total-shards)\n      --scan-seed <num>      Deterministic port shuffle seed\n      --resume               Resume from shard checkpoint\n      --fresh-scan           Ignore/reset shard checkpoint for this run\n  -r, --reverse-dns          Enable reverse DNS lookups\n  -n, --no-dns               Disable reverse DNS lookups\n  -e, --explain              Add concise per-port rationale in output\n  -v, --verbose              Show full output sections\n  -f, --file-type <type>     Export format: txt|json|html|csv\n  -o, --output <name>        Output filename\n  -L, --location <dir>       Output directory\n\nLearner mode:\n  nprobe-rs interactive      Guided prompt mode with banner and safe defaults\n  nprobe-rs learn            Alias for interactive mode\n\nIntegrity:\n  nprobe-rs integrity\n  nprobe-rs integrity --reseal\n\nSession history:\n  nprobe-rs sessions --limit 20\n  nprobe-rs sessions --show <session-id>\n  nprobe-rs sessions --diff <older-session-id> <newer-session-id>\n      Optional session filters: --profile <name> --updated-after <ts> --updated-before <ts>\n      Optional diff filters:    --ip <addr> --target-contains <text> --severity <level>\n      Optional diff export:     -f txt|json|html -o <name> -L <dir>\n\nNmap-style shortcuts accepted:\n  -sU  -sS  -sT  -sV  -O  -Pn  -A  -T0..-T5  -p-\n\nFlag docs mode:\n  nprobe-rs --flag-help --scan\n  nprobe-rs --flag-help -sU\n  nprobe-rs --explain --scan   (legacy alias)\n\nCompatibility:\n  nprobe-rs scan <target> [options] still works.".to_string(),
+        "Usage:\n  nprobe-rs <target> [options]\n  nprobe-rs interactive\n  nprobe-rs integrity [--reseal]\n  nprobe-rs sessions [--limit N]\n  nprobe-rs sessions --show <session-id>\n  nprobe-rs sessions --diff <older-session-id> <newer-session-id>\n\nCommon options:\n  -p, --ports <list|range>   Select ports (example: -p 22,80,443)\n      --all-ports            Scan ports 1-65535 (Nmap: -p-)\n      --ping-scan            Discovery-only host up check (Nmap: -sn)\n  -U, --udp                  Enable UDP probes (Nmap: -sU)\n  -S, --syn                  Enable privileged TCP probes (Nmap: -sS)\n      --connect              Force user-space TCP connect scanning (Nmap: -sT)\n      --service-detect       Enable banner/service detection (Nmap: -sV, Masscan: --banners)\n      --os-detect            Bias toward richer passive OS correlation (Nmap: -O)\n      --arp                  Enable ARP neighbor discovery (local IPv4)\n      --callback-ping        Record guarded post-discovery callback notes\n      --phantom/--sar/--kis  TBNS defensive scan concepts\n      --idf/--mirror         Additional defensive scan concepts\n      --hybrid               Controlled masscan+nmap fusion mode\n  -A, --aggressive           Aggressive mode (Nmap: -A)\n  -w, --timeout-ms <ms>      Probe timeout in milliseconds\n      --rate [num]           Stabilized raw/firehose target in packets per second (bare flag = 100)\n      --gpu-rate [num]       GPU/parallel crafter ceiling in packets per second (bare flag = 100)\n      --gpu-burst <num>      GPU/parallel crafter burst ceiling\n      --gpu-timestamp        Timestamp-pace the GPU/fused packet scheduler\n      --gpu-schedule-random  Randomize GPU/fused packet scheduling order\n      --assess-hardware      Assess local hardware and print safe raw/GPU ceilings only\n      --override-mode        Ask for explicit confirmations, then bypass adaptive throttles and emergency brakes\n      --scan-type [name]     List framework scan types, or query one specific type\n      --burst-size <num>     Token-bucket burst limit\n      --max-retries <num>    Adaptive retries per probe (0..20)\n      --total-shards <num>   Total shard count for distributed scans\n      --shard-index <num>    Current shard index (requires total-shards)\n      --scan-seed <num>      Deterministic port shuffle seed\n      --resume               Resume from shard checkpoint\n      --fresh-scan           Ignore/reset shard checkpoint for this run\n  -r, --reverse-dns          Enable reverse DNS lookups\n  -n, --no-dns               Disable reverse DNS lookups\n  -e, --explain              Add concise per-port rationale in output\n  -v, --verbose              Show full output sections\n  -f, --file-type <type>     Export format: txt|json|html|csv\n  -o, --output <name>        Output filename\n  -L, --location <dir>       Output directory\n\nLearner mode:\n  nprobe-rs interactive      Guided prompt mode with banner and safe defaults\n  nprobe-rs learn            Alias for interactive mode\n\nScan type catalog:\n  nprobe-rs --scan-type\n  nprobe-rs --scan-type zombie\n  nprobe-rs --scan-type -sI\n\nIntegrity:\n  nprobe-rs integrity\n  nprobe-rs integrity --reseal\n\nSession history:\n  nprobe-rs sessions --limit 20\n  nprobe-rs sessions --show <session-id>\n  nprobe-rs sessions --diff <older-session-id> <newer-session-id>\n      Optional session filters: --profile <name> --updated-after <ts> --updated-before <ts>\n      Optional diff filters:    --ip <addr> --target-contains <text> --severity <level>\n      Optional diff export:     -f txt|json|html -o <name> -L <dir>\n\nNmap-style shortcuts accepted:\n  -sn  -sU  -sS  -sT  -sV  -O  -Pn  -PR  -A  -T0..-T5  -p-\n\nCatalog-only encyclopedia entries:\n  Use `nprobe-rs --scan-type <name|flag>` for scan families that are documented but not executable.\n\nFlag docs mode:\n  nprobe-rs --flag-help --scan\n  nprobe-rs --flag-help -sU\n  nprobe-rs --explain --scan   (legacy alias)\n\nCompatibility:\n  nprobe-rs scan <target> [options] still works.".to_string(),
     )
+}
+
+pub fn maybe_render_scan_type_mode() -> Option<String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.is_empty() {
+        return None;
+    }
+
+    let first = args[0].as_str();
+    let inline = if let Some((flag, value)) = first.split_once('=') {
+        if flag == "--scan-type" || flag == "--scan-types" {
+            Some(value.to_string())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some(value) = inline {
+        let query = if value.trim().is_empty() {
+            None
+        } else {
+            Some(value.as_str())
+        };
+        return Some(scan_types::render_scan_type_catalog(query));
+    }
+
+    if first != "--scan-type" && first != "--scan-types" {
+        return None;
+    }
+
+    if args.len() == 1 {
+        return Some(scan_types::render_scan_type_catalog(None));
+    }
+
+    if args.len() == 2 {
+        return Some(scan_types::render_scan_type_catalog(Some(args[1].as_str())));
+    }
+
+    None
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CatalogedScanGate {
+    token: &'static str,
+    scan_id: &'static str,
+    label: &'static str,
+    risky: bool,
+}
+
+const CATALOGED_SCAN_GATES: &[CatalogedScanGate] = &[
+    CatalogedScanGate {
+        token: "-PS",
+        scan_id: "tcp-syn-ping",
+        label: "TCP SYN Ping",
+        risky: false,
+    },
+    CatalogedScanGate {
+        token: "-PA",
+        scan_id: "tcp-ack-ping",
+        label: "TCP ACK Ping",
+        risky: false,
+    },
+    CatalogedScanGate {
+        token: "-PU",
+        scan_id: "udp-ping",
+        label: "UDP Ping",
+        risky: false,
+    },
+    CatalogedScanGate {
+        token: "-PY",
+        scan_id: "sctp-init-ping",
+        label: "SCTP INIT Ping",
+        risky: false,
+    },
+    CatalogedScanGate {
+        token: "-PE",
+        scan_id: "icmp-echo",
+        label: "ICMP Echo Ping",
+        risky: false,
+    },
+    CatalogedScanGate {
+        token: "-PP",
+        scan_id: "icmp-timestamp",
+        label: "ICMP Timestamp Ping",
+        risky: false,
+    },
+    CatalogedScanGate {
+        token: "-PM",
+        scan_id: "icmp-netmask",
+        label: "ICMP Netmask Ping",
+        risky: false,
+    },
+    CatalogedScanGate {
+        token: "-PO",
+        scan_id: "ip-proto-ping",
+        label: "IP Protocol Ping",
+        risky: false,
+    },
+    CatalogedScanGate {
+        token: "-sY",
+        scan_id: "sctp-init",
+        label: "SCTP INIT Scan",
+        risky: false,
+    },
+    CatalogedScanGate {
+        token: "-sZ",
+        scan_id: "sctp-cookie",
+        label: "SCTP COOKIE Scan",
+        risky: false,
+    },
+    CatalogedScanGate {
+        token: "-sO",
+        scan_id: "ip-protocol",
+        label: "IP Protocol Scan",
+        risky: false,
+    },
+    CatalogedScanGate {
+        token: "-sC",
+        scan_id: "script-scan",
+        label: "Script Scan",
+        risky: false,
+    },
+    CatalogedScanGate {
+        token: "--traceroute",
+        scan_id: "traceroute",
+        label: "Traceroute",
+        risky: false,
+    },
+    CatalogedScanGate {
+        token: "-sA",
+        scan_id: "ack",
+        label: "ACK Scan",
+        risky: true,
+    },
+    CatalogedScanGate {
+        token: "-sN",
+        scan_id: "null",
+        label: "NULL Scan",
+        risky: true,
+    },
+    CatalogedScanGate {
+        token: "-sF",
+        scan_id: "fin",
+        label: "FIN Scan",
+        risky: true,
+    },
+    CatalogedScanGate {
+        token: "-sX",
+        scan_id: "xmas",
+        label: "Xmas Scan",
+        risky: true,
+    },
+    CatalogedScanGate {
+        token: "-sM",
+        scan_id: "maimon",
+        label: "Maimon Scan",
+        risky: true,
+    },
+    CatalogedScanGate {
+        token: "--scanflags",
+        scan_id: "custom-scanflags",
+        label: "Custom TCP Scanflags",
+        risky: true,
+    },
+    CatalogedScanGate {
+        token: "-sW",
+        scan_id: "window",
+        label: "Window Scan",
+        risky: true,
+    },
+    CatalogedScanGate {
+        token: "-sI",
+        scan_id: "zombie",
+        label: "Idle/Zombie Scan",
+        risky: true,
+    },
+    CatalogedScanGate {
+        token: "--zombie",
+        scan_id: "zombie",
+        label: "Idle/Zombie Scan",
+        risky: true,
+    },
+    CatalogedScanGate {
+        token: "-f",
+        scan_id: "fragment",
+        label: "Fragmented Packet Scan",
+        risky: true,
+    },
+    CatalogedScanGate {
+        token: "--mtu",
+        scan_id: "fragment",
+        label: "Custom MTU Fragmentation",
+        risky: true,
+    },
+    CatalogedScanGate {
+        token: "-D",
+        scan_id: "decoy",
+        label: "Decoy Scan",
+        risky: true,
+    },
+    CatalogedScanGate {
+        token: "--decoy",
+        scan_id: "decoy",
+        label: "Decoy Scan",
+        risky: true,
+    },
+    CatalogedScanGate {
+        token: "-b",
+        scan_id: "ftp-bounce",
+        label: "FTP Bounce Scan",
+        risky: true,
+    },
+    CatalogedScanGate {
+        token: "--spoof-source",
+        scan_id: "spoof-source",
+        label: "Spoofed Source Scan",
+        risky: true,
+    },
+    CatalogedScanGate {
+        token: "--interface",
+        scan_id: "interface-bind",
+        label: "Forced Interface Scan",
+        risky: true,
+    },
+    CatalogedScanGate {
+        token: "--source-port",
+        scan_id: "source-port-pin",
+        label: "Pinned Source Port Scan",
+        risky: true,
+    },
+];
+
+pub fn maybe_reject_cataloged_scan_mode() -> Option<NProbeError> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    detect_cataloged_scan_gate(&args)
+}
+
+fn detect_cataloged_scan_gate(args: &[String]) -> Option<NProbeError> {
+    for raw in args {
+        let token = raw
+            .split_once('=')
+            .map(|(left, _)| left)
+            .unwrap_or(raw.as_str());
+        if let Some(gate) = CATALOGED_SCAN_GATES
+            .iter()
+            .find(|candidate| candidate.token.eq_ignore_ascii_case(token))
+        {
+            let detail = if gate.risky {
+                format!(
+                    "{} ({}) is cataloged in NProbe-RS, but this build does not execute stealth, spoofing, or firewall-evasion scan modes. Inspect it with `--scan-type {}` instead.",
+                    gate.label, gate.token, gate.scan_id
+                )
+            } else {
+                format!(
+                    "{} ({}) is cataloged in NProbe-RS, but there is no executable lane for it yet. Inspect it with `--scan-type {}` instead.",
+                    gate.label, gate.token, gate.scan_id
+                )
+            };
+            return Some(if gate.risky {
+                NProbeError::Safety(detail)
+            } else {
+                NProbeError::Cli(detail)
+            });
+        }
+    }
+    None
 }
 
 impl SessionArgs {
@@ -728,6 +1023,9 @@ fn render_flag_explain(raw_query: Option<&str>) -> String {
         "pn" | "no-host-discovery" => {
             "Compatibility flag (`-Pn` or `--no-host-discovery`). Current nprobe-rs scanning already avoids a separate ping-only discovery phase."
         }
+        "sn" | "pingscan" | "ping-scan" | "hostdiscovery" | "host-discovery" | "discoveryonly" | "discovery-only" => {
+            "Discovery-only mode (`-sn` or `--ping-scan`). NProbe-RS verifies host presence through the lightweight fetcher plane and does not perform a port scan."
+        }
         "p" | "ports" => "Select ports or ranges. Example: `-p 22,80,443` or `-p 1-1024`.",
         "s" | "su" | "udp" => "Enable UDP probing (`-sU` or `--udp`).",
         "ss" | "syn" => {
@@ -765,7 +1063,7 @@ fn render_flag_explain(raw_query: Option<&str>) -> String {
             "Aggressive mode (`-A`): enables deeper detection and root-required probe paths."
         }
         "t" | "timing" => {
-            "Timing profile (`-T0`..`-T5`). Mapped to internal profiles from stealth to aggressive."
+            "Timing profile (`-T0`..`-T5`). NProbe-RS now preserves a dedicated timing template so scan pacing, timeout, retries, and concurrency shift even when the broader scan profile stays the same."
         }
         "p-" | "all-ports" => "Scan all TCP ports 1-65535 (`-p-` or `--all-ports`).",
         "rate" | "ratepps" | "rate-pps" | "maxrate" | "max-rate" | "minrate" | "min-rate" => {
@@ -782,6 +1080,15 @@ fn render_flag_explain(raw_query: Option<&str>) -> String {
         }
         "gpuschedulerandom" | "gpu-schedule-random" => {
             "Randomize GPU/parallel scheduling order (`--gpu-schedule-random`). On current builds it also randomizes the fused packet-crafter chunk order."
+        }
+        "assesshardware" | "assess-hardware" => {
+            "Assess local hardware compatibility and safe ceilings (`--assess-hardware`). This mode reports recommended raw and GPU limits and does not transmit scan packets."
+        }
+        "overridemode" | "override-mode" => {
+            "Power-user override (`--override-mode`). Requires interactive confirmations, then bypasses adaptive local throttles, target fragility brakes, and runtime emergency brakes for raw/GPU acceleration paths. Hard prerequisites like permissions and platform support still apply."
+        }
+        "scantype" | "scan-type" | "scan-types" => {
+            "List framework scan types (`--scan-type`) or inspect one entry (`--scan-type zombie`). The catalog shows implemented, partial, and planned scan families plus combo recipes."
         }
         "burstsize" | "burst-size" => {
             "Set token-bucket burst size (`--burst-size`) to smooth short-term packet bursts."
@@ -889,7 +1196,7 @@ impl ScanArgs {
             }
         }
 
-        let (ports, top_ports) = if self.all_ports {
+        let (mut ports, top_ports) = if self.all_ports {
             ((1u16..=65535).collect(), None)
         } else if let Some(raw) = self.ports.as_deref() {
             (parse_ports(raw)?, None)
@@ -910,17 +1217,25 @@ impl ScanArgs {
         }
 
         let root_only = self.root_only || matches!(self.profile, Some(ScanProfile::RootOnly));
-        let effective_aggressive_root = self.aggressive || self.aggressive_root || root_only;
-        let effective_privileged_probes =
+        let mut effective_aggressive_root = self.aggressive || self.aggressive_root || root_only;
+        let mut effective_privileged_probes =
             self.syn || self.privileged_probes || self.aggressive || root_only;
 
-        let profile_explicit = self.profile.is_some() || self.root_only || self.aggressive;
+        let timing_template = self.timing_template;
+        let profile_explicit = self.profile.is_some()
+            || self.root_only
+            || self.aggressive
+            || timing_template.is_some();
         let profile = if root_only {
             ScanProfile::RootOnly
         } else if (self.aggressive || self.aggressive_root) && self.profile.is_none() {
             ScanProfile::Aggressive
         } else {
-            self.profile.unwrap_or(ScanProfile::Balanced)
+            self.profile.unwrap_or_else(|| {
+                timing_template
+                    .and_then(map_timing_to_profile)
+                    .unwrap_or(ScanProfile::Balanced)
+            })
         };
 
         let mut report_format = self
@@ -965,6 +1280,7 @@ impl ScanArgs {
         let gpu_burst_size = self.gpu_burst_size;
         let gpu_timestamp = self.gpu_timestamp;
         let gpu_schedule_random = self.gpu_schedule_random;
+        let override_mode = self.override_mode;
         let mut burst_size = self.burst_size;
         let mut max_retries = self.max_retries;
         let total_shards = self.total_shards;
@@ -975,6 +1291,7 @@ impl ScanArgs {
         let mut top_ports = top_ports;
         let mut lab_mode = self.lab_mode;
         let mut strict_safety = self.strict_safety;
+        let ping_scan = self.ping_scan;
         let mut service_detection =
             self.service_detect || effective_aggressive_root || !self.no_service_detect;
         if self.os_detect {
@@ -988,7 +1305,14 @@ impl ScanArgs {
             strict_safety = true;
             service_detection = false;
         }
-        if ports.is_empty() && top_ports.is_none() {
+        if ping_scan {
+            ports.clear();
+            top_ports = None;
+            effective_aggressive_root = false;
+            effective_privileged_probes = false;
+            service_detection = false;
+        }
+        if !ping_scan && ports.is_empty() && top_ports.is_none() {
             top_ports = match profile {
                 ScanProfile::Idf => profile.concept_port_budget(),
                 ScanProfile::Mirror => Some(64),
@@ -1022,12 +1346,22 @@ impl ScanArgs {
             }
         }
 
+        if override_mode {
+            let raw_lane_override = effective_privileged_probes || effective_aggressive_root;
+            let gpu_lane_override = gpu_rate_explicit
+                || gpu_burst_size.is_some()
+                || gpu_timestamp
+                || gpu_schedule_random;
+            confirm_override_mode(raw_lane_override, gpu_lane_override)?;
+        }
+
         Ok(ScanRequest {
             target: self.target,
             session_id: None,
             ports,
             top_ports,
-            include_udp: self.udp || effective_aggressive_root,
+            ping_scan,
+            include_udp: !ping_scan && (self.udp || effective_aggressive_root),
             reverse_dns: self.reverse_dns && !self.no_dns,
             service_detection,
             explain,
@@ -1048,6 +1382,7 @@ impl ScanArgs {
             timeout_ms,
             concurrency,
             delay_ms,
+            timing_template,
             rate_limit_pps,
             rate_explicit,
             gpu_rate_pps,
@@ -1055,6 +1390,8 @@ impl ScanArgs {
             gpu_burst_size,
             gpu_timestamp,
             gpu_schedule_random,
+            assess_hardware: self.assess_hardware,
+            override_mode,
             burst_size,
             max_retries,
             total_shards,
@@ -1142,6 +1479,7 @@ impl InteractiveArgs {
             session_id: None,
             ports,
             top_ports,
+            ping_scan: false,
             include_udp: false,
             reverse_dns,
             service_detection,
@@ -1163,6 +1501,7 @@ impl InteractiveArgs {
             timeout_ms: None,
             concurrency: None,
             delay_ms: None,
+            timing_template: None,
             rate_limit_pps: None,
             rate_explicit: false,
             gpu_rate_pps: None,
@@ -1170,6 +1509,8 @@ impl InteractiveArgs {
             gpu_burst_size: None,
             gpu_timestamp: false,
             gpu_schedule_random: false,
+            assess_hardware: false,
+            override_mode: false,
             burst_size: None,
             max_retries: None,
             total_shards: None,
@@ -1195,6 +1536,7 @@ fn normalize_args(args: Vec<OsString>) -> Vec<OsString> {
         let token = args[idx].to_string_lossy().to_string();
         match token.as_str() {
             "--scan" => {}
+            "-sn" => mapped.push("--ping-scan".into()),
             "-sU" => mapped.push("--udp".into()),
             "-sS" => mapped.push("--syn".into()),
             "-sT" => mapped.push("--connect".into()),
@@ -1203,6 +1545,7 @@ fn normalize_args(args: Vec<OsString>) -> Vec<OsString> {
             "-p-" => mapped.push("--all-ports".into()),
             "-sV" => mapped.push("--service-detect".into()),
             "-Pn" => mapped.push("--no-host-discovery".into()),
+            "-PR" => mapped.push("--arp".into()),
             "--phantom" | "--phantom-scan" => {
                 mapped.push("--profile".into());
                 mapped.push("phantom".into());
@@ -1230,9 +1573,9 @@ fn normalize_args(args: Vec<OsString>) -> Vec<OsString> {
             "-T" => {
                 if idx + 1 < args.len() {
                     let level = args[idx + 1].to_string_lossy().to_string();
-                    if let Some(profile) = map_timing_to_profile(level.as_str()) {
-                        mapped.push("--profile".into());
-                        mapped.push(profile.into());
+                    if let Some(level) = parse_timing_level(level.as_str()) {
+                        mapped.push("--timing-template".into());
+                        mapped.push(level.to_string().into());
                         idx += 1;
                     } else {
                         mapped.push(args[idx].clone());
@@ -1243,9 +1586,9 @@ fn normalize_args(args: Vec<OsString>) -> Vec<OsString> {
             }
             _ => {
                 if token.starts_with("-T") && token.len() == 3 {
-                    if let Some(profile) = map_timing_to_profile(&token[2..]) {
-                        mapped.push("--profile".into());
-                        mapped.push(profile.into());
+                    if let Some(level) = parse_timing_level(&token[2..]) {
+                        mapped.push("--timing-template".into());
+                        mapped.push(level.to_string().into());
                     } else {
                         mapped.push(args[idx].clone());
                     }
@@ -1316,6 +1659,63 @@ fn prompt_yes_no(label: &str, default_yes: bool) -> NProbeResult<bool> {
             _ => println!("[!] Enter yes or no."),
         }
     }
+}
+
+fn confirm_override_mode(raw_lane: bool, gpu_lane: bool) -> NProbeResult<()> {
+    if cfg!(test) {
+        return Ok(());
+    }
+
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Err(NProbeError::Cli(
+            "--override-mode requires an interactive terminal because it asks for explicit risk confirmations".to_string(),
+        ));
+    }
+
+    println!("[!] Override mode requested.");
+    println!(
+        "[!] This bypasses adaptive safety governors, local auto-throttles, and emergency-brake enforcement."
+    );
+    println!(
+        "[!] Cons: fragile targets can be overloaded, packet bursts can spike abruptly, and this host can become unstable under sustained acceleration."
+    );
+    if !prompt_yes_no("Continue with override mode", false)? {
+        return Err(NProbeError::Cli("override mode cancelled".to_string()));
+    }
+
+    if raw_lane {
+        println!("[!] Raw/kernel-bypass override risks:");
+        println!(
+            "    - Blackrock-shuffled packet crafting can ignore target fragility signals and device-profile pacing."
+        );
+        println!(
+            "    - The masscan-style firehose can transmit with fewer brakes, which can destabilize fragile hosts."
+        );
+        if !prompt_yes_no(
+            "Disable adaptive raw packet safety governors for this run",
+            false,
+        )? {
+            return Err(NProbeError::Cli("override mode cancelled".to_string()));
+        }
+    }
+
+    if gpu_lane {
+        println!("[!] GPU/parallel override risks:");
+        println!(
+            "    - GPU/parallel crafters can outrun the CPU/NIC bridge and bypass local health pacing."
+        );
+        println!(
+            "    - Local thermal, memory, and queue pressure can rise faster because emergency auto-throttles are disabled."
+        );
+        if !prompt_yes_no(
+            "Disable adaptive GPU/parallel safety governors for this run",
+            false,
+        )? {
+            return Err(NProbeError::Cli("override mode cancelled".to_string()));
+        }
+    }
+
+    Ok(())
 }
 
 fn prompt_profile_choice() -> NProbeResult<ScanProfile> {
@@ -1909,12 +2309,24 @@ fn diff_item_css_severity(item: &ActionableDiffItem) -> &'static str {
     diff_item_effective_severity(item).as_str()
 }
 
-fn map_timing_to_profile(level: &str) -> Option<&'static str> {
+fn parse_timing_level(level: &str) -> Option<u8> {
     match level.trim() {
-        "0" | "1" => Some("stealth"),
-        "2" | "3" => Some("balanced"),
-        "4" => Some("turbo"),
-        "5" => Some("aggressive"),
+        "0" => Some(0),
+        "1" => Some(1),
+        "2" => Some(2),
+        "3" => Some(3),
+        "4" => Some(4),
+        "5" => Some(5),
+        _ => None,
+    }
+}
+
+fn map_timing_to_profile(level: u8) -> Option<ScanProfile> {
+    match level {
+        0 | 1 => Some(ScanProfile::Stealth),
+        2 | 3 => Some(ScanProfile::Balanced),
+        4 => Some(ScanProfile::Turbo),
+        5 => Some(ScanProfile::Aggressive),
         _ => None,
     }
 }
@@ -2067,8 +2479,8 @@ fn parse_port(raw: &str) -> NProbeResult<u16> {
 #[cfg(test)]
 mod tests {
     use super::{
-        looks_like_private_ipv4_target, normalize_args, render_integrity_status,
-        should_inject_scan, Cli, CliAction, SessionCommand,
+        detect_cataloged_scan_gate, looks_like_private_ipv4_target, normalize_args,
+        render_integrity_status, should_inject_scan, Cli, CliAction, SessionCommand,
     };
     use crate::models::ScanProfile;
     use crate::platform::self_integrity::IntegrityStatus;
@@ -2111,6 +2523,39 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(rendered.contains(&"--connect".to_string()));
         assert!(rendered.contains(&"--no-host-discovery".to_string()));
+    }
+
+    #[test]
+    fn normalize_args_maps_ping_scan_and_timing_aliases() {
+        let args = vec![
+            OsString::from("nprobe-rs"),
+            OsString::from("-sn"),
+            OsString::from("-T4"),
+            OsString::from("10.0.0.5"),
+        ];
+        let normalized = normalize_args(args);
+        let rendered = normalized
+            .iter()
+            .map(|value| value.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert!(rendered.contains(&"--ping-scan".to_string()));
+        assert!(rendered.contains(&"--timing-template".to_string()));
+        assert!(rendered.contains(&"4".to_string()));
+    }
+
+    #[test]
+    fn normalize_args_maps_nmap_arp_alias() {
+        let args = vec![
+            OsString::from("nprobe-rs"),
+            OsString::from("-PR"),
+            OsString::from("10.0.0.5"),
+        ];
+        let normalized = normalize_args(args);
+        let rendered = normalized
+            .iter()
+            .map(|value| value.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert!(rendered.contains(&"--arp".to_string()));
     }
 
     #[test]
@@ -2221,6 +2666,46 @@ mod tests {
     }
 
     #[test]
+    fn ping_scan_mode_parses_as_discovery_only() {
+        let cli = Cli::parse_from(["nprobe-rs", "scan", "10.0.0.5", "--ping-scan", "-p", "80"]);
+        let action = cli.into_action().expect("cli action should parse");
+        match action {
+            CliAction::Scan(request) => {
+                assert!(request.ping_scan);
+                assert!(request.ports.is_empty());
+                assert_eq!(request.top_ports, None);
+                assert!(!request.service_detection);
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn timing_template_parses_from_hidden_runtime_flag() {
+        let cli = Cli::parse_from(["nprobe-rs", "scan", "10.0.0.5", "--timing-template", "4"]);
+        let action = cli.into_action().expect("cli action should parse");
+        match action {
+            CliAction::Scan(request) => {
+                assert_eq!(request.timing_template, Some(4));
+                assert_eq!(request.profile, ScanProfile::Turbo);
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stealth_scan_alias_maps_to_syn_lane() {
+        let cli = Cli::parse_from(["nprobe-rs", "scan", "10.0.0.5", "--stealth-scan"]);
+        let action = cli.into_action().expect("cli action should parse");
+        match action {
+            CliAction::Scan(request) => {
+                assert!(request.privileged_probes);
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
     fn rate_flags_parse_into_explicit_caps() {
         let cli = Cli::parse_from([
             "nprobe-rs",
@@ -2278,6 +2763,46 @@ mod tests {
             }
             other => panic!("unexpected action: {other:?}"),
         }
+    }
+
+    #[test]
+    fn assess_hardware_flag_parses_into_request() {
+        let cli = Cli::parse_from(["nprobe-rs", "scan", "10.0.0.5", "--assess-hardware"]);
+        let action = cli.into_action().expect("cli action should parse");
+        match action {
+            CliAction::Scan(request) => {
+                assert!(request.assess_hardware);
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn override_mode_flag_parses_into_request() {
+        let cli = Cli::parse_from(["nprobe-rs", "scan", "10.0.0.5", "--override-mode"]);
+        let action = cli.into_action().expect("cli action should parse");
+        match action {
+            CliAction::Scan(request) => {
+                assert!(request.override_mode);
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn detect_cataloged_scan_gate_blocks_risky_idle_scan_flag() {
+        let err = detect_cataloged_scan_gate(&["-sI".to_string(), "192.0.2.10".to_string()])
+            .expect("gate should reject idle scan");
+        let rendered = err.user_message();
+        assert!(rendered.contains("Idle/Zombie Scan"));
+        assert!(rendered.contains("stealth, spoofing, or firewall-evasion"));
+        assert!(rendered.contains("--scan-type zombie"));
+    }
+
+    #[test]
+    fn detect_cataloged_scan_gate_allows_live_ping_scan_flag() {
+        let err = detect_cataloged_scan_gate(&["-sn".to_string(), "192.0.2.10".to_string()]);
+        assert!(err.is_none());
     }
 
     #[test]

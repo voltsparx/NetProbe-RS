@@ -49,6 +49,14 @@ pub fn render(report: &ScanReport) -> String {
         report.metadata.started_at, report.metadata.finished_at, report.metadata.duration_ms
     ));
     html.push_str(&format!(
+        "<div class=\"meta\">Override mode: {}</div>",
+        if report.request.override_mode {
+            "active"
+        } else {
+            "off"
+        }
+    ));
+    html.push_str(&format!(
         "<div class=\"meta\">Async tasks: {} | Thread tasks: {} | Parallel tasks: {} | Lua hooks: {} | Integrity: {} ({})</div>",
         report.metadata.engine_stats.async_engine_tasks,
         report.metadata.engine_stats.thread_pool_tasks,
@@ -91,6 +99,60 @@ pub fn render(report: &ScanReport) -> String {
         esc(&report.metadata.engine_stats.gpu_shader_kernel),
         report.metadata.engine_stats.gpu_action_triggers_loaded
     ));
+    html.push_str(&format!(
+        "<div class=\"meta\">Local system: profile={} | health={} | platform={} | raw={} | gpu={} | cpu={:.0}% across {} threads | memory={} MiB free / {} MiB total | safe raw={}pps burst {} | safe gpu={}pps burst {} | safe concurrency={} | delay floor={}ms | fault isolation={} | emergency brake={}</div>",
+        esc(&report.metadata.local_system.hardware_profile),
+        esc(&report.metadata.local_system.health_stage),
+        esc(&report.metadata.local_system.platform_tier),
+        if report.metadata.local_system.raw_packet_supported {
+            "ready"
+        } else {
+            "not-ready"
+        },
+        if report.metadata.local_system.gpu_hybrid_supported {
+            "scaffold-ready"
+        } else {
+            "fallback"
+        },
+        report.metadata.local_system.cpu_usage_pct,
+        report.metadata.local_system.cpu_threads,
+        report.metadata.local_system.available_memory_mib,
+        report.metadata.local_system.total_memory_mib,
+        report.metadata.local_system.recommended_raw_rate_pps,
+        report.metadata.local_system.recommended_raw_burst,
+        report.metadata.local_system.recommended_gpu_rate_pps,
+        report.metadata.local_system.recommended_gpu_burst,
+        report.metadata.local_system.recommended_concurrency,
+        report.metadata.local_system.recommended_delay_ms,
+        esc(&report.metadata.local_system.fault_isolation_mode),
+        esc(if report.metadata.local_system.emergency_brake_triggered {
+            report
+                .metadata
+                .local_system
+                .emergency_brake_reason
+                .as_deref()
+                .unwrap_or("triggered")
+        } else {
+            "armed/not-triggered"
+        })
+    ));
+    if report.metadata.local_system.assessment_mode {
+        html.push_str("<div class=\"meta\">Hardware assessment mode: no scan packets were transmitted; this report is local safety guidance only.</div>");
+    }
+    if !report.metadata.local_system.compatibility_notes.is_empty() {
+        html.push_str("<h2>Local Compatibility Notes</h2><ul>");
+        for note in &report.metadata.local_system.compatibility_notes {
+            html.push_str(&format!("<li>{}</li>", esc(note)));
+        }
+        html.push_str("</ul>");
+    }
+    if !report.metadata.local_system.adjustments.is_empty() {
+        html.push_str("<h2>Local Safety Adjustments</h2><ul>");
+        for note in &report.metadata.local_system.adjustments {
+            html.push_str(&format!("<li>{}</li>", esc(note)));
+        }
+        html.push_str("</ul>");
+    }
     if !report.metadata.engine_stats.scan_bundle_stages.is_empty() {
         html.push_str(&format!(
             "<div class=\"meta\">Bundle stages: {}</div>",

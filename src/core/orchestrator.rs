@@ -26,7 +26,7 @@ use crate::engine_packet::{arp as packet_arp, port_scan as packet_port_scan};
 use crate::engine_parallel::dns;
 use crate::engine_plugin::lua;
 use crate::engine_report::reporting;
-use crate::engines::scan_bundle;
+use crate::engines::{local_system_guard, scan_bundle};
 use crate::error::{NProbeError, NProbeResult};
 use crate::fetchers::{self, FetcherReport};
 use crate::fingerprint_db::FingerprintDatabase;
@@ -86,25 +86,29 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
     enforce_defensive_scope(&mut request, &resolved, &mut global_warnings)?;
     enforce_privileged_modes(&mut request, &mut global_warnings)?;
 
-    let mut selected_ports = if request.ports.is_empty() {
+    let mut selected_ports = if request.ping_scan {
+        Vec::new()
+    } else if request.ports.is_empty() {
         let top = request.top_ports.unwrap_or(100);
         service_registry.top_tcp_ports(top)
     } else {
         request.ports.clone()
     };
-    apply_defensive_port_policy(
-        &request,
-        has_public_targets,
-        &mut selected_ports,
-        &mut global_warnings,
-    )?;
-    if selected_ports.is_empty() {
+    if !request.ping_scan {
+        apply_defensive_port_policy(
+            &request,
+            has_public_targets,
+            &mut selected_ports,
+            &mut global_warnings,
+        )?;
+    }
+    if selected_ports.is_empty() && !request.ping_scan {
         return Err(NProbeError::Parse(
             "no ports selected for scanning".to_string(),
         ));
     }
 
-    let fingerprint_db = if request.service_detection {
+    let fingerprint_db = if request.service_detection && !request.ping_scan {
         Arc::new(FingerprintDatabase::load_for_ports(
             &selected_ports,
             request.include_udp,
@@ -142,6 +146,14 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
         &mut global_warnings,
     )?;
 
+    let mut local_system = local_system_guard::assess_request();
+    local_system.assessment_mode = request.assess_hardware;
+    local_system_guard::apply_request_governor(
+        &mut request,
+        &mut local_system,
+        &mut global_warnings,
+    )?;
+
     let strategy = strategy::plan(&request, work_items.len(), selected_ports.len());
     if !request.profile_explicit {
         request.profile = match strategy.mode {
@@ -157,12 +169,36 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
         };
     }
     strategy::apply_runtime_overrides(&mut request, &strategy);
-    let gpu_plan = engine_gpu::plan_hybrid_runtime(
+    local_system_guard::apply_request_governor(
+        &mut request,
+        &mut local_system,
+        &mut global_warnings,
+    )?;
+    let gpu_plan = match engine_gpu::plan_hybrid_runtime(
         &request,
         strategy.mode.as_str(),
         work_items.len(),
         selected_ports.len(),
-    );
+    ) {
+        Ok(plan) => plan,
+        Err(NProbeError::Gpu(detail)) => {
+            let mut plan = engine_gpu::HybridGpuPlan::default();
+            if engine_gpu::gpu_requested(&request) {
+                plan.requested = true;
+                plan.lane = engine_gpu::GpuHybridLane::CpuFallback;
+                plan.backend_label = "fault-isolated-cpu-fallback".to_string();
+                let note = format!(
+                    "fault isolation engaged: gpu hybrid lane fell back to the governed CPU path because {}",
+                    detail
+                );
+                global_warnings.push(note.clone());
+                local_system.adjustments.push(note.clone());
+                plan.notes.push(note);
+            }
+            plan
+        }
+        Err(err) => return Err(err),
+    };
     if let Some(chapter) = request.profile.tbns_chapter() {
         global_warnings.push(format!(
             "tbns active: tri-blue-network-scans chapter={} profile={} safety-bus engaged for low-impact discovery",
@@ -182,10 +218,22 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
                 .to_string(),
         );
     }
+    if request.ping_scan {
+        global_warnings.push(
+            "ping scan mode active: NProbe-RS will perform host discovery only and will not run a port scan for this session"
+                .to_string(),
+        );
+    }
+    if request.override_mode {
+        global_warnings.push(
+            "override mode active: adaptive local throttles, target fragility brakes, and runtime emergency brakes are bypassed for the accelerated lanes on this run"
+                .to_string(),
+        );
+    }
     global_warnings.extend(strategy.notes.iter().cloned());
     if request.rate_limit_pps != Some(strategy.rate_limit_pps) {
         global_warnings.push(format!(
-            "custom rate override active: {} pps",
+            "runtime rate target active: {} pps",
             request.rate_limit_pps.unwrap_or(strategy.rate_limit_pps)
         ));
     }
@@ -216,7 +264,7 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
     global_warnings.extend(gpu_plan.notes.iter().cloned());
     if request.max_retries != Some(strategy.max_retries) {
         global_warnings.push(format!(
-            "custom retry override active: {}",
+            "runtime retry cap active: {}",
             request.max_retries.unwrap_or(strategy.max_retries)
         ));
     }
@@ -238,8 +286,38 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
         "scan bundle selected: {} [{}]",
         bundle_plan.name, bundle_plan.summary
     ));
-    let host_concurrency =
+    let initial_host_concurrency =
         host_parallelism(&request, &strategy, selected_ports.len(), host_queue.len());
+    let local_host_cap = (local_system.recommended_concurrency / 4).max(1);
+    let host_concurrency = if request.override_mode {
+        initial_host_concurrency
+    } else {
+        initial_host_concurrency.min(local_host_cap)
+    };
+    if host_concurrency < initial_host_concurrency {
+        let note = format!(
+            "intelligence reduced host parallelism from {} to {} because the local system health monitor rated this machine as {}",
+            initial_host_concurrency,
+            host_concurrency,
+            local_system.health_stage
+        );
+        global_warnings.push(note.clone());
+        local_system.adjustments.push(note);
+    }
+    if request.assess_hardware {
+        let note = format!(
+            "hardware assessment complete: safe ceilings raw={}pps burst={} gpu={}pps burst={} concurrency={} delay={}ms",
+            local_system.recommended_raw_rate_pps,
+            local_system.recommended_raw_burst,
+            local_system.recommended_gpu_rate_pps,
+            local_system.recommended_gpu_burst,
+            local_system.recommended_concurrency,
+            local_system.recommended_delay_ms
+        );
+        global_warnings.push(note.clone());
+        local_system.adjustments.push(note);
+        host_queue.clear();
+    }
     let mut in_flight = FuturesUnordered::new();
     let mut hosts = Vec::new();
     let mut async_tasks = 0usize;
@@ -460,11 +538,13 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
                 os_fingerprint_classes_loaded: os_stats.classes_loaded,
                 os_fingerprint_cpes_loaded: os_stats.cpes_loaded,
             },
+            local_system,
             platform,
         },
         request: ScanRequestSummary {
             target: request.target.clone(),
             port_count: selected_ports.len(),
+            ping_scan: request.ping_scan,
             include_udp: request.include_udp,
             explain: request.explain,
             verbose: request.verbose,
@@ -476,6 +556,9 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
             report_format: request.report_format,
             lab_mode: request.lab_mode,
             callback_ping: request.callback_ping,
+            assess_hardware: request.assess_hardware,
+            override_mode: request.override_mode,
+            timing_template: request.timing_template,
             total_shards: request.total_shards,
             shard_index: request.shard_index,
             scan_seed: request.scan_seed,
@@ -574,6 +657,66 @@ async fn process_host(
     defer_enrichment: bool,
 ) -> NProbeResult<HostExecution> {
     let ip = work_item.ip;
+    if request.ping_scan {
+        let mut host = HostResult {
+            target: request.target.clone(),
+            ip: ip.to_string(),
+            reverse_dns: None,
+            observed_mac: None,
+            device_class: None,
+            device_vendor: None,
+            operating_system: None,
+            phantom_device_check: None,
+            safety_actions: vec!["host-discovery:ping-scan".to_string()],
+            warnings: global_warnings,
+            ports: Vec::new(),
+            risk_score: 0,
+            insights: vec!["ping scan mode active: no port scan was performed for this host".to_string()],
+            defensive_advice: Vec::new(),
+            learning_notes: vec![
+                "Discovery-only mode uses the lightweight fetcher plane to look for ARP/ICMP evidence instead of opening a port scan lane."
+                    .to_string(),
+            ],
+            lua_findings: Vec::new(),
+        };
+        let (thread_pool_tasks, parallel_tasks, lua_hooks_ran) =
+            finalize_host(&request, &mut host, os_fingerprint_db.as_ref()).await?;
+        host.insights
+            .push("ping scan mode active: no port scan was performed for this host".to_string());
+        host.learning_notes.push(
+            "Discovery-only mode used the lightweight fetcher plane to look for ARP/ICMP evidence instead of opening a port scan lane."
+                .to_string(),
+        );
+        let confirmed = host.insights.iter().any(|insight| {
+            insight.starts_with("icmp reachability confirmed")
+                || insight.starts_with("arp neighbor:")
+        });
+        if confirmed {
+            host.safety_actions
+                .push("host-discovery:confirmed-up".to_string());
+        } else {
+            host.safety_actions
+                .push("host-discovery:no-positive-reply".to_string());
+            host.warnings.push(
+                "ping scan mode completed without a positive ICMP/ARP reply on the current lightweight discovery lane; no port scan was attempted."
+                    .to_string(),
+            );
+            dedupe_sort_strings(&mut host.warnings);
+        }
+        dedupe_sort_strings(&mut host.safety_actions);
+        dedupe_sort_strings(&mut host.insights);
+        dedupe_sort_strings(&mut host.learning_notes);
+
+        return Ok(HostExecution {
+            checkpoint_unit: work_item.checkpoint_unit,
+            host,
+            async_tasks: 0,
+            thread_pool_tasks,
+            parallel_tasks,
+            lua_hooks_ran,
+        });
+    }
+
     let prefer_packet_frontend = matches!(
         strategy.mode,
         ExecutionMode::Hybrid | ExecutionMode::PacketBlast
@@ -1360,6 +1503,8 @@ fn apply_sharding(
     let dimension = if hosts.len() > 1 {
         hosts = shard_slice(hosts, total, index);
         "hosts"
+    } else if request.ping_scan {
+        "none"
     } else if ports.len() > 1 {
         ports = shard_slice(ports, total, index);
         "ports"
@@ -1378,7 +1523,7 @@ fn apply_sharding(
             index, total
         )));
     }
-    if ports.is_empty() {
+    if ports.is_empty() && !request.ping_scan {
         return Err(NProbeError::Parse(format!(
             "shard {} of {} has no ports to scan",
             index, total
@@ -1397,7 +1542,12 @@ fn prepare_shard_checkpoint(
     shard_dimension: &str,
     warnings: &mut Vec<String>,
 ) -> NProbeResult<(Vec<ScanWorkItem>, Option<ShardCheckpointRuntime>)> {
-    let work_items = build_scan_work_items(&host_targets, selected_ports, shard_dimension);
+    let work_items = build_scan_work_items(
+        &host_targets,
+        selected_ports,
+        shard_dimension,
+        request.ping_scan,
+    );
     if total_shards <= 1 || shard_dimension == "none" || work_items.is_empty() {
         return Ok((work_items, None));
     }
@@ -1498,9 +1648,22 @@ fn build_scan_work_items(
     hosts: &[IpAddr],
     selected_ports: &[u16],
     shard_dimension: &str,
+    ping_scan: bool,
 ) -> Vec<ScanWorkItem> {
-    if hosts.is_empty() || selected_ports.is_empty() {
+    if hosts.is_empty() || (!ping_scan && selected_ports.is_empty()) {
         return Vec::new();
+    }
+
+    if ping_scan {
+        return hosts
+            .iter()
+            .copied()
+            .map(|ip| ScanWorkItem {
+                checkpoint_unit: ip.to_string(),
+                ip,
+                ports: Vec::new(),
+            })
+            .collect();
     }
 
     if shard_dimension == "ports" {
@@ -1707,6 +1870,7 @@ mod tests {
             session_id: None,
             ports: vec![22, 80, 443],
             top_ports: None,
+            ping_scan: false,
             include_udp: false,
             reverse_dns: false,
             service_detection: true,
@@ -1728,6 +1892,7 @@ mod tests {
             timeout_ms: None,
             concurrency: None,
             delay_ms: None,
+            timing_template: None,
             rate_limit_pps: None,
             rate_explicit: false,
             gpu_rate_pps: None,
@@ -1735,6 +1900,8 @@ mod tests {
             gpu_burst_size: None,
             gpu_timestamp: false,
             gpu_schedule_random: false,
+            assess_hardware: false,
+            override_mode: false,
             burst_size: None,
             max_retries: None,
             total_shards: None,
@@ -1809,6 +1976,25 @@ mod tests {
 
         let report = run_scan(request).await.expect("hybrid scan should succeed");
         assert!(!report.hosts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn hardware_assessment_mode_skips_remote_scanning() {
+        let mut request = base_request();
+        request.assess_hardware = true;
+        request.target = "127.0.0.1".to_string();
+        request.top_ports = Some(1);
+        request.ports = Vec::new();
+
+        let report = run_scan(request).await.expect("assessment should succeed");
+        assert!(report.metadata.local_system.assessment_mode);
+        assert!(report.hosts.is_empty());
+        assert!(report
+            .metadata
+            .local_system
+            .adjustments
+            .iter()
+            .any(|note| note.contains("hardware assessment complete")));
     }
 
     #[test]

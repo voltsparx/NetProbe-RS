@@ -74,54 +74,63 @@ pub fn plan(request: &ScanRequest, host_count: usize, port_count: usize) -> Scan
         .saturating_mul(protocol_multiplier);
     let packet_blast_allowed = request.effective_privileged_probes()
         && !request.strict_safety
-        && !request.service_detection;
+        && !request.service_detection
+        && !request.ping_scan;
 
-    let mut mode = match request.profile {
-        ScanProfile::Stealth => ExecutionMode::Async,
-        ScanProfile::Phantom | ScanProfile::Sar | ScanProfile::Kis | ScanProfile::Idf => {
-            ExecutionMode::Async
-        }
-        ScanProfile::Mirror => ExecutionMode::Hybrid,
-        ScanProfile::Balanced => {
-            if probe_volume >= 6_000 {
-                ExecutionMode::Hybrid
-            } else {
+    let mut mode = if request.ping_scan {
+        ExecutionMode::Async
+    } else {
+        match request.profile {
+            ScanProfile::Stealth => ExecutionMode::Async,
+            ScanProfile::Phantom | ScanProfile::Sar | ScanProfile::Kis | ScanProfile::Idf => {
                 ExecutionMode::Async
             }
+            ScanProfile::Mirror => ExecutionMode::Hybrid,
+            ScanProfile::Balanced => {
+                if probe_volume >= 6_000 {
+                    ExecutionMode::Hybrid
+                } else {
+                    ExecutionMode::Async
+                }
+            }
+            ScanProfile::Turbo
+            | ScanProfile::Aggressive
+            | ScanProfile::RootOnly
+            | ScanProfile::Hybrid => ExecutionMode::Hybrid,
         }
-        ScanProfile::Turbo
-        | ScanProfile::Aggressive
-        | ScanProfile::RootOnly
-        | ScanProfile::Hybrid => ExecutionMode::Hybrid,
     };
 
     if request.strict_safety && mode == ExecutionMode::PacketBlast {
         mode = ExecutionMode::Hybrid;
     }
 
-    let persona = match request.profile {
-        ScanProfile::Phantom => ScanPersona::PhantomMinimal,
-        ScanProfile::Sar => ScanPersona::SarObserve,
-        ScanProfile::Kis => ScanPersona::KisObserve,
-        ScanProfile::Idf => ScanPersona::IdfFog,
-        ScanProfile::Mirror => ScanPersona::MirrorReflective,
-        _ => {
-            if matches!(request.profile, ScanProfile::Stealth)
-                || request.strict_safety
-                || request.lab_mode
-            {
-                ScanPersona::StealthSafe
-            } else if request.lab_mode
-                && mode == ExecutionMode::PacketBlast
-                && probe_volume >= 200_000
-            {
-                ScanPersona::MassScan
-            } else if request.service_detection
-                && matches!(request.profile, ScanProfile::Aggressive)
-            {
-                ScanPersona::Audit
-            } else {
-                ScanPersona::Discovery
+    let persona = if request.ping_scan {
+        ScanPersona::Discovery
+    } else {
+        match request.profile {
+            ScanProfile::Phantom => ScanPersona::PhantomMinimal,
+            ScanProfile::Sar => ScanPersona::SarObserve,
+            ScanProfile::Kis => ScanPersona::KisObserve,
+            ScanProfile::Idf => ScanPersona::IdfFog,
+            ScanProfile::Mirror => ScanPersona::MirrorReflective,
+            _ => {
+                if matches!(request.profile, ScanProfile::Stealth)
+                    || request.strict_safety
+                    || request.lab_mode
+                {
+                    ScanPersona::StealthSafe
+                } else if request.lab_mode
+                    && mode == ExecutionMode::PacketBlast
+                    && probe_volume >= 200_000
+                {
+                    ScanPersona::MassScan
+                } else if request.service_detection
+                    && matches!(request.profile, ScanProfile::Aggressive)
+                {
+                    ScanPersona::Audit
+                } else {
+                    ScanPersona::Discovery
+                }
             }
         }
     };
@@ -215,6 +224,65 @@ pub fn plan(request: &ScanRequest, host_count: usize, port_count: usize) -> Scan
         }
     }
 
+    if request.ping_scan {
+        rate_limit_pps = rate_limit_pps.min(256);
+        burst_size = burst_size.min(8);
+        max_retries = max_retries.max(2);
+        recommended_delay = recommended_delay.max(Duration::from_millis(50));
+        recommended_timeout = recommended_timeout.max(Duration::from_millis(1800));
+        recommended_concurrency = recommended_concurrency.min(16);
+    }
+
+    if let Some(level) = request.timing_template {
+        match level {
+            0 => {
+                mode = ExecutionMode::Async;
+                rate_limit_pps = rate_limit_pps.min(12);
+                burst_size = burst_size.min(1);
+                max_retries = max_retries.max(3);
+                recommended_delay = recommended_delay.max(Duration::from_millis(300));
+                recommended_timeout = recommended_timeout.max(Duration::from_millis(5000));
+                recommended_concurrency = recommended_concurrency.min(1);
+            }
+            1 => {
+                mode = ExecutionMode::Async;
+                rate_limit_pps = rate_limit_pps.min(48);
+                burst_size = burst_size.min(2);
+                max_retries = max_retries.max(3);
+                recommended_delay = recommended_delay.max(Duration::from_millis(150));
+                recommended_timeout = recommended_timeout.max(Duration::from_millis(4000));
+                recommended_concurrency = recommended_concurrency.min(2);
+            }
+            2 => {
+                mode = ExecutionMode::Async;
+                rate_limit_pps = rate_limit_pps.min(256);
+                burst_size = burst_size.min(8);
+                max_retries = max_retries.max(2);
+                recommended_delay = recommended_delay.max(Duration::from_millis(40));
+                recommended_timeout = recommended_timeout.max(Duration::from_millis(2500));
+                recommended_concurrency = recommended_concurrency.min(12);
+            }
+            3 => {}
+            4 => {
+                rate_limit_pps = rate_limit_pps.max(4_000);
+                burst_size = burst_size.max(96);
+                max_retries = max_retries.min(2);
+                recommended_delay = recommended_delay.min(Duration::from_millis(1));
+                recommended_timeout = recommended_timeout.min(Duration::from_millis(900));
+                recommended_concurrency = recommended_concurrency.max(96);
+            }
+            5 => {
+                rate_limit_pps = rate_limit_pps.max(12_000);
+                burst_size = burst_size.max(192);
+                max_retries = max_retries.min(1);
+                recommended_delay = Duration::ZERO;
+                recommended_timeout = recommended_timeout.min(Duration::from_millis(700));
+                recommended_concurrency = recommended_concurrency.max(192);
+            }
+            _ => {}
+        }
+    }
+
     let resource_plan = resource_governor::plan(request.profile, mode, host_count, port_count);
     rate_limit_pps = rate_limit_pps.min(resource_plan.rate_cap_pps);
     burst_size = burst_size.min(resource_plan.burst_cap);
@@ -272,6 +340,13 @@ pub fn plan(request: &ScanRequest, host_count: usize, port_count: usize) -> Scan
             "rate target={}pps burst={} retries={}",
             rate_limit_pps, burst_size, max_retries
         ),
+        format!(
+            "timing template={}",
+            request
+                .timing_template
+                .map(|level| format!("T{}", level))
+                .unwrap_or_else(|| "default".to_string())
+        ),
     ];
 
     ScanStrategy {
@@ -325,6 +400,7 @@ mod tests {
             session_id: None,
             ports: vec![22, 80, 443],
             top_ports: None,
+            ping_scan: false,
             include_udp: false,
             reverse_dns: false,
             service_detection: true,
@@ -346,6 +422,7 @@ mod tests {
             timeout_ms: None,
             concurrency: None,
             delay_ms: None,
+            timing_template: None,
             rate_limit_pps: None,
             rate_explicit: false,
             gpu_rate_pps: None,
@@ -353,6 +430,8 @@ mod tests {
             gpu_burst_size: None,
             gpu_timestamp: false,
             gpu_schedule_random: false,
+            assess_hardware: false,
+            override_mode: false,
             burst_size: None,
             max_retries: None,
             total_shards: None,
@@ -419,5 +498,28 @@ mod tests {
         request.profile = ScanProfile::Aggressive;
         let strategy = plan(&request, 256, 1024);
         assert_ne!(strategy.mode, ExecutionMode::PacketBlast);
+    }
+
+    #[test]
+    fn ping_scan_forces_async_discovery_envelope() {
+        let mut request = base_request();
+        request.ping_scan = true;
+        request.profile = ScanProfile::Aggressive;
+        request.service_detection = false;
+        request.privileged_probes = true;
+        let strategy = plan(&request, 32, 0);
+        assert_eq!(strategy.mode, ExecutionMode::Async);
+        assert_eq!(strategy.persona, ScanPersona::Discovery);
+        assert!(strategy.rate_limit_pps <= 256);
+    }
+
+    #[test]
+    fn timing_template_t4_raises_rate_floor() {
+        let mut request = base_request();
+        request.timing_template = Some(4);
+        let strategy = plan(&request, 32, 128);
+        assert!(strategy.rate_limit_pps >= 4_000);
+        assert!(strategy.recommended_timeout <= Duration::from_millis(900));
+        assert!(strategy.notes.iter().any(|note| note.contains("timing template=T4")));
     }
 }
