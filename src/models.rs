@@ -185,6 +185,33 @@ pub struct RuntimeSettings {
     pub delay: Duration,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TcpScanMode {
+    #[default]
+    Connect,
+    Syn,
+    Ack,
+    Maimon,
+    Custom,
+}
+
+impl TcpScanMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TcpScanMode::Connect => "connect",
+            TcpScanMode::Syn => "syn",
+            TcpScanMode::Ack => "ack",
+            TcpScanMode::Maimon => "maimon",
+            TcpScanMode::Custom => "custom",
+        }
+    }
+
+    pub fn uses_raw_packets(self) -> bool {
+        !matches!(self, TcpScanMode::Connect)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanRequest {
     pub target: String,
@@ -206,6 +233,10 @@ pub struct ScanRequest {
     #[serde(default)]
     pub traceroute: bool,
     pub include_udp: bool,
+    #[serde(default)]
+    pub tcp_scan_mode: TcpScanMode,
+    #[serde(default)]
+    pub custom_tcp_flags: Option<u8>,
     pub reverse_dns: bool,
     pub service_detection: bool,
     #[serde(default)]
@@ -272,11 +303,17 @@ impl ScanRequest {
     }
 
     pub fn requires_root(&self) -> bool {
-        self.aggressive_root || self.privileged_probes || self.source_port_requires_root()
+        self.aggressive_root
+            || self.privileged_probes
+            || self.tcp_scan_mode.uses_raw_packets()
+            || self.source_port_requires_root()
     }
 
     pub fn source_port_requires_root(&self) -> bool {
-        self.source_port.is_some_and(|port| port < 1024)
+        match self.source_port {
+            Some(port) => port < 1024,
+            None => false,
+        }
     }
 
     pub fn effective_privileged_probes(&self) -> bool {
@@ -305,6 +342,7 @@ pub enum PortState {
     Open,
     Closed,
     Filtered,
+    Unfiltered,
     OpenOrFiltered,
 }
 
@@ -314,6 +352,7 @@ impl PortState {
             PortState::Open => "open",
             PortState::Closed => "closed",
             PortState::Filtered => "filtered",
+            PortState::Unfiltered => "unfiltered",
             PortState::OpenOrFiltered => "open|filtered",
         }
     }
@@ -410,8 +449,9 @@ impl HostResult {
     }
 
     pub fn merge_phantom_device_check(&mut self, incoming: Option<PhantomDeviceCheckSummary>) {
-        let Some(incoming) = incoming else {
-            return;
+        let incoming = match incoming {
+            Some(incoming) => incoming,
+            None => return,
         };
 
         self.phantom_device_check = Some(match self.phantom_device_check.take() {

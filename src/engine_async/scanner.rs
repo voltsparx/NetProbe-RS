@@ -5,7 +5,10 @@
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::{io, net::{IpAddr, SocketAddr}};
+use std::{
+    io,
+    net::{IpAddr, SocketAddr},
+};
 
 use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -330,7 +333,10 @@ impl RateGovernor {
 }
 
 enum PortSchedule<'a> {
-    Sequential { ports: Vec<u16>, next: usize },
+    Sequential {
+        ports: Vec<u16>,
+        next: usize,
+    },
     Randomized {
         ports: &'a [u16],
         permutation: BlackrockPermutation,
@@ -361,9 +367,7 @@ impl<'a> PortSchedule<'a> {
                 *next += 1;
                 Some(port)
             }
-            Self::Randomized { ports, permutation } => {
-                permutation.next().map(|index| ports[index])
-            }
+            Self::Randomized { ports, permutation } => permutation.next().map(|index| ports[index]),
         }
     }
 

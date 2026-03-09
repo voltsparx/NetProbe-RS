@@ -5,16 +5,17 @@ struct PortStateCounts {
     open: usize,
     closed: usize,
     filtered: usize,
+    unfiltered: usize,
     open_or_filtered: usize,
 }
 
 impl PortStateCounts {
     fn observed_ports(self) -> usize {
-        self.open + self.closed + self.filtered + self.open_or_filtered
+        self.open + self.closed + self.filtered + self.unfiltered + self.open_or_filtered
     }
 
     fn responsive_ports(self) -> usize {
-        self.open + self.closed
+        self.open + self.closed + self.unfiltered
     }
 }
 
@@ -92,11 +93,12 @@ fn annotate_sar(host: &mut HostResult) {
     }
 
     host.insights.push(format!(
-        "sar response-shape: {} (open={} closed={} filtered={} open|filtered={})",
+        "sar response-shape: {} (open={} closed={} filtered={} unfiltered={} open|filtered={})",
         classify_response_shape(counts),
         counts.open,
         counts.closed,
         counts.filtered,
+        counts.unfiltered,
         counts.open_or_filtered
     ));
     host.learning_notes.push(
@@ -169,6 +171,7 @@ fn collect_port_state_counts(host: &HostResult) -> PortStateCounts {
             PortState::Open => counts.open += 1,
             PortState::Closed => counts.closed += 1,
             PortState::Filtered => counts.filtered += 1,
+            PortState::Unfiltered => counts.unfiltered += 1,
             PortState::OpenOrFiltered => counts.open_or_filtered += 1,
         }
     }
@@ -217,7 +220,7 @@ fn classify_response_shape(counts: PortStateCounts) -> &'static str {
         && (counts.filtered + counts.open_or_filtered) > 0
     {
         "drop-heavy"
-    } else if counts.closed > counts.open {
+    } else if counts.closed + counts.unfiltered > counts.open {
         "rejective"
     } else if counts.open > 0 && counts.filtered > 0 {
         "mixed-guarded"

@@ -1,12 +1,10 @@
 use std::time::{Duration, Instant};
 
-#[cfg(unix)]
-use std::process::Command;
-
 use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
 
 use crate::error::{NProbeError, NProbeResult};
 use crate::models::{LocalSystemStats, ScanRequest};
+use crate::platform::privilege;
 
 const MONITOR_SAMPLE_INTERVAL: Duration = Duration::from_millis(900);
 
@@ -170,6 +168,10 @@ pub fn apply_request_governor(
         }
     }
 
+    if let Some(reason) = gpu_request_denial_reason(request, cfg!(target_os = "macos")) {
+        return Err(NProbeError::Gpu(reason));
+    }
+
     if request.override_mode {
         push_adjustment(
             stats,
@@ -291,6 +293,17 @@ fn gpu_requested_without_backend(request: &ScanRequest) -> bool {
         || request.gpu_schedule_random
 }
 
+fn gpu_request_denial_reason(request: &ScanRequest, macos_host: bool) -> Option<String> {
+    if !macos_host || !gpu_requested_without_backend(request) {
+        return None;
+    }
+
+    Some(
+        "GPU accelerated scan controls are not supported on macOS in this build. Remove --gpu-rate/--gpu-burst/--gpu-timestamp/--gpu-schedule-random and use the governed CPU path instead."
+            .to_string(),
+    )
+}
+
 fn new_system() -> System {
     System::new_with_specifics(
         RefreshKind::nothing()
@@ -409,6 +422,11 @@ fn derive_stats_from_sample(sample: LocalSystemSample, assessment_mode: bool) ->
             recommended_gpu_rate_pps,
             recommended_gpu_burst
         ));
+    } else if cfg!(target_os = "macos") {
+        compatibility_notes.push(
+            "gpu hybrid lane is not supported on macOS; use the governed CPU path instead of --gpu-* controls on this host"
+                .to_string(),
+        );
     } else {
         compatibility_notes.push(
             "gpu hybrid lane is in fallback mode on this platform; nprobe-rs will stay on the governed CPU path instead of attempting active GPU execution"
@@ -532,23 +550,7 @@ fn raw_packet_ready() -> bool {
         return false;
     }
 
-    if cfg!(target_os = "windows") {
-        return true;
-    }
-
-    #[cfg(unix)]
-    {
-        return Command::new("id")
-            .arg("-u")
-            .output()
-            .ok()
-            .and_then(|output| String::from_utf8(output.stdout).ok())
-            .and_then(|raw| raw.trim().parse::<u32>().ok())
-            == Some(0);
-    }
-
-    #[allow(unreachable_code)]
-    false
+    privilege::has_elevated_network_privileges()
 }
 
 fn raise_delay_floor(
@@ -647,7 +649,10 @@ fn push_adjustment(stats: &mut LocalSystemStats, warnings: &mut Vec<String>, mes
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_request_governor, derive_stats_from_sample, LocalSystemSample};
+    use super::{
+        apply_request_governor, derive_stats_from_sample, gpu_request_denial_reason,
+        raw_packet_ready, LocalSystemSample,
+    };
     use crate::models::{ReportFormat, ScanProfile, ScanRequest};
 
     fn base_request() -> ScanRequest {
@@ -664,6 +669,8 @@ mod tests {
             ping_scan: false,
             traceroute: false,
             include_udp: false,
+            tcp_scan_mode: crate::models::TcpScanMode::Connect,
+            custom_tcp_flags: None,
             reverse_dns: false,
             service_detection: true,
             version_intensity: None,
@@ -795,5 +802,31 @@ mod tests {
         assert!(warnings
             .iter()
             .any(|warning| warning.contains("override mode active")));
+    }
+
+    #[test]
+    fn raw_packet_ready_uses_shared_privilege_probe() {
+        let expected = if cfg!(target_os = "linux") || cfg!(target_os = "windows") {
+            crate::platform::privilege::has_elevated_network_privileges()
+        } else {
+            false
+        };
+        assert_eq!(raw_packet_ready(), expected);
+    }
+
+    #[test]
+    fn gpu_request_denial_reason_triggers_for_macos_gpu_requests_only() {
+        let mut request = base_request();
+        request.gpu_rate_explicit = false;
+        request.gpu_rate_pps = None;
+        request.gpu_burst_size = None;
+        assert!(gpu_request_denial_reason(&request, true).is_none());
+
+        request.gpu_rate_explicit = true;
+        request.gpu_rate_pps = Some(1_000);
+        let reason = gpu_request_denial_reason(&request, true)
+            .expect("macOS GPU requests should be denied explicitly");
+        assert!(reason.contains("not supported on macOS"));
+        assert!(gpu_request_denial_reason(&request, false).is_none());
     }
 }

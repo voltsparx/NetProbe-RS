@@ -23,14 +23,14 @@ Instead of only reporting open ports, it explains findings, highlights risks, an
 - 🧑‍💻 Internal reviews
 - 🔬 Security research
 
-The project is publishable in its current supported scope as a defensive scanner. Concepts documented under `docs/scan-types/` are not automatically equivalent to live packet paths; use `nprobe-rs --scan-types` to inspect what is currently implemented versus cataloged.
+The project is publishable in its current supported scope as a defensive scanner. Concepts documented under `docs/scan-types/` are not automatically equivalent to live packet paths; use `nprobe-rs --scan-type` to inspect what is currently implemented versus cataloged.
 
 ---
 
 ## 🧩 Features
 
 - 🔎 Explainable scan results with defensive guidance  
-- 🎯 Nmap-style command flow (`nprobe-rs <target>`) and short aliases  
+- 🎯 Nmap-style command flow (`nprobe-rs <target>`) and first-class `nprs` alias
 - ⚡ Rust async engine for high-performance scanning  
 - 🧵 Thread-pool DNS resolution  
 - 🧠 Parallel analysis using Rayon  
@@ -38,17 +38,43 @@ The project is publishable in its current supported scope as a defensive scanner
 - 📄 Multi-format output: CLI, TXT, JSON, HTML, CSV  
 - 🚦 Cleaner terminal output (focused, less noisy by default)  
 - 🛡️ Safety controls to prevent unintended scanning  
-- 🔐 Auto privilege elevation for root-required scan modes (sudo/su/doas where available)  
-- 📱 Termux/mobile-friendly presets  
+- 🔐 Auto privilege elevation for root-required scan modes on Linux/macOS (sudo/doas where available)
 - ⚙️ Persistent configuration & last-run metadata  
 
 ---
 
 ## 📚 Scan Types
 
-- `phantom`: device-check first touch that decides safe rate, delay, and follow-up depth
-- `kis`: cautious identity hints using low-impact timing observation
-- `sar`: response-shape observation that studies how the target reacts under low pressure
+Use `nprobe-rs --scan-type` or `nprs --scan-type` for the canonical live catalog. Status values are `implemented`, `partial`, and `planned`.
+
+Shortcut notes:
+
+- Legacy Nmap host-discovery alias `-sP` is accepted as `--ping-scan`.
+- Project-specific live scan shortcuts are also accepted: `-sPH` (phantom), `-sKI` (kis), `-sSR` (sar), `-sID` (idf), `-sMR` (mirror), `-sHY` (hybrid), `-sCB` (callback-ping).
+
+Implemented runtime lanes:
+
+- Discovery: `arp`
+- Classic: `connect`, `syn`, `udp`
+- Safe control/evasion-adjacent: `source-port-pin`
+- Enrichment: `banner`, `aggressive-suite`
+- Hybrid/timing: `hybrid`, `timing-profile`
+- New project-specific defensive families: `phantom`, `kis`, `sar`, `tbns`, `idf`, `mirror`, `callback-ping`
+
+Partial lanes:
+
+- Discovery: `ping-scan`, `icmp-echo`
+- Enrichment: `os-fingerprint`, `script-scan`, `traceroute`
+
+Cataloged but not live runtime lanes:
+
+- Discovery: `icmp-timestamp`, `icmp-netmask`, `tcp-ping`, `tcp-syn-ping`, `tcp-ack-ping`, `udp-ping`, `sctp-init-ping`, `ip-proto-ping`
+- Classic: `ack`, `maimon`, `custom-scanflags`, `ip-protocol`, `sctp-init`, `sctp-cookie`
+- Combo recipes: `kinetic-fingerprint`, `sovereign-callback`
+
+Cataloged and intentionally not exposed as live runtime features:
+
+- `ftp-bounce`, `window`, `fragment`, `decoy`, `spoof-source`, `interface-bind`
 
 Overview and detailed docs:
 
@@ -81,6 +107,8 @@ cargo install --path .
 nprobe-rs 127.0.0.1 --top-ports 100
 ```
 
+Installer scripts place both `nprobe-rs` and the short alias `nprs` on disk. `cargo install --path .` now installs both first-class binaries as well.
+
 ---
 
 ## ✅ Release Quality Gates
@@ -89,12 +117,24 @@ Run these before publishing or tagging a release:
 
 ```bash
 cargo fmt --all -- --check
-cargo check
-cargo test
-cargo build --release
+cargo check --all-targets
+cargo test --all-targets
+cargo build --release --bins
 ```
 
 For the full release checklist, see [RELEASE.md](RELEASE.md).
+
+GitHub Actions now validates the crate on Linux, macOS, and Windows, and tagged releases package both `nprobe-rs` and `nprs` with per-archive SHA-256 checksums.
+
+---
+
+## ⚙️ Acceleration Engines
+
+- Governed async/user-space engine: available on Linux, macOS, and Windows.
+- Raw packet crafting engine: available on Linux and Windows when elevated raw-socket access is present; the safety governor blocks the kernel-bypass lane when the host is not ready.
+- AF_XDP zero-copy backend: Linux-only optional build path via `--features afxdp`; current builds treat it as a scaffolded backend and fall back automatically when the host cannot sustain it.
+- GPU acceleration controls: Linux and Windows only; current builds use a governed hybrid bridge around the packet crafter envelope rather than a standalone GPU packet backend.
+- macOS: GPU control flags are denied explicitly, and scans stay on the governed async/user-space lanes.
 
 ---
 
@@ -125,7 +165,7 @@ nprobe-rs 192.168.1.20 --location ./reports --file-type csv
 ## ⚡ Shortcut Aliases
 
 ```bash
-nprobe-rs 192.168.1.10 -a -o termux-scan -f json
+nprobe-rs 192.168.1.10 -A -o aggressive-scan -f json
 nprobe-rs 192.168.1.10 -A -a -w 700 -U
 nprobe-rs 192.168.1.10 -sU -p 53,161
 nprobe-rs 192.168.1.10 -T4 -p-
@@ -174,22 +214,16 @@ Guidance: Use key-based authentication and disable password login.
 - By default, output is printed to console unless `--output`, `--location`, or `--file-type` is provided.  
 - `nprobe-rs scan <target>` is still supported for compatibility, but `nprobe-rs <target>` is preferred.  
 - Timeout short flag is `-w` (`--timeout-ms`), while Nmap-style timing shortcuts use `-T0..-T5`.  
-- Root-required scan modes auto-attempt elevation on Unix-like systems when possible.  
-- Linux zero-copy path can be enabled with `cargo build --release --features afxdp` (AF_XDP scaffold currently falls back automatically when unavailable).  
-
-### 📱 Termux / Mobile Presets
-
-- `--root-only` enables privileged scanning with safer runtime limits  
-- Defaults to top 200 ports when no scope is provided  
-- For privileged probes, run inside a root shell (`su` / `tsu`)  
+- Supported host platforms are Linux, macOS, and Windows.
+- Root-required scan modes auto-attempt elevation on Linux and macOS when possible.
 
 ---
 
 ## 📦 Installation Helpers
 
-Cross-platform install scripts are provided in `building-scripts/`:
+Cross-platform install scripts are provided in `building-scripts/`. The flow now mirrors the common Nmap pattern: use native package-manager/source prerequisites on Unix, then install into a conventional bin directory; use the PowerShell/CMD installer path on Windows.
 
-### Linux/macOS
+### Linux / macOS
 ```bash
 ./building-scripts/install.sh             # prompt mode
 ./building-scripts/install.sh deps
@@ -200,11 +234,11 @@ Cross-platform install scripts are provided in `building-scripts/`:
 ./building-scripts/install.sh uninstall
 ```
 
-### Termux
-```bash
-./building-scripts/install-termux.sh      # prompt mode
-./building-scripts/install-termux.sh install
-```
+Notes:
+
+- Linux dependency installation uses the detected distro package manager.
+- macOS dependency installation expects Xcode Command Line Tools plus Homebrew.
+- `uninstall` removes both `nprobe-rs` and `nprs` from the detected install directory and can resolve script installs, PATH-visible installs, and the standard Cargo bin location. Pass `--install-dir` for a custom target.
 
 ### Windows PowerShell
 ```powershell
@@ -217,16 +251,21 @@ Cross-platform install scripts are provided in `building-scripts/`:
 .\building-scripts\install.ps1 uninstall
 ```
 
+Notes:
+
+- `uninstall` removes both `nprobe-rs.exe` and `nprs.exe` from the detected install directory and can resolve script installs, PATH-visible installs, and the standard Cargo bin location. Pass `-InstallDir` for a custom target. Cargo bin PATH entries are left intact.
+
 ### Windows CMD
 ```cmd
 building-scripts\install.bat
 building-scripts\install.bat install
+building-scripts\install.bat uninstall
 ```
 
 Installed command name:
 
-- `nprobe-rs` (Linux/macOS/Termux)
-- `nprobe-rs.exe` (Windows)
+- `nprobe-rs` and `nprs` (Linux/macOS)
+- `nprobe-rs.exe` and `nprs.exe` (Windows)
 
 ---
 

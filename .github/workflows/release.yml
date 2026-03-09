@@ -1,0 +1,92 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            package_id: linux-x86_64
+            archive_name: nprobe-rs-${{ github.ref_name }}-linux-x86_64.tar.gz
+          - os: macos-latest
+            package_id: macos
+            archive_name: nprobe-rs-${{ github.ref_name }}-macos.tar.gz
+          - os: windows-latest
+            package_id: windows-x86_64
+            archive_name: nprobe-rs-${{ github.ref_name }}-windows-x86_64.zip
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build Release Binaries
+        run: cargo build --release --bins
+
+      - name: Package Unix Artifact
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          pkg_dir="dist/nprobe-rs-${GITHUB_REF_NAME}-${{ matrix.package_id }}"
+          mkdir -p "$pkg_dir"
+          cp target/release/nprobe-rs "$pkg_dir/"
+          cp target/release/nprs "$pkg_dir/"
+          cp README.md LICENSE RELEASE.md "$pkg_dir/"
+          tar -C dist -czf "dist/${{ matrix.archive_name }}" "$(basename "$pkg_dir")"
+          shasum -a 256 "dist/${{ matrix.archive_name }}" > "dist/${{ matrix.archive_name }}.sha256"
+
+      - name: Package Windows Artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $pkgDir = Join-Path "dist" "nprobe-rs-$env:GITHUB_REF_NAME-${{ matrix.package_id }}"
+          New-Item -ItemType Directory -Force -Path $pkgDir | Out-Null
+          Copy-Item target/release/nprobe-rs.exe $pkgDir
+          Copy-Item target/release/nprs.exe $pkgDir
+          Copy-Item README.md $pkgDir
+          Copy-Item LICENSE $pkgDir
+          Copy-Item RELEASE.md $pkgDir
+          $archivePath = Join-Path "dist" "${{ matrix.archive_name }}"
+          Compress-Archive -Path "$pkgDir/*" -DestinationPath $archivePath -Force
+          $hash = (Get-FileHash $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -Path "$archivePath.sha256" -Value "$hash  ${{ matrix.archive_name }}"
+
+      - name: Upload Release Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.package_id }}
+          path: dist/*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download Built Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-artifacts/**/*
+          generate_release_notes: true

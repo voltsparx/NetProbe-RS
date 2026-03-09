@@ -162,4 +162,31 @@ mod tests {
         let expected: Vec<usize> = (0..513).collect();
         assert_eq!(order, expected);
     }
+
+    #[test]
+    fn permutation_handles_zero_and_singleton_domains() {
+        let empty: Vec<usize> = BlackrockPermutation::new(0, 7).collect();
+        assert!(empty.is_empty());
+
+        let singleton: Vec<usize> = BlackrockPermutation::new(1, 7).collect();
+        assert_eq!(singleton, vec![0]);
+    }
+
+    #[test]
+    fn permutation_remains_bijective_across_multiple_sizes_and_seeds() {
+        let sizes = [
+            0usize, 1, 2, 3, 4, 5, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255,
+            256, 257, 511, 512, 513, 1023,
+        ];
+        let seeds = [0u64, 1, 42, 0x1234_5678_9abc_def0];
+
+        for size in sizes {
+            for seed in seeds {
+                let mut order: Vec<usize> = BlackrockPermutation::new(size, seed).collect();
+                order.sort_unstable();
+                let expected: Vec<usize> = (0..size).collect();
+                assert_eq!(order, expected, "size={size} seed={seed}");
+            }
+        }
+    }
 }

@@ -565,6 +565,8 @@ mod tests {
             ping_scan: false,
             traceroute: false,
             include_udp: false,
+            tcp_scan_mode: crate::models::TcpScanMode::Connect,
+            custom_tcp_flags: None,
             reverse_dns: false,
             service_detection: true,
             version_intensity: None,

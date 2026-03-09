@@ -409,6 +409,8 @@ mod tests {
             ping_scan: false,
             traceroute: false,
             include_udp: false,
+            tcp_scan_mode: crate::models::TcpScanMode::Connect,
+            custom_tcp_flags: None,
             reverse_dns: false,
             service_detection: true,
             version_intensity: None,
@@ -536,5 +538,61 @@ mod tests {
             .notes
             .iter()
             .any(|note| note.contains("timing template=T4")));
+    }
+
+    #[test]
+    fn timing_template_t0_forces_serial_safe_envelope() {
+        let mut request = base_request();
+        request.timing_template = Some(0);
+        let strategy = plan(&request, 32, 128);
+        assert_eq!(strategy.mode, ExecutionMode::Async);
+        assert!(strategy.rate_limit_pps <= 12);
+        assert_eq!(strategy.burst_size, 1);
+        assert!(strategy.max_retries >= 3);
+        assert_eq!(strategy.recommended_concurrency, 1);
+        assert!(strategy.recommended_delay >= Duration::from_millis(300));
+        assert!(strategy.recommended_timeout >= Duration::from_millis(5_000));
+    }
+
+    #[test]
+    fn timing_template_t5_pushes_fast_runtime_floor() {
+        let mut request = base_request();
+        request.timing_template = Some(5);
+        let strategy = plan(&request, 32, 128);
+        assert!(strategy.rate_limit_pps >= 12_000);
+        assert!(strategy.max_retries <= 1);
+        assert_eq!(strategy.recommended_delay, Duration::ZERO);
+        assert!(strategy.recommended_timeout <= Duration::from_millis(700));
+        assert!(strategy
+            .notes
+            .iter()
+            .any(|note| note.contains("timing template=T5")));
+    }
+
+    #[test]
+    fn timing_templates_progress_from_cautious_to_fast() {
+        let mut previous_rate = 0u32;
+        let mut previous_delay = Duration::from_secs(60);
+        let mut previous_timeout = Duration::from_secs(60);
+        let mut previous_retries = u8::MAX;
+
+        for level in 0..=5 {
+            let mut request = base_request();
+            request.timing_template = Some(level);
+            let strategy = plan(&request, 32, 128);
+            assert!(strategy.rate_limit_pps >= previous_rate);
+            assert!(strategy.recommended_delay <= previous_delay);
+            assert!(strategy.recommended_timeout <= previous_timeout);
+            assert!(strategy.max_retries <= previous_retries);
+            assert!(strategy
+                .notes
+                .iter()
+                .any(|note| note.contains(&format!("timing template=T{level}"))));
+
+            previous_rate = strategy.rate_limit_pps;
+            previous_delay = strategy.recommended_delay;
+            previous_timeout = strategy.recommended_timeout;
+            previous_retries = strategy.max_retries;
+        }
     }
 }

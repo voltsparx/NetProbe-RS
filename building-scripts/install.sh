@@ -18,10 +18,61 @@ detect_os_tag() {
 }
 
 OS_TAG="${NPROBE_RS_OS_TAG:-$(detect_os_tag)}"
-DEFAULT_INSTALL_DIR="${NPROBE_RS_DEFAULT_INSTALL_DIR:-${NPROBE_RS_INSTALL_DIR:-$HOME/.local/bin}}"
 INSTALL_DIR="${NPROBE_RS_INSTALL_DIR:-}"
 PATH_UPDATE_MODE="ask"
 INSTALL_DEPS="no"
+
+default_install_dir() {
+  if [ -n "${NPROBE_RS_DEFAULT_INSTALL_DIR:-}" ]; then
+    printf '%s\n' "$NPROBE_RS_DEFAULT_INSTALL_DIR"
+    return
+  fi
+
+  if [ -n "${NPROBE_RS_INSTALL_DIR:-}" ]; then
+    printf '%s\n' "$NPROBE_RS_INSTALL_DIR"
+    return
+  fi
+
+  case "$OS_TAG" in
+    linux)
+      printf '%s\n' "/usr/local/bin"
+      ;;
+    macos)
+      if command -v brew >/dev/null 2>&1; then
+        brew_prefix="$(brew --prefix 2>/dev/null || true)"
+        if [ -n "$brew_prefix" ]; then
+          printf '%s\n' "$brew_prefix/bin"
+          return
+        fi
+      fi
+      printf '%s\n' "/usr/local/bin"
+      ;;
+    *)
+      printf '%s\n' "$HOME/.local/bin"
+      ;;
+  esac
+}
+
+DEFAULT_INSTALL_DIR="$(default_install_dir)"
+
+cargo_bin_dir() {
+  if [ -n "${CARGO_HOME:-}" ]; then
+    printf '%s\n' "$CARGO_HOME/bin"
+    return
+  fi
+
+  printf '%s\n' "$HOME/.cargo/bin"
+}
+
+ensure_supported_shell_platform() {
+  if [ "$OS_TAG" = "linux" ] || [ "$OS_TAG" = "macos" ]; then
+    return
+  fi
+
+  echo "error: building-scripts/install.sh supports Linux and macOS hosts only." >&2
+  echo "Use building-scripts/install.ps1 or install.bat on Windows." >&2
+  exit 1
+}
 
 usage() {
   cat <<'EOF'
@@ -29,11 +80,11 @@ Usage:
   ./building-scripts/install.sh [action] [options]
 
 Actions:
-  deps               Install build dependencies for the current platform when supported
+  deps               Install build dependencies for Linux/macOS when supported
   install            Install binary to local/custom bin and optionally add PATH
   update             Rebuild and replace existing installed binary
   test               Build a test binary into build-<os>/ in repo root
-  uninstall          Remove installed binary and optionally clean PATH entry
+  uninstall          Remove installed binaries and optionally clean PATH entry
 
 Prompt mode:
   Run without an action to choose from an interactive menu.
@@ -143,7 +194,7 @@ if [ -z "$ACTION" ]; then
 fi
 ACTION="$(normalize_action "$ACTION")"
 
-run_system_package_cmd() {
+run_elevated_cmd() {
   if [ "$(id -u)" -eq 0 ]; then
     "$@"
     return
@@ -154,26 +205,29 @@ run_system_package_cmd() {
     return
   fi
 
+  if command -v doas >/dev/null 2>&1; then
+    doas "$@"
+    return
+  fi
+
   "$@"
 }
 
-ensure_unix_build_deps() {
+ensure_linux_build_deps() {
   echo "Installing build dependencies for $OS_TAG..."
   if command -v apt-get >/dev/null 2>&1; then
-    run_system_package_cmd apt-get update
-    run_system_package_cmd apt-get install -y build-essential pkg-config curl clang
+    run_elevated_cmd apt-get update
+    run_elevated_cmd apt-get install -y build-essential pkg-config curl clang
   elif command -v dnf >/dev/null 2>&1; then
-    run_system_package_cmd dnf install -y gcc gcc-c++ make pkgconf-pkg-config curl clang
+    run_elevated_cmd dnf install -y gcc gcc-c++ make pkgconf-pkg-config curl clang
   elif command -v yum >/dev/null 2>&1; then
-    run_system_package_cmd yum install -y gcc gcc-c++ make pkgconfig curl clang
+    run_elevated_cmd yum install -y gcc gcc-c++ make pkgconfig curl clang
   elif command -v pacman >/dev/null 2>&1; then
-    run_system_package_cmd pacman -Sy --needed --noconfirm base-devel pkgconf curl clang
+    run_elevated_cmd pacman -Sy --needed --noconfirm base-devel pkgconf curl clang
   elif command -v zypper >/dev/null 2>&1; then
-    run_system_package_cmd zypper install -y gcc gcc-c++ make pkg-config curl clang
+    run_elevated_cmd zypper install -y gcc gcc-c++ make pkg-config curl clang
   elif command -v apk >/dev/null 2>&1; then
-    run_system_package_cmd apk add --no-cache build-base pkgconf curl clang
-  elif [ "$OS_TAG" = "macos" ] && command -v brew >/dev/null 2>&1; then
-    brew install pkg-config llvm rustup-init || true
+    run_elevated_cmd apk add --no-cache build-base pkgconf curl clang
   else
     echo "error: unsupported package manager for automatic dependency install." >&2
     echo "Install Rust toolchain, clang, make, and pkg-config manually, then rerun." >&2
@@ -183,6 +237,45 @@ ensure_unix_build_deps() {
   if ! command -v cargo >/dev/null 2>&1; then
     echo "warning: cargo is still not available. Install Rust with rustup: https://rustup.rs/" >&2
   fi
+}
+
+ensure_macos_build_deps() {
+  echo "Installing build dependencies for macOS..."
+
+  if ! xcode-select -p >/dev/null 2>&1; then
+    echo "error: Xcode Command Line Tools are required on macOS." >&2
+    echo "Run 'xcode-select --install', then rerun this script." >&2
+    exit 1
+  fi
+
+  if ! command -v brew >/dev/null 2>&1; then
+    echo "error: Homebrew is required for automatic macOS dependency install." >&2
+    echo "Install Homebrew or install Rust and pkg-config manually, then rerun." >&2
+    exit 1
+  fi
+
+  if ! command -v cargo >/dev/null 2>&1; then
+    brew install rust
+  fi
+
+  if ! command -v pkg-config >/dev/null 2>&1; then
+    brew install pkg-config
+  fi
+
+  if ! command -v cargo >/dev/null 2>&1; then
+    echo "warning: cargo is still not available. Install Rust with rustup: https://rustup.rs/" >&2
+  fi
+}
+
+ensure_unix_build_deps() {
+  case "$OS_TAG" in
+    linux) ensure_linux_build_deps ;;
+    macos) ensure_macos_build_deps ;;
+    *)
+      echo "error: unsupported Unix platform '$OS_TAG' for automatic dependency install." >&2
+      exit 1
+      ;;
+  esac
 }
 
 maybe_install_deps() {
@@ -199,18 +292,30 @@ build_release_binary() {
     exit 1
   fi
 
-  echo "Building nprobe-rs (release)..."
-  cargo build --release --manifest-path "$ROOT_DIR/Cargo.toml"
+  echo "Building nprobe-rs and nprs (release)..."
+  cargo build --release --bins --manifest-path "$ROOT_DIR/Cargo.toml"
 }
 
 release_binary_path() {
   printf '%s\n' "$ROOT_DIR/target/release/nprobe-rs"
 }
 
+release_alias_binary_path() {
+  printf '%s\n' "$ROOT_DIR/target/release/nprs"
+}
+
 require_release_binary() {
   SRC_BIN="$(release_binary_path)"
   if [ ! -f "$SRC_BIN" ]; then
     echo "error: release binary not found at $SRC_BIN" >&2
+    exit 1
+  fi
+}
+
+require_release_alias_binary() {
+  ALIAS_SRC_BIN="$(release_alias_binary_path)"
+  if [ ! -f "$ALIAS_SRC_BIN" ]; then
+    echo "error: release alias binary not found at $ALIAS_SRC_BIN" >&2
     exit 1
   fi
 }
@@ -252,6 +357,21 @@ path_contains_dir() {
   esac
 }
 
+target_dir_is_user_writable() {
+  target_dir="$1"
+  if [ -d "$target_dir" ]; then
+    [ -w "$target_dir" ]
+    return
+  fi
+
+  parent_dir="$(dirname "$target_dir")"
+  while [ ! -d "$parent_dir" ] && [ "$parent_dir" != "/" ]; do
+    parent_dir="$(dirname "$parent_dir")"
+  done
+
+  [ -w "$parent_dir" ]
+}
+
 rc_file_for_current_shell() {
   if [ -n "${NPROBE_RS_SHELL_RC:-}" ]; then
     printf '%s\n' "$NPROBE_RS_SHELL_RC"
@@ -261,17 +381,7 @@ rc_file_for_current_shell() {
   shell_name="$(basename "${SHELL:-}")"
   case "$shell_name" in
     zsh) printf '%s\n' "$HOME/.zshrc" ;;
-    bash)
-      if [ "$OS_TAG" = "macos" ]; then
-        if [ -f "$HOME/.bashrc" ]; then
-          printf '%s\n' "$HOME/.bashrc"
-        else
-          printf '%s\n' "$HOME/.bash_profile"
-        fi
-      else
-        printf '%s\n' "$HOME/.bashrc"
-      fi
-      ;;
+    bash) printf '%s\n' "$HOME/.bashrc" ;;
     fish) printf '%s\n' "" ;;
     *) printf '%s\n' "$HOME/.profile" ;;
   esac
@@ -341,27 +451,54 @@ install_binary_to_dir() {
   target_dir="$1"
   build_release_binary
   require_release_binary
+  require_release_alias_binary
 
   SRC_BIN="$(release_binary_path)"
-  mkdir -p "$target_dir"
-  DEST_BIN="$target_dir/nprobe-rs"
-  cp "$SRC_BIN" "$DEST_BIN"
-  chmod +x "$DEST_BIN"
-  echo "Installed: $DEST_BIN"
+  ALIAS_SRC_BIN="$(release_alias_binary_path)"
+  PRIMARY_BIN="$target_dir/nprobe-rs"
+  ALIAS_BIN="$target_dir/nprs"
+
+  if target_dir_is_user_writable "$target_dir"; then
+    mkdir -p "$target_dir"
+    cp "$SRC_BIN" "$PRIMARY_BIN"
+    chmod +x "$PRIMARY_BIN"
+    cp "$ALIAS_SRC_BIN" "$ALIAS_BIN"
+    chmod +x "$ALIAS_BIN"
+  else
+    run_elevated_cmd mkdir -p "$target_dir"
+    run_elevated_cmd cp "$SRC_BIN" "$PRIMARY_BIN"
+    run_elevated_cmd chmod +x "$PRIMARY_BIN"
+    run_elevated_cmd cp "$ALIAS_SRC_BIN" "$ALIAS_BIN"
+    run_elevated_cmd chmod +x "$ALIAS_BIN"
+  fi
+
+  echo "Installed: $PRIMARY_BIN"
+  echo "Alias installed: $ALIAS_BIN"
 }
 
-installed_binary_guess() {
+installed_binary_dir_guess() {
   if [ -n "$INSTALL_DIR" ]; then
-    printf '%s\n' "$INSTALL_DIR/nprobe-rs"
+    printf '%s\n' "$INSTALL_DIR"
     return
   fi
 
   if command -v nprobe-rs >/dev/null 2>&1; then
-    command -v nprobe-rs
+    dirname "$(command -v nprobe-rs)"
     return
   fi
 
-  printf '%s\n' "$DEFAULT_INSTALL_DIR/nprobe-rs"
+  if command -v nprs >/dev/null 2>&1; then
+    dirname "$(command -v nprs)"
+    return
+  fi
+
+  CARGO_BIN_DIR="$(cargo_bin_dir)"
+  if [ -f "$CARGO_BIN_DIR/nprobe-rs" ] || [ -f "$CARGO_BIN_DIR/nprs" ]; then
+    printf '%s\n' "$CARGO_BIN_DIR"
+    return
+  fi
+
+  printf '%s\n' "$DEFAULT_INSTALL_DIR"
 }
 
 remove_path_exports() {
@@ -409,14 +546,20 @@ maybe_remove_path_exports() {
 action_test() {
   build_release_binary
   require_release_binary
+  require_release_alias_binary
 
   BUILD_DIR="$ROOT_DIR/build-$OS_TAG"
   mkdir -p "$BUILD_DIR"
   SRC_BIN="$(release_binary_path)"
+  ALIAS_SRC_BIN="$(release_alias_binary_path)"
   DEST_BIN="$BUILD_DIR/nprobe-rs"
+  ALIAS_BIN="$BUILD_DIR/nprs"
   cp "$SRC_BIN" "$DEST_BIN"
   chmod +x "$DEST_BIN"
+  cp "$ALIAS_SRC_BIN" "$ALIAS_BIN"
+  chmod +x "$ALIAS_BIN"
   echo "Test binary ready: $DEST_BIN"
+  echo "Alias binary ready: $ALIAS_BIN"
 }
 
 action_install() {
@@ -426,24 +569,38 @@ action_install() {
 }
 
 action_update() {
-  BIN_PATH="$(installed_binary_guess)"
-  INSTALL_DIR="$(dirname "$BIN_PATH")"
+  INSTALL_DIR="$(installed_binary_dir_guess)"
   install_binary_to_dir "$INSTALL_DIR"
   maybe_update_path "$INSTALL_DIR"
   echo "Update complete."
 }
 
 action_uninstall() {
-  BIN_PATH="$(installed_binary_guess)"
+  TARGET_DIR="$(installed_binary_dir_guess)"
+  BIN_PATH="$TARGET_DIR/nprobe-rs"
+  ALIAS_PATH="$TARGET_DIR/nprs"
   removed="no"
   if [ -f "$BIN_PATH" ]; then
-    rm -f "$BIN_PATH"
+    if [ -w "$BIN_PATH" ]; then
+      rm -f "$BIN_PATH"
+    else
+      run_elevated_cmd rm -f "$BIN_PATH"
+    fi
     echo "Removed: $BIN_PATH"
+    removed="yes"
+  fi
+  if [ -f "$ALIAS_PATH" ]; then
+    if [ -w "$ALIAS_PATH" ]; then
+      rm -f "$ALIAS_PATH"
+    else
+      run_elevated_cmd rm -f "$ALIAS_PATH"
+    fi
+    echo "Removed: $ALIAS_PATH"
     removed="yes"
   fi
 
   if [ "$removed" = "no" ]; then
-    echo "No installed binary found at $BIN_PATH"
+    echo "No installed binaries found in $TARGET_DIR"
   fi
 
   maybe_remove_path_exports
@@ -452,6 +609,8 @@ action_uninstall() {
 action_deps() {
   ensure_unix_build_deps
 }
+
+ensure_supported_shell_platform
 
 case "$ACTION" in
   deps) action_deps ;;

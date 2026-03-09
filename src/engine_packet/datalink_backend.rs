@@ -1,6 +1,6 @@
 // Layer-2 backend: sends crafted Ethernet+IPv4+TCP frames directly on interface.
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 mod imp {
     use std::io;
     use std::io::ErrorKind;
@@ -183,7 +183,7 @@ mod imp {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 mod imp {
     use std::io;
     use std::net::Ipv4Addr;
@@ -199,7 +199,7 @@ mod imp {
         _target_ip: Ipv4Addr,
     ) -> io::Result<(DatalinkRawTx, DatalinkRawRx)> {
         Err(io::Error::other(
-            "direct layer-2 backend is currently supported on unix targets only",
+            "direct layer-2 backend is currently supported on Linux hosts only",
         ))
     }
 
@@ -220,7 +220,7 @@ mod imp {
 
 pub use imp::open_layer2_backends;
 
-#[cfg(any(unix, test))]
+#[cfg(any(target_os = "linux", test))]
 fn parse_mac_bytes(raw: &str) -> Option<[u8; 6]> {
     let token = raw.trim();
     let sep = if token.contains(':') { ':' } else { '-' };

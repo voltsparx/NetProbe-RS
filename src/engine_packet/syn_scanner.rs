@@ -126,9 +126,10 @@ impl RawSynScanner {
         )
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn run_with_tx_factory<RX, F>(
         &self,
-        mut tx_factory: F,
+        tx_factory: F,
         rx_backend: RX,
         targets: &[(Ipv4Addr, u16)],
     ) -> io::Result<Vec<RawSynResult>>
@@ -854,5 +855,50 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].state, RawPortState::Open);
+    }
+
+    #[test]
+    fn shared_target_range_scans_only_requested_window() {
+        let responses = Arc::new(Mutex::new(VecDeque::new()));
+        let rx = MockRxBackend {
+            responses: Arc::clone(&responses),
+            current_frame: None,
+        };
+        let tx_responses = Arc::clone(&responses);
+        let shared_targets = Arc::<[(Ipv4Addr, u16)]>::from(vec![
+            (Ipv4Addr::new(10, 0, 0, 10), 80),
+            (Ipv4Addr::new(10, 0, 0, 10), 81),
+            (Ipv4Addr::new(10, 0, 0, 10), 82),
+            (Ipv4Addr::new(10, 0, 0, 10), 83),
+            (Ipv4Addr::new(10, 0, 0, 10), 84),
+        ]);
+
+        let scanner = RawSynScanner::new(RawSynScannerConfig {
+            source_ip: Ipv4Addr::new(10, 0, 0, 5),
+            source_port: 40000,
+            rate_pps: 2000,
+            burst_size: 16,
+            tx_workers: 2,
+            tx_batch_size: 8,
+            rx_grace: Duration::from_millis(40),
+            scan_seed: 555,
+        });
+
+        let results = scanner
+            .run_with_tx_factory_range(
+                move |_| {
+                    Ok(Box::new(MockTxBackend {
+                        responses: Arc::clone(&tx_responses),
+                    }) as Box<dyn RawTxBackend>)
+                },
+                rx,
+                shared_targets,
+                1..4,
+            )
+            .expect("windowed scan should succeed");
+
+        let mut scanned_ports = results.iter().map(|value| value.port).collect::<Vec<_>>();
+        scanned_ports.sort_unstable();
+        assert_eq!(scanned_ports, vec![81, 82, 83]);
     }
 }

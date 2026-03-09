@@ -8,7 +8,7 @@ Cross-platform lifecycle helpers for `nprobe-rs`.
 - `install`: install to local/custom bin and optionally add install path to `PATH`
 - `update`: rebuild and replace installed binary
 - `test`: build release and copy test binary to `build-<os>/` in repo root
-- `uninstall`: remove installed binary
+- `uninstall`: remove installed binaries and optionally clean the PATH entry the helper added
 
 ## Linux / macOS
 
@@ -29,15 +29,12 @@ Optional automation flags:
 - `--add-to-path` to add install directory to PATH without prompting
 - `--no-path-update` to skip PATH changes
 
-## Termux (Android)
+Platform notes:
 
-```bash
-chmod +x ./building-scripts/install-termux.sh
-./building-scripts/install-termux.sh      # prompt mode
-./building-scripts/install-termux.sh install
-```
-
-The Termux script installs dependencies first, then runs the same action flow as `install.sh`.
+- Linux uses the detected distro package manager for `deps`.
+- macOS expects Xcode Command Line Tools plus Homebrew for `deps`.
+- Unix installs now place both `nprobe-rs` and the short alias `nprs` in the target bin directory.
+- `uninstall` removes both binaries from the detected install directory and can resolve script installs, PATH-visible installs, and the standard Cargo bin path.
 
 ## Windows PowerShell
 
@@ -58,20 +55,28 @@ Optional automation flags:
 - `-AddToPath` to add install directory to PATH without prompting
 - `-NoPathUpdate` to skip PATH changes
 - `-Help` for usage
+- `uninstall` removes both binaries from the detected install directory and can resolve script installs, PATH-visible installs, and the standard Cargo bin path. The helper leaves Cargo bin PATH entries intact.
 
 ## Windows CMD
 
 ```cmd
 building-scripts\install.bat
 building-scripts\install.bat install
+building-scripts\install.bat uninstall
 ```
 
 ## Result
 
 Installed command name:
 
-- `nprobe-rs` on Linux/macOS/Termux
-- `nprobe-rs.exe` on Windows
+- `nprobe-rs` and `nprs` on Linux/macOS
+- `nprobe-rs.exe` and `nprs.exe` on Windows
+
+## Engine Notes
+
+- Raw packet crafting is available on Linux and Windows when privileged raw access is present.
+- AF_XDP is an optional Linux-only kernel-bypass scaffold that falls back automatically when unavailable.
+- GPU control flags are supported on Linux and Windows only; macOS explicitly denies them and stays on the governed async path.
 
 Example:
 

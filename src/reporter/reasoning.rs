@@ -20,6 +20,9 @@ fn explain_port(finding: &PortFinding) -> String {
         PortState::Filtered => {
             "Filtered state means packet loss, firewall filtering, or probe timeout blocked certainty"
         }
+        PortState::Unfiltered => {
+            "Unfiltered means the host replied to a filter-mapping probe, but this is not evidence of an open listening service"
+        }
         PortState::OpenOrFiltered => {
             "Open|filtered means UDP probing saw no definitive close signal"
         }

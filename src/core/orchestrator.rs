@@ -6,8 +6,6 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
-#[cfg(unix)]
-use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,6 +34,7 @@ use crate::models::{
 };
 use crate::os_fingerprint_db::OsFingerprintDatabase;
 use crate::platform::capability_registry;
+use crate::platform::privilege;
 use crate::reporter::tbns_profiles;
 use crate::service_db::ServiceRegistry;
 use crate::targeting;
@@ -1432,7 +1431,7 @@ fn enforce_privileged_modes(
     if request.root_only {
         apply_root_only_limits(request);
         warnings
-            .push("root-only preset active: mobile-tuned limits applied for stability".to_string());
+            .push("root-only preset active: conservative privileged limits applied".to_string());
     }
 
     if request.aggressive_root {
@@ -1706,27 +1705,7 @@ fn is_private_v6(ip: &Ipv6Addr) -> bool {
 }
 
 fn has_root_privileges() -> bool {
-    #[cfg(unix)]
-    {
-        if let Some(uid) = std::env::var_os("EUID").or_else(|| std::env::var_os("UID")) {
-            if uid.to_string_lossy().trim() == "0" {
-                return true;
-            }
-        }
-
-        if let Ok(output) = Command::new("id").arg("-u").output() {
-            if output.status.success() {
-                return String::from_utf8_lossy(&output.stdout).trim() == "0";
-            }
-        }
-
-        false
-    }
-
-    #[cfg(not(unix))]
-    {
-        false
-    }
+    privilege::has_elevated_network_privileges()
 }
 
 fn build_root_required_message(request: &ScanRequest) -> String {
@@ -1742,28 +1721,7 @@ fn build_root_required_message(request: &ScanRequest) -> String {
     }
 
     let mode_text = modes.join(", ");
-    if is_termux_env() {
-        format!(
-            "{mode_text} requires root in Termux. Re-run inside a root shell (for example via `su`) and retry."
-        )
-    } else {
-        format!("{mode_text} requires root/admin privileges. Re-run with sudo or equivalent.")
-    }
-}
-
-fn is_termux_env() -> bool {
-    if std::env::var_os("TERMUX_VERSION").is_some() {
-        return true;
-    }
-
-    std::env::var_os("PREFIX")
-        .map(|value| {
-            value
-                .to_string_lossy()
-                .to_ascii_lowercase()
-                .contains("com.termux")
-        })
-        .unwrap_or(false)
+    format!("{mode_text} requires root/admin privileges. Re-run with sudo or equivalent.")
 }
 
 fn apply_sharding(
@@ -2157,6 +2115,8 @@ mod tests {
             ping_scan: false,
             traceroute: false,
             include_udp: false,
+            tcp_scan_mode: crate::models::TcpScanMode::Connect,
+            custom_tcp_flags: None,
             reverse_dns: false,
             service_detection: true,
             version_intensity: None,

@@ -20,6 +20,9 @@ fn teaching_note_for(finding: &PortFinding) -> Option<String> {
         PortState::Open => "Teach: open means the service accepted interaction",
         PortState::Closed => "Teach: closed means host replied but nothing is listening",
         PortState::Filtered => "Teach: filtered usually means firewall or packet loss",
+        PortState::Unfiltered => {
+            "Teach: unfiltered means the host replied to a filter-mapping probe, but this does not prove an open service"
+        }
         PortState::OpenOrFiltered => "Teach: open|filtered is common for UDP ambiguity",
     };
 

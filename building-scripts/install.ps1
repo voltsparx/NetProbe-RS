@@ -27,7 +27,7 @@ Actions:
   install            Install binary to local/custom bin and optionally add PATH
   update             Rebuild and replace existing installed binary
   test               Build a test binary into build-windows\ in repo root
-  uninstall          Remove installed binary and optionally clean PATH entry
+  uninstall          Remove installed binaries and optionally clean PATH entry
 
 Prompt mode:
   Run without an action to choose from an interactive menu.
@@ -111,7 +111,23 @@ function Get-DefaultInstallDir {
     if (-not [string]::IsNullOrWhiteSpace($env:NPROBE_RS_INSTALL_DIR)) {
         return $env:NPROBE_RS_INSTALL_DIR
     }
-    return (Join-Path $HOME ".local\bin")
+    if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+        return (Join-Path $env:LOCALAPPDATA "Programs\nprobe-rs\bin")
+    }
+    return (Join-Path $HOME "AppData\Local\Programs\nprobe-rs\bin")
+}
+
+function Get-CargoBinDir {
+    if (-not [string]::IsNullOrWhiteSpace($env:CARGO_HOME)) {
+        return (Join-Path $env:CARGO_HOME "bin")
+    }
+    return (Join-Path $HOME ".cargo\bin")
+}
+
+function Test-IsCargoBinDir {
+    param([string]$Directory)
+
+    return (ConvertTo-NormalizedPath $Directory) -eq (ConvertTo-NormalizedPath (Get-CargoBinDir))
 }
 
 function Get-ReleaseBinaryPath {
@@ -120,6 +136,14 @@ function Get-ReleaseBinaryPath {
     if (Test-Path $primary) { return $primary }
     if (Test-Path $fallback) { return $fallback }
     throw "Release binary not found. Expected: $primary"
+}
+
+function Get-ReleaseAliasBinaryPath {
+    $primary = Join-Path $RootDir "target\release\nprs.exe"
+    $fallback = Join-Path $RootDir "target\release\nprs"
+    if (Test-Path $primary) { return $primary }
+    if (Test-Path $fallback) { return $fallback }
+    throw "Release alias binary not found. Expected: $primary"
 }
 
 function Build-ReleaseBinary {
@@ -132,8 +156,8 @@ function Build-ReleaseBinary {
         throw "cargo was not found in PATH. Install Rust toolchain first: https://rustup.rs/"
     }
 
-    Write-Host "Building nprobe-rs (release)..."
-    & $cargo.Source build --release --manifest-path $Manifest
+    Write-Host "Building nprobe-rs and nprs (release)..."
+    & $cargo.Source build --release --bins --manifest-path $Manifest
     if ($LASTEXITCODE -ne 0) {
         throw "cargo build failed with exit code $LASTEXITCODE"
     }
@@ -309,25 +333,39 @@ function Install-BinaryToDirectory {
     param([string]$TargetDir)
 
     $source = Build-ReleaseBinary
+    $aliasSource = Get-ReleaseAliasBinaryPath
     New-Item -ItemType Directory -Force -Path $TargetDir | Out-Null
-    $dest = Join-Path $TargetDir "nprobe-rs.exe"
-    Copy-Item -Path $source -Destination $dest -Force
-    Write-Host "Installed: $dest"
+    $primary = Join-Path $TargetDir "nprobe-rs.exe"
+    $alias = Join-Path $TargetDir "nprs.exe"
+    Copy-Item -Path $source -Destination $primary -Force
+    Copy-Item -Path $aliasSource -Destination $alias -Force
+    Write-Host "Installed: $primary"
+    Write-Host "Alias installed: $alias"
 }
 
-function Resolve-InstalledBinaryPath {
+function Resolve-InstalledBinaryDirectory {
     param([string]$ExplicitInstallDir)
 
     if (-not [string]::IsNullOrWhiteSpace($ExplicitInstallDir)) {
-        return (Join-Path $ExplicitInstallDir "nprobe-rs.exe")
+        return $ExplicitInstallDir
     }
 
     $command = Get-Command nprobe-rs -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($command -and $command.Source) {
-        return $command.Source
+        return (Split-Path -Parent $command.Source)
     }
 
-    return (Join-Path (Get-DefaultInstallDir) "nprobe-rs.exe")
+    $aliasCommand = Get-Command nprs -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($aliasCommand -and $aliasCommand.Source) {
+        return (Split-Path -Parent $aliasCommand.Source)
+    }
+
+    $cargoBinDir = Get-CargoBinDir
+    if ((Test-Path (Join-Path $cargoBinDir "nprobe-rs.exe")) -or (Test-Path (Join-Path $cargoBinDir "nprs.exe"))) {
+        return $cargoBinDir
+    }
+
+    return (Get-DefaultInstallDir)
 }
 
 $normalizedAction = if ($Help) { "help" } else { Resolve-Action $Action }
@@ -348,11 +386,15 @@ switch ($normalizedAction) {
     }
     "test" {
         $source = Build-ReleaseBinary
+        $aliasSource = Get-ReleaseAliasBinaryPath
         $buildDir = Join-Path $RootDir "build-windows"
         New-Item -ItemType Directory -Force -Path $buildDir | Out-Null
         $dest = Join-Path $buildDir "nprobe-rs.exe"
+        $alias = Join-Path $buildDir "nprs.exe"
         Copy-Item -Path $source -Destination $dest -Force
+        Copy-Item -Path $aliasSource -Destination $alias -Force
         Write-Host "Test binary ready: $dest"
+        Write-Host "Alias binary ready: $alias"
     }
     "install" {
         $targetDir = Request-InstallDir $InstallDir
@@ -360,22 +402,34 @@ switch ($normalizedAction) {
         Invoke-AddToPath $targetDir $pathMode
     }
     "update" {
-        $installedBinary = Resolve-InstalledBinaryPath $InstallDir
-        $targetDir = Split-Path -Parent $installedBinary
+        $targetDir = Resolve-InstalledBinaryDirectory $InstallDir
         Install-BinaryToDirectory $targetDir
         Invoke-AddToPath $targetDir $pathMode
         Write-Host "Update complete."
     }
     "uninstall" {
-        $installedBinary = Resolve-InstalledBinaryPath $InstallDir
-        $targetDir = Split-Path -Parent $installedBinary
+        $targetDir = Resolve-InstalledBinaryDirectory $InstallDir
+        $installedBinary = Join-Path $targetDir "nprobe-rs.exe"
+        $aliasBinary = Join-Path $targetDir "nprs.exe"
+        $removed = $false
         if (Test-Path $installedBinary) {
             Remove-Item -Force $installedBinary
             Write-Host "Removed: $installedBinary"
-        } else {
-            Write-Host "No installed binary found at: $installedBinary"
+            $removed = $true
         }
-        Invoke-RemoveFromPath $targetDir $pathMode
+        if (Test-Path $aliasBinary) {
+            Remove-Item -Force $aliasBinary
+            Write-Host "Removed: $aliasBinary"
+            $removed = $true
+        }
+        if (-not $removed) {
+            Write-Host "No installed binaries found in: $targetDir"
+        }
+        if (Test-IsCargoBinDir $targetDir) {
+            Write-Host "Skipped PATH removal for Cargo bin directory: $targetDir"
+        } else {
+            Invoke-RemoveFromPath $targetDir $pathMode
+        }
     }
 }
 

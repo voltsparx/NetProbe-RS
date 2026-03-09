@@ -17,6 +17,7 @@ jobs:
       matrix:
         os:
           - ubuntu-latest
+          - macos-latest
           - windows-latest
 
     runs-on: ${{ matrix.os }}
@@ -34,7 +35,16 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Build Check
-        run: cargo check
+        run: cargo check --all-targets
 
       - name: Test
-        run: cargo test
+        run: cargo test --all-targets
+
+      - name: Release Build
+        run: cargo build --release --bins
+
+      - name: Smoke Help
+        run: cargo run --quiet --bin nprobe-rs -- --help
+
+      - name: Smoke Alias Help
+        run: cargo run --quiet --bin nprs -- --help

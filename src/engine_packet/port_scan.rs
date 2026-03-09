@@ -859,6 +859,7 @@ pub async fn run(
             scan_targets.len()
         ));
     }
+    let scan_targets = Arc::<[(Ipv4Addr, u16)]>::from(scan_targets);
     let gpu_dispatch_plan =
         engine_gpu::derive_dispatch_plan(request, scan_targets.len(), burst_size);
     if let Some(dispatch) = gpu_dispatch_plan {
@@ -991,7 +992,8 @@ pub async fn run(
             .min(firehose_budget.tx_batch_cap)
             .max(1);
         let window_size = fusion_plan.window_size.min(remaining).max(1);
-        let chunk_targets = scan_targets[scanned..scanned + window_size].to_vec();
+        let chunk_range = scanned..scanned + window_size;
+        let chunk_targets = Arc::clone(&scan_targets);
         let config = RawSynScannerConfig {
             source_ip,
             source_port,
@@ -1006,7 +1008,7 @@ pub async fn run(
         let chunk_started = Instant::now();
         let backend_result = AsyncPacketEngine::run_blocking("packet-blast", move || {
             let scanner = RawSynScanner::new(config);
-            run_with_preferred_backend(scanner, source_ip, target_v4, &chunk_targets)
+            run_with_preferred_backend(scanner, source_ip, target_v4, chunk_targets, chunk_range)
         })
         .await
         .map_err(NProbeError::Io)?;
@@ -1293,14 +1295,16 @@ fn run_with_preferred_backend(
     scanner: RawSynScanner,
     source_ip: Ipv4Addr,
     target_ip: Ipv4Addr,
-    scan_targets: &[(Ipv4Addr, u16)],
+    scan_targets: Arc<[(Ipv4Addr, u16)]>,
+    range: std::ops::Range<usize>,
 ) -> io::Result<BackendRunResult> {
-    let worker_count = scanner.effective_tx_workers(scan_targets.len());
+    let target_count = range.end.saturating_sub(range.start);
+    let worker_count = scanner.effective_tx_workers(target_count);
 
     let afxdp_err = match open_afxdp_backends(source_ip, target_ip) {
         Ok((tx, rx)) => {
             let mut first_tx = Some(tx);
-            let findings = scanner.run_with_tx_factory(
+            let findings = scanner.run_with_tx_factory_range(
                 move |worker_id| {
                     if worker_id == 0 {
                         let primary = first_tx.take().ok_or_else(|| {
@@ -1313,7 +1317,8 @@ fn run_with_preferred_backend(
                     Ok(Box::new(extra_tx) as Box<dyn RawTxBackend>)
                 },
                 rx,
-                scan_targets,
+                Arc::clone(&scan_targets),
+                range.clone(),
             )?;
             return Ok(BackendRunResult {
                 findings,
@@ -1329,7 +1334,7 @@ fn run_with_preferred_backend(
     match open_layer2_backends(source_ip, target_ip) {
         Ok((tx, rx)) => {
             let mut first_tx = Some(tx);
-            let findings = scanner.run_with_tx_factory(
+            let findings = scanner.run_with_tx_factory_range(
                 move |worker_id| {
                     if worker_id == 0 {
                         let primary = first_tx.take().ok_or_else(|| {
@@ -1342,7 +1347,8 @@ fn run_with_preferred_backend(
                     Ok(Box::new(extra_tx) as Box<dyn RawTxBackend>)
                 },
                 rx,
-                scan_targets,
+                Arc::clone(&scan_targets),
+                range.clone(),
             )?;
             Ok(BackendRunResult {
                 findings,
@@ -1354,10 +1360,11 @@ fn run_with_preferred_backend(
         }
         Err(l2_err) => {
             let rx = RawSocketRx::new(source_ip)?;
-            let findings = scanner.run_with_tx_factory(
+            let findings = scanner.run_with_tx_factory_range(
                 move |_| Ok(Box::new(RawSocketTx::new(source_ip)?) as Box<dyn RawTxBackend>),
                 rx,
                 scan_targets,
+                range,
             )?;
             Ok(BackendRunResult {
                 findings,

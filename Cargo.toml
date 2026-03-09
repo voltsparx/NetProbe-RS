@@ -2,6 +2,7 @@
 name = "nprobe-rs"
 version = "4.5.0"
 edition = "2021"
+default-run = "nprobe-rs"
 authors = ["voltsparx"]
 description = "Rust network scanner for authorized internal and lab use with explainable output."
 license = "MIT"
@@ -39,7 +40,7 @@ sysinfo = "0.33"
 thiserror = "2.0"
 tokio = { version = "1.44", features = ["macros", "rt-multi-thread", "time", "net", "fs", "io-util", "sync"] }
 
-[target.'cfg(unix)'.dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
 pnet_datalink = "0.35"
 
 [build-dependencies]

@@ -66,7 +66,7 @@ impl FileType {
     version,
     about = "NProbe-RS: Reverse-Engineered scanner in safe, explainable Rust",
     override_usage = "nprobe-rs <target> [OPTIONS]\n       nprobe-rs scan <target> [OPTIONS]\n       nprobe-rs interactive\n       nprobe-rs integrity [OPTIONS]\n       nprobe-rs sessions [OPTIONS]",
-    after_help = "Nmap-style shortcuts supported: -sL, -sn, -iL, -iR, -sU, -sS, -sT, -sV, -O, -A, -F, -T0..-T5, -p-, -r, -R",
+    after_help = "Nmap-style shortcuts supported: -sL, -sP, -sn, -iL, -iR, -sU, -sS, -sT, -sV, -O, -A, -F, -T0..-T5, -p-, -r, -R\nFramework scan shortcuts: -sPH, -sKI, -sSR, -sID, -sMR, -sHY, -sCB",
     arg_required_else_help = true
 )]
 pub struct Cli {
@@ -216,7 +216,7 @@ struct ScanArgs {
         long = "syn",
         visible_aliases = ["sS", "syn-scan", "half-open", "stealth", "stealth-scan"],
         conflicts_with = "connect",
-        help = "Use privileged TCP probing (Nmap: -sS). Will auto-prompt for sudo/su if required"
+        help = "Use privileged TCP probing (Nmap: -sS). Linux auto-prompts via sudo/doas when needed"
     )]
     syn: bool,
 
@@ -350,9 +350,8 @@ struct ScanArgs {
     #[arg(
         short = 'R',
         long = "root-only",
-        visible_alias = "termux-root",
         hide = true,
-        help = "Termux/mobile root preset: enables privileged probes with mobile-safe defaults"
+        help = "Conservative root-required preset: enables privileged probes with tighter runtime defaults"
     )]
     root_only: bool,
 
@@ -369,7 +368,7 @@ struct ScanArgs {
         long = "privileged-probes",
         visible_aliases = ["priv-probes", "pp"],
         hide = true,
-        help = "Use privileged low-port probe rotation (requires root/sudo)"
+        help = "Use privileged low-port probe rotation (requires root or admin privileges)"
     )]
     privileged_probes: bool,
 
@@ -738,7 +737,7 @@ pub fn maybe_render_quick_help_mode() -> Option<String> {
     }
 
     Some(
-        "Usage:\n  nprobe-rs <target> [options]\n  nprobe-rs interactive\n  nprobe-rs integrity [--reseal]\n  nprobe-rs sessions [--limit N]\n  nprobe-rs sessions --show <session-id>\n  nprobe-rs sessions --diff <older-session-id> <newer-session-id>\n\nCommon options:\n  <target>                   Host, CIDR, octet-range, or comma/semicolon-separated expression\n      --input-file <path>    Read targets from file (Nmap: -iL)\n      --random-targets <n>   Generate N random public IPv4 targets (Nmap: -iR)\n      --exclude <expr>       Exclude target expression after expansion\n      --exclude-file <path>  Exclude targets listed in file\n      --list-scan            Resolve/list targets only; send no probes (Nmap: -sL)\n  -p, --ports <list|range>   Select ports (example: -p 22,80,443)\n      --exclude-ports <list> Remove ports from the active scan set\n      --all-ports            Scan ports 1-65535 (Nmap: -p-)\n  -F, --fast-mode            Scan a smaller fast-mode top-port set (Nmap: -F)\n      --ping-scan            Discovery-only host up check (Nmap: -sn)\n  -U, --udp                  Enable UDP probes (Nmap: -sU)\n  -S, --syn                  Enable privileged TCP probes (Nmap: -sS)\n      --connect              Force user-space TCP connect scanning (Nmap: -sT)\n  -r, --sequential           Scan ports in ascending order (Nmap: -r)\n  -g, --source-port <port>   Pin the outbound source port (Nmap: -g)\n      --service-detect       Enable banner/service detection (Nmap: -sV, Masscan: --banners)\n      --os-detect            Bias toward richer passive OS correlation (Nmap: -O)\n      --arp                  Enable ARP neighbor discovery (local IPv4)\n      --traceroute           Run a bounded follow-up path trace after positive host evidence\n      --callback-ping        Record guarded post-discovery callback notes\n      --phantom/--sar/--kis  TBNS defensive scan concepts\n      --idf/--mirror         Additional defensive scan concepts\n      --hybrid               Controlled masscan+nmap fusion mode\n  -A, --aggressive           Aggressive mode (Nmap: -A)\n  -w, --timeout-ms <ms>      Probe timeout in milliseconds\n      --rate [num]           Stabilized raw/firehose target in packets per second (bare flag = 100)\n      --gpu-rate [num]       GPU/parallel crafter ceiling in packets per second (bare flag = 100)\n      --gpu-burst <num>      GPU/parallel crafter burst ceiling\n      --gpu-timestamp        Timestamp-pace the GPU/fused packet scheduler\n      --gpu-schedule-random  Randomize GPU/fused packet scheduling order\n      --gpu-actions <path>   Explicit GPU action-trigger manifest path\n      --assess-hardware      Assess local hardware and print safe raw/GPU ceilings only\n      --override-mode        Ask for explicit confirmations, then bypass target-facing throttles while keeping overflow protection armed\n      --scan-type [name]     List framework scan types, or query one specific type\n      --burst-size <num>     Token-bucket burst limit\n      --max-retries <num>    Adaptive retries per probe (0..20)\n      --total-shards <num>   Total shard count for distributed scans\n      --shard-index <num>    Current shard index (requires total-shards)\n      --scan-seed <num>      Deterministic port shuffle seed\n      --resume               Resume from shard checkpoint\n      --fresh-scan           Ignore/reset shard checkpoint for this run\n  -R, --reverse-dns          Enable reverse DNS lookups\n  -n, --no-dns               Disable reverse DNS lookups\n  -e, --explain              Add concise per-port rationale in output\n  -v, --verbose              Show full output sections\n  -f, --file-type <type>     Export format: txt|json|html|csv\n  -o, --output <name>        Output filename\n  -L, --location <dir>       Output directory\n\nLearner mode:\n  nprobe-rs interactive      Guided prompt mode with banner and safe defaults\n  nprobe-rs learn            Alias for interactive mode\n\nScan type catalog:\n  nprobe-rs --scan-type\n  nprobe-rs --scan-type syn\n  nprobe-rs --scan-type phantom\n\nIntegrity:\n  nprobe-rs integrity\n  nprobe-rs integrity --reseal\n\nSession history:\n  nprobe-rs sessions --limit 20\n  nprobe-rs sessions --show <session-id>\n  nprobe-rs sessions --diff <older-session-id> <newer-session-id>\n      Optional session filters: --profile <name> --updated-after <ts> --updated-before <ts>\n      Optional diff filters:    --ip <addr> --target-contains <text> --severity <level>\n      Optional diff export:     -f txt|json|html -o <name> -L <dir>\n\nNmap-style shortcuts accepted:\n  -sL  -sn  -iL  -iR  -sU  -sS  -sT  -sV  -O  -Pn  -PR  -A  -F  -T0..-T5  -p-  -r  -R  -g\n\nCatalog-only encyclopedia entries:\n  Use `nprobe-rs --scan-type <name|flag>` for scan families that are documented but not executable.\n\nFlag docs mode:\n  nprobe-rs --flag-help --scan\n  nprobe-rs --flag-help -sU\n  nprobe-rs --explain --scan   (legacy alias)\n\nCompatibility:\n  nprobe-rs scan <target> [options] still works.".to_string(),
+        "Usage:\n  nprobe-rs|nprs <target> [options]\n  nprobe-rs|nprs interactive\n  nprobe-rs|nprs integrity [--reseal]\n  nprobe-rs|nprs sessions [--limit N]\n  nprobe-rs|nprs sessions --show <session-id>\n  nprobe-rs|nprs sessions --diff <older-session-id> <newer-session-id>\n\nCommon options:\n  <target>                   Host, CIDR, octet-range, or comma/semicolon-separated expression\n      --input-file <path>    Read targets from file (Nmap: -iL)\n      --random-targets <n>   Generate N random public IPv4 targets (Nmap: -iR)\n      --exclude <expr>       Exclude target expression after expansion\n      --exclude-file <path>  Exclude targets listed in file\n      --list-scan            Resolve/list targets only; send no probes (Nmap: -sL)\n  -p, --ports <list|range>   Select ports (example: -p 22,80,443)\n      --exclude-ports <list> Remove ports from the active scan set\n      --all-ports            Scan ports 1-65535 (Nmap: -p-)\n  -F, --fast-mode            Scan a smaller fast-mode top-port set (Nmap: -F)\n      --ping-scan            Discovery-only host up check (Nmap: -sn, legacy: -sP)\n  -U, --udp                  Enable UDP probes (Nmap: -sU)\n  -S, --syn                  Enable privileged TCP probes (Nmap: -sS)\n      --connect              Force user-space TCP connect scanning (Nmap: -sT)\n  -r, --sequential           Scan ports in ascending order (Nmap: -r)\n  -g, --source-port <port>   Pin the outbound source port (Nmap: -g)\n      --service-detect       Enable banner/service detection (Nmap: -sV, Masscan: --banners)\n      --os-detect            Bias toward richer passive OS correlation (Nmap: -O)\n      --arp                  Enable ARP neighbor discovery (local IPv4)\n      --traceroute           Run a bounded follow-up path trace after positive host evidence\n      --callback-ping        Record guarded post-discovery callback notes (`-sCB`)\n      --phantom/--sar/--kis  TBNS defensive scan concepts (`-sPH`, `-sSR`, `-sKI`)\n      --idf/--mirror         Additional defensive scan concepts (`-sID`, `-sMR`)\n      --hybrid               Controlled masscan+nmap fusion mode (`-sHY`)\n  -A, --aggressive           Aggressive mode (Nmap: -A)\n  -w, --timeout-ms <ms>      Probe timeout in milliseconds\n      --rate [num]           Stabilized raw/firehose target in packets per second (bare flag = 100)\n      --gpu-rate [num]       GPU/parallel crafter ceiling in packets per second (bare flag = 100)\n      --gpu-burst <num>      GPU/parallel crafter burst ceiling\n      --gpu-timestamp        Timestamp-pace the GPU/fused packet scheduler\n      --gpu-schedule-random  Randomize GPU/fused packet scheduling order\n      --gpu-actions <path>   Explicit GPU action-trigger manifest path\n      --assess-hardware      Assess local hardware and print safe raw/GPU ceilings only\n      --override-mode        Ask for explicit confirmations, then bypass target-facing throttles while keeping overflow protection armed\n      --scan-type [name]     List framework scan types, or query one specific type\n      --burst-size <num>     Token-bucket burst limit\n      --max-retries <num>    Adaptive retries per probe (0..20)\n      --total-shards <num>   Total shard count for distributed scans\n      --shard-index <num>    Current shard index (requires total-shards)\n      --scan-seed <num>      Deterministic port shuffle seed\n      --resume               Resume from shard checkpoint\n      --fresh-scan           Ignore/reset shard checkpoint for this run\n  -R, --reverse-dns          Enable reverse DNS lookups\n  -n, --no-dns               Disable reverse DNS lookups\n  -e, --explain              Add concise per-port rationale in output\n  -v, --verbose              Show full output sections\n  -f, --file-type <type>     Export format: txt|json|html|csv\n  -o, --output <name>        Output filename\n  -L, --location <dir>       Output directory\n\nLearner mode:\n  nprobe-rs|nprs interactive      Guided prompt mode with banner and safe defaults\n  nprobe-rs|nprs learn            Alias for interactive mode\n\nScan type catalog:\n  nprobe-rs|nprs --scan-type\n  nprobe-rs|nprs --scan-type syn\n  nprobe-rs|nprs --scan-type phantom\n\nIntegrity:\n  nprobe-rs|nprs integrity\n  nprobe-rs|nprs integrity --reseal\n\nSession history:\n  nprobe-rs|nprs sessions --limit 20\n  nprobe-rs|nprs sessions --show <session-id>\n  nprobe-rs|nprs sessions --diff <older-session-id> <newer-session-id>\n      Optional session filters: --profile <name> --updated-after <ts> --updated-before <ts>\n      Optional diff filters:    --ip <addr> --target-contains <text> --severity <level>\n      Optional diff export:     -f txt|json|html -o <name> -L <dir>\n\nNmap-style shortcuts accepted:\n  -sL  -sP  -sn  -iL  -iR  -sU  -sS  -sT  -sV  -O  -Pn  -PR  -A  -F  -T0..-T5  -p-  -r  -R  -g\n\nFramework scan shortcuts accepted:\n  -sPH  -sKI  -sSR  -sID  -sMR  -sHY  -sCB\n\nCatalog-only encyclopedia entries:\n  Use `nprobe-rs|nprs --scan-type <name|flag>` for scan families that are documented but not executable.\n\nFlag docs mode:\n  nprobe-rs|nprs --flag-help --scan\n  nprobe-rs|nprs --flag-help -sU\n  nprobe-rs|nprs --flag-help -sPH\n  nprobe-rs|nprs --explain --scan   (legacy alias)\n\nCompatibility:\n  nprobe-rs|nprs scan <target> [options] still works.".to_string(),
     )
 }
 
@@ -1115,8 +1114,8 @@ fn render_flag_explain(raw_query: Option<&str>) -> String {
         "excludefile" | "exclude-file" => {
             "Exclude targets from a file (`--exclude-file`)."
         }
-        "sn" | "pingscan" | "ping-scan" | "hostdiscovery" | "host-discovery" | "discoveryonly" | "discovery-only" => {
-            "Discovery-only mode (`-sn` or `--ping-scan`). NProbe-RS verifies host presence through the lightweight fetcher plane and does not perform a port scan."
+        "sp" | "sn" | "pingscan" | "ping-scan" | "hostdiscovery" | "host-discovery" | "discoveryonly" | "discovery-only" => {
+            "Discovery-only mode (`-sn`, legacy `-sP`, or `--ping-scan`). NProbe-RS verifies host presence through the lightweight fetcher plane and does not perform a port scan."
         }
         "p" | "ports" => "Select ports or ranges. Example: `-p 22,80,443` or `-p 1-1024`.",
         "excludeports" | "exclude-ports" => {
@@ -1127,7 +1126,7 @@ fn render_flag_explain(raw_query: Option<&str>) -> String {
         }
         "s" | "su" | "udp" => "Enable UDP probing (`-sU` or `--udp`).",
         "ss" | "syn" => {
-            "Enable privileged TCP probing (`-sS` or `--syn`). If needed, the tool re-runs with sudo/su."
+            "Enable privileged TCP probing (`-sS` or `--syn`). On Linux, the tool can re-run with sudo/doas when needed."
         }
         "sv" | "servicedetect" | "service-detect" | "banners" => {
             "Enable banner/service detection (`-sV`, `--service-detect`, or Masscan-style `--banners`)."
@@ -1139,26 +1138,26 @@ fn render_flag_explain(raw_query: Option<&str>) -> String {
         "traceroute" | "trace-route" => {
             "Run a bounded traceroute-style follow-up after positive host evidence (`--traceroute`). Aggressive mode also enables it."
         }
-        "callback" | "callbackping" | "callback-ping" | "cbping" | "cb-ping" => {
-            "Add a guarded post-discovery callback note using the fetcher plane (`--callback-ping`)."
+        "scb" | "callback" | "callbackping" | "callback-ping" | "cbping" | "cb-ping" | "meshcallback" | "mesh-callback" => {
+            "Add a guarded post-discovery callback note using the fetcher plane (`--callback-ping`, `--mesh-callback`, or `-sCB`)."
         }
-        "phantom" | "phantomscan" | "phantom-scan" => {
-            "Select the TBNS Phantom first-touch profile (`--phantom` or `--phantom-scan`)."
+        "sph" | "phantom" | "phantomscan" | "phantom-scan" | "devicecheck" | "device-check" => {
+            "Select the TBNS Phantom first-touch profile (`--phantom`, `--phantom-scan`, `--device-check`, or `-sPH`)."
         }
-        "sar" | "sars" | "sarscan" | "sar-scan" => {
-            "Select the TBNS SAR observation profile (`--sar`, `--sar-scan`, or `--sars`)."
+        "ssr" | "sar" | "sars" | "sarscan" | "sar-scan" | "spectraladaptiveresponse" | "spectral-adaptive-response" => {
+            "Select the TBNS SAR observation profile (`--sar`, `--sar-scan`, `--sars`, `--spectral-adaptive-response`, or `-sSR`)."
         }
-        "kis" | "kisscan" | "kis-scan" => {
-            "Select the TBNS KIS timing-observation profile (`--kis` or `--kis-scan`)."
+        "ski" | "kis" | "kisscan" | "kis-scan" | "kineticimpedancescan" | "kinetic-impedance-scan" => {
+            "Select the TBNS KIS timing-observation profile (`--kis`, `--kis-scan`, `--kinetic-impedance-scan`, or `-sKI`)."
         }
-        "idf" | "idfscan" | "idf-scan" | "dummyscan" | "dummy-scan" | "fogscan" | "fog-scan" => {
-            "Select the inert-decoy-fog defensive profile (`--idf`, `--idf-scan`, or `--dummy-scan`)."
+        "sid" | "idf" | "idfscan" | "idf-scan" | "dummyscan" | "dummy-scan" | "fogscan" | "fog-scan" | "inertdecoyfog" | "inert-decoy-fog" => {
+            "Select the inert-decoy-fog defensive profile (`--idf`, `--idf-scan`, `--dummy-scan`, `--inert-decoy-fog`, or `-sID`)."
         }
-        "mirror" | "mirrorscan" | "mirror-scan" => {
-            "Select the reflective hybrid correlation profile (`--mirror` or `--mirror-scan`)."
+        "smr" | "mirror" | "mirrorscan" | "mirror-scan" | "reflectivehybrid" | "reflective-hybrid" => {
+            "Select the reflective hybrid correlation profile (`--mirror`, `--mirror-scan`, `--reflective-hybrid`, or `-sMR`)."
         }
-        "hybrid" | "hybridscan" | "hybrid-scan" | "masscanhybrid" | "masscan-hybrid" | "masscancontrolled" | "masscan-controlled" => {
-            "Select the controlled masscan+nmap fusion profile (`--hybrid` or `--masscan-hybrid`)."
+        "shy" | "hybrid" | "hybridscan" | "hybrid-scan" | "masscanhybrid" | "masscan-hybrid" | "masscancontrolled" | "masscan-controlled" | "controlledfirehose" | "controlled-firehose" => {
+            "Select the controlled masscan+nmap fusion profile (`--hybrid`, `--masscan-hybrid`, `--controlled-firehose`, or `-sHY`)."
         }
         "a" | "aggressive" => {
             "Aggressive mode (`-A`): enables deeper detection, a bounded traceroute follow-up, and root-required probe paths."
@@ -1573,6 +1572,8 @@ impl ScanArgs {
             ping_scan,
             traceroute,
             include_udp: !list_scan && !ping_scan && (self.udp || effective_aggressive_root),
+            tcp_scan_mode: crate::models::TcpScanMode::Connect,
+            custom_tcp_flags: None,
             reverse_dns: self.reverse_dns && !self.no_dns,
             service_detection,
             version_intensity,
@@ -1703,6 +1704,8 @@ impl InteractiveArgs {
             ping_scan: false,
             traceroute: false,
             include_udp: false,
+            tcp_scan_mode: crate::models::TcpScanMode::Connect,
+            custom_tcp_flags: None,
             reverse_dns,
             service_detection,
             version_intensity: None,
@@ -1764,7 +1767,7 @@ fn normalize_args(args: Vec<OsString>) -> Vec<OsString> {
         match token.as_str() {
             "--scan" => {}
             "-sL" => mapped.push("--list-scan".into()),
-            "-sn" => mapped.push("--ping-scan".into()),
+            "-sP" | "-sn" => mapped.push("--ping-scan".into()),
             "-sU" => mapped.push("--udp".into()),
             "-sS" => mapped.push("--syn".into()),
             "-sT" => mapped.push("--connect".into()),
@@ -1795,30 +1798,37 @@ fn normalize_args(args: Vec<OsString>) -> Vec<OsString> {
                     mapped.push(args[idx].clone());
                 }
             }
-            "--phantom" | "--phantom-scan" => {
+            "-sPH" | "--phantom" | "--phantom-scan" | "--device-check" => {
                 mapped.push("--profile".into());
                 mapped.push("phantom".into());
             }
-            "--sar" | "--sar-scan" | "--sars" => {
+            "-sSR" | "--sar" | "--sar-scan" | "--sars" | "--spectral-adaptive-response" => {
                 mapped.push("--profile".into());
                 mapped.push("sar".into());
             }
-            "--kis" | "--kis-scan" => {
+            "-sKI" | "--kis" | "--kis-scan" | "--kinetic-impedance-scan" => {
                 mapped.push("--profile".into());
                 mapped.push("kis".into());
             }
-            "--idf" | "--idf-scan" | "--dummy-scan" | "--fog-scan" => {
+            "-sID" | "--idf" | "--idf-scan" | "--dummy-scan" | "--fog-scan"
+            | "--inert-decoy-fog" => {
                 mapped.push("--profile".into());
                 mapped.push("idf".into());
             }
-            "--mirror" | "--mirror-scan" => {
+            "-sMR" | "--mirror" | "--mirror-scan" | "--reflective-hybrid" => {
                 mapped.push("--profile".into());
                 mapped.push("mirror".into());
             }
-            "--hybrid" | "--hybrid-scan" | "--masscan-hybrid" | "--masscan-controlled" => {
+            "-sHY"
+            | "--hybrid"
+            | "--hybrid-scan"
+            | "--masscan-hybrid"
+            | "--masscan-controlled"
+            | "--controlled-firehose" => {
                 mapped.push("--profile".into());
                 mapped.push("hybrid".into());
             }
+            "-sCB" | "--mesh-callback" => mapped.push("--callback-ping".into()),
             "-T" => {
                 if idx + 1 < args.len() {
                     let level = args[idx + 1].to_string_lossy().to_string();
@@ -2887,6 +2897,43 @@ mod tests {
     }
 
     #[test]
+    fn normalize_args_maps_legacy_ping_and_new_scan_shortcuts() {
+        let args = vec![
+            OsString::from("nprobe-rs"),
+            OsString::from("-sP"),
+            OsString::from("-sPH"),
+            OsString::from("-sKI"),
+            OsString::from("-sSR"),
+            OsString::from("-sID"),
+            OsString::from("-sMR"),
+            OsString::from("-sHY"),
+            OsString::from("-sCB"),
+            OsString::from("--device-check"),
+            OsString::from("--kinetic-impedance-scan"),
+            OsString::from("--spectral-adaptive-response"),
+            OsString::from("--inert-decoy-fog"),
+            OsString::from("--reflective-hybrid"),
+            OsString::from("--controlled-firehose"),
+            OsString::from("--mesh-callback"),
+            OsString::from("10.0.0.5"),
+        ];
+        let normalized = normalize_args(args);
+        let rendered = normalized
+            .iter()
+            .map(|value| value.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert!(rendered.contains(&"--ping-scan".to_string()));
+        assert!(rendered.contains(&"--profile".to_string()));
+        assert!(rendered.contains(&"phantom".to_string()));
+        assert!(rendered.contains(&"kis".to_string()));
+        assert!(rendered.contains(&"sar".to_string()));
+        assert!(rendered.contains(&"idf".to_string()));
+        assert!(rendered.contains(&"mirror".to_string()));
+        assert!(rendered.contains(&"hybrid".to_string()));
+        assert!(rendered.contains(&"--callback-ping".to_string()));
+    }
+
+    #[test]
     fn normalize_args_keeps_integrity_subcommand() {
         let args = vec![OsString::from("nprobe-rs"), OsString::from("integrity")];
         let normalized = normalize_args(args);
@@ -2938,6 +2985,25 @@ mod tests {
             OsString::from("10.0.0.5"),
             OsString::from("--mirror-scan"),
             OsString::from("--callback-ping"),
+        ]);
+        let cli = Cli::parse_from(argv);
+        let action = cli.into_action().expect("cli action should parse");
+        match action {
+            CliAction::Scan(request) => {
+                assert_eq!(request.profile, ScanProfile::Mirror);
+                assert!(request.callback_ping);
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_scan_shortcuts_parse_into_request() {
+        let argv = normalize_args(vec![
+            OsString::from("nprobe-rs"),
+            OsString::from("10.0.0.5"),
+            OsString::from("-sMR"),
+            OsString::from("-sCB"),
         ]);
         let cli = Cli::parse_from(argv);
         let action = cli.into_action().expect("cli action should parse");
