@@ -174,7 +174,7 @@ pub fn apply_request_governor(
         push_adjustment(
             stats,
             warnings,
-            "override mode active: local system limits are advisory only; nprobe-rs will not auto-reduce rate, burst, concurrency, or trigger the pre-execution emergency brake".to_string(),
+            "override mode active: pre-execution local system limits are advisory only; nprobe-rs will not auto-reduce requested rate/burst/concurrency before launch, but runtime overflow protection for accelerated packet crafters remains active".to_string(),
         );
         if request.effective_privileged_probes() && !stats.raw_packet_supported {
             push_adjustment(
@@ -653,14 +653,21 @@ mod tests {
     fn base_request() -> ScanRequest {
         ScanRequest {
             target: "127.0.0.1".to_string(),
+            target_inputs: Vec::new(),
+            exclude_targets: Vec::new(),
             session_id: None,
             ports: vec![22, 80, 443],
+            excluded_ports: Vec::new(),
             top_ports: None,
+            port_ratio: None,
+            list_scan: false,
             ping_scan: false,
             traceroute: false,
             include_udp: false,
             reverse_dns: false,
             service_detection: true,
+            version_intensity: None,
+            version_trace: false,
             explain: false,
             verbose: false,
             report_format: ReportFormat::Cli,
@@ -676,6 +683,8 @@ mod tests {
             strict_safety: false,
             output_path: None,
             lua_script: None,
+            source_port: None,
+            sequential_port_order: false,
             timeout_ms: None,
             concurrency: Some(128),
             delay_ms: Some(0),
@@ -687,6 +696,7 @@ mod tests {
             gpu_burst_size: Some(32),
             gpu_timestamp: false,
             gpu_schedule_random: false,
+            gpu_action_manifest: None,
             assess_hardware: false,
             override_mode: false,
             burst_size: Some(32),

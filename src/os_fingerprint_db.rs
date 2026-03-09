@@ -23,6 +23,7 @@ struct OsClassRecord {
     family: String,
     generation: String,
     device_type: String,
+    name_tokens: Vec<String>,
     tokens: Vec<String>,
     vendor_tokens: Vec<String>,
     family_tokens: Vec<String>,
@@ -45,6 +46,11 @@ struct HostEvidence {
     cpe_hints: Vec<CpeKey>,
     vendor_hints: Vec<String>,
     device_type_hints: Vec<String>,
+    text_hints: Vec<String>,
+    windows_signals: usize,
+    unix_signals: usize,
+    printer_signals: usize,
+    appliance_signals: usize,
     ttl_hint: Option<u8>,
 }
 
@@ -97,6 +103,7 @@ impl OsFingerprintDatabase {
             let score = base_score
                 + vendor_boost(class, &evidence)
                 + device_type_boost(class, &evidence)
+                + platform_signal_boost(class, &evidence)
                 + ttl_boost(class, &evidence, base_score);
 
             match best {
@@ -108,7 +115,7 @@ impl OsFingerprintDatabase {
         }
 
         let (class, score, source, precision) = best?;
-        if score < 78 {
+        if score < 72 {
             return None;
         }
 
@@ -177,6 +184,7 @@ struct OsClassAggregate {
     family: String,
     generation: String,
     device_type: String,
+    name_tokens: BTreeSet<String>,
     cpes: BTreeSet<String>,
     occurrences: usize,
 }
@@ -187,11 +195,13 @@ impl OsClassAggregate {
             "{} {} {} {}",
             self.vendor, self.family, self.generation, self.device_type
         );
+        let name_tokens = self.name_tokens.into_iter().collect::<Vec<_>>();
         OsClassRecord {
             vendor_tokens: normalized_tokens(&self.vendor),
             family_tokens: normalized_tokens(&self.family),
             generation_tokens: normalized_tokens(&self.generation),
             device_type_tokens: normalized_tokens(&self.device_type),
+            name_tokens: name_tokens.clone(),
             tokens: normalized_tokens(&joined)
                 .into_iter()
                 .chain(
@@ -200,6 +210,7 @@ impl OsClassAggregate {
                         .flat_map(|cpe| normalized_tokens(cpe))
                         .collect::<Vec<_>>(),
                 )
+                .chain(name_tokens.iter().cloned())
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect(),
@@ -242,6 +253,7 @@ impl HostEvidence {
         let mut cpe_hints = BTreeSet::<String>::new();
         let mut vendor_hints = BTreeSet::<String>::new();
         let mut device_type_hints = BTreeSet::<String>::new();
+        let mut text_hints = BTreeSet::<String>::new();
 
         if let Some(vendor) = host.device_vendor.as_deref() {
             for token in normalized_tokens(vendor) {
@@ -253,8 +265,18 @@ impl HostEvidence {
                 device_type_hints.insert(token);
             }
         }
+        extend_token_set(
+            &mut text_hints,
+            host.reverse_dns.as_deref().unwrap_or_default(),
+        );
 
         for port in &host.ports {
+            if let Some(service) = port.service.as_deref() {
+                extend_token_set(&mut text_hints, service);
+            }
+            if let Some(banner) = port.banner.as_deref() {
+                extend_token_set(&mut text_hints, banner);
+            }
             let Some(identity) = port.service_identity.as_ref() else {
                 continue;
             };
@@ -264,12 +286,24 @@ impl HostEvidence {
                 if !normalized.is_empty() {
                     os_hints.insert(normalized);
                 }
+                extend_token_set(&mut text_hints, os);
             }
 
             if let Some(device_type) = identity.device_type.as_deref() {
                 for token in normalized_tokens(device_type) {
                     device_type_hints.insert(token);
                 }
+                extend_token_set(&mut text_hints, device_type);
+            }
+
+            if let Some(product) = identity.product.as_deref() {
+                extend_token_set(&mut text_hints, product);
+            }
+            if let Some(info) = identity.info.as_deref() {
+                extend_token_set(&mut text_hints, info);
+            }
+            if let Some(hostname) = identity.hostname.as_deref() {
+                extend_token_set(&mut text_hints, hostname);
             }
 
             for cpe in &identity.cpes {
@@ -291,6 +325,11 @@ impl HostEvidence {
                 .collect(),
             vendor_hints: vendor_hints.into_iter().collect(),
             device_type_hints: device_type_hints.into_iter().collect(),
+            windows_signals: signal_count(&text_hints, WINDOWS_SIGNAL_TOKENS),
+            unix_signals: signal_count(&text_hints, UNIX_SIGNAL_TOKENS),
+            printer_signals: signal_count(&text_hints, PRINTER_SIGNAL_TOKENS),
+            appliance_signals: signal_count(&text_hints, APPLIANCE_SIGNAL_TOKENS),
+            text_hints: text_hints.into_iter().collect(),
             ttl_hint,
         }
     }
@@ -342,6 +381,7 @@ fn flush_block(
         entry.generation = generation;
         entry.device_type = device_type;
         entry.occurrences += 1;
+        entry.name_tokens.extend(normalized_tokens(&block.name));
         entry.cpes.extend(block.cpes.iter().cloned());
     }
 }
@@ -384,6 +424,11 @@ fn score_class(class: &OsClassRecord, evidence: &HostEvidence) -> (usize, &'stat
         if score > best.0 {
             best = (score, "passive-service-correlation", precision);
         }
+    }
+
+    let (text_score, source, precision) = text_hint_score(class, &evidence.text_hints);
+    if (evidence.os_hints.is_empty() && text_score > best.0) || (best.0 == 0 && text_score > 0) {
+        best = (text_score, source, precision);
     }
 
     best
@@ -455,6 +500,50 @@ fn service_hint_score(class: &OsClassRecord, hint_tokens: &[String]) -> (usize, 
     (score, precision)
 }
 
+fn text_hint_score(class: &OsClassRecord, text_hints: &[String]) -> (usize, &'static str, usize) {
+    if text_hints.is_empty() {
+        return (0, "passive-banner-correlation", 1);
+    }
+
+    let name_overlap = token_overlap(&class.name_tokens, text_hints);
+    let vendor_overlap = token_overlap(&class.vendor_tokens, text_hints);
+    let family_overlap = token_overlap(&class.family_tokens, text_hints);
+    let generation_overlap = token_overlap(&class.generation_tokens, text_hints);
+    let total_overlap = token_overlap(&class.tokens, text_hints);
+
+    if total_overlap == 0 || (name_overlap == 0 && vendor_overlap == 0 && family_overlap == 0) {
+        return (0, "passive-banner-correlation", 1);
+    }
+
+    let mut score = name_overlap * 36
+        + family_overlap * 28
+        + generation_overlap * 22
+        + vendor_overlap * 18
+        + total_overlap * 6
+        + class.occurrences.min(10);
+    if name_overlap > 0 && (family_overlap > 0 || generation_overlap > 0) {
+        score += 18;
+    }
+    if generation_overlap > 0 {
+        score += 12;
+    }
+
+    let source = if name_overlap > 0 {
+        "passive-fingerprint-correlation"
+    } else {
+        "passive-banner-correlation"
+    };
+    let precision = if generation_overlap > 0 || name_overlap >= 2 {
+        3
+    } else if family_overlap > 0 && vendor_overlap > 0 {
+        2
+    } else {
+        1
+    };
+
+    (score, source, precision)
+}
+
 fn vendor_boost(class: &OsClassRecord, evidence: &HostEvidence) -> usize {
     if evidence.vendor_hints.is_empty()
         || token_overlap(&class.vendor_tokens, &evidence.vendor_hints) == 0
@@ -473,6 +562,50 @@ fn device_type_boost(class: &OsClassRecord, evidence: &HostEvidence) -> usize {
     } else {
         8
     }
+}
+
+fn platform_signal_boost(class: &OsClassRecord, evidence: &HostEvidence) -> usize {
+    let mut boost = 0usize;
+
+    if evidence.windows_signals > 0
+        && class
+            .tokens
+            .iter()
+            .any(|token| matches!(token.as_str(), "windows" | "microsoft"))
+    {
+        boost += 12 + evidence.windows_signals.min(4) * 6;
+    }
+
+    if evidence.unix_signals > 0
+        && class
+            .tokens
+            .iter()
+            .any(|token| matches!(token.as_str(), "linux" | "unix" | "bsd" | "solaris"))
+    {
+        boost += 10 + evidence.unix_signals.min(4) * 5;
+    }
+
+    if evidence.printer_signals > 0
+        && class
+            .device_type_tokens
+            .iter()
+            .any(|token| token == "printer")
+    {
+        boost += 10 + evidence.printer_signals.min(3) * 5;
+    }
+
+    if evidence.appliance_signals > 0
+        && class.device_type_tokens.iter().any(|token| {
+            matches!(
+                token.as_str(),
+                "router" | "switch" | "firewall" | "bridge" | "broadband" | "wap"
+            )
+        })
+    {
+        boost += 8 + evidence.appliance_signals.min(3) * 4;
+    }
+
+    boost
 }
 
 fn ttl_boost(class: &OsClassRecord, evidence: &HostEvidence, base_score: usize) -> usize {
@@ -507,6 +640,7 @@ fn ttl_boost(class: &OsClassRecord, evidence: &HostEvidence, base_score: usize) 
 fn confidence_from_score(score: usize, source: &str) -> f32 {
     let base = match source {
         "passive-cpe-correlation" => 0.76f32,
+        "passive-fingerprint-correlation" => 0.67f32,
         _ => 0.61f32,
     };
     let scaled = (score as f32 / 220.0).clamp(0.0, 1.0);
@@ -534,6 +668,10 @@ fn normalized_tokens(raw: &str) -> Vec<String> {
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
+}
+
+fn extend_token_set(bucket: &mut BTreeSet<String>, raw: &str) {
+    bucket.extend(normalized_tokens(raw));
 }
 
 fn normalize_token(raw: &str) -> String {
@@ -581,6 +719,46 @@ fn generic_device_type(value: &str) -> bool {
         "" | "general purpose" | "specialized"
     )
 }
+
+fn signal_count(tokens: &BTreeSet<String>, patterns: &[&str]) -> usize {
+    tokens
+        .iter()
+        .filter(|token| patterns.contains(&token.as_str()))
+        .count()
+}
+
+const WINDOWS_SIGNAL_TOKENS: &[&str] = &[
+    "exchange",
+    "iis",
+    "microsoft",
+    "microsoftds",
+    "msrpc",
+    "netbios",
+    "rdp",
+    "winrm",
+    "windows",
+    "wsman",
+];
+
+const UNIX_SIGNAL_TOKENS: &[&str] = &[
+    "bsd", "courier", "debian", "dovecot", "exim", "freebsd", "linux", "nfs", "openbsd", "openssh",
+    "postfix", "rpcbind", "solaris", "ubuntu", "unix",
+];
+
+const PRINTER_SIGNAL_TOKENS: &[&str] = &["ipp", "jetdirect", "pjl", "printer", "printserver"];
+
+const APPLIANCE_SIGNAL_TOKENS: &[&str] = &[
+    "appliance",
+    "cisco",
+    "firewall",
+    "fortinet",
+    "junos",
+    "mikrotik",
+    "router",
+    "routeros",
+    "switch",
+    "ubiquiti",
+];
 
 fn candidate_nmap_roots() -> [PathBuf; 2] {
     [
@@ -717,5 +895,108 @@ mod tests {
         let guess = db.guess_host(&host, Some(61)).expect("cpe-backed os guess");
         assert_eq!(guess.label, "Linux 4.X broadband router");
         assert_eq!(guess.source, "passive-cpe-correlation");
+    }
+
+    #[test]
+    fn fingerprints_from_banner_text_without_explicit_os_field() {
+        let db = OsFingerprintDatabase::from_os_db(
+            "Fingerprint Ubuntu Linux 22.04 server\n\
+             Class Linux | Linux | Ubuntu 22.04 | general purpose\n\
+             Fingerprint Windows Server 2022\n\
+             Class Microsoft | Windows | Server 2022 | general purpose\n",
+        );
+        let mut host = empty_host();
+        host.reverse_dns = Some("git-ubuntu-01.example".to_string());
+        host.ports.push(PortFinding {
+            port: 22,
+            protocol: "tcp".to_string(),
+            state: PortState::Open,
+            service: Some("ssh".to_string()),
+            service_identity: Some(ServiceIdentity {
+                product: Some("OpenSSH".to_string()),
+                version: Some("9.6p1".to_string()),
+                info: Some("Ubuntu-3ubuntu13.8".to_string()),
+                hostname: None,
+                operating_system: None,
+                device_type: None,
+                cpes: vec!["cpe:/a:openbsd:openssh:9.6p1".to_string()],
+            }),
+            banner: Some("SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.8".to_string()),
+            reason: "test".to_string(),
+            matched_by: Some("test".to_string()),
+            confidence: Some(0.78),
+            vulnerability_hints: Vec::new(),
+            educational_note: None,
+            latency_ms: None,
+            explanation: None,
+        });
+
+        let guess = db
+            .guess_host(&host, Some(58))
+            .expect("banner-backed os guess");
+        assert_eq!(guess.label, "Linux Ubuntu 22.04");
+        assert_eq!(guess.source, "passive-fingerprint-correlation");
+    }
+
+    #[test]
+    fn platform_signals_and_banner_text_favor_windows_hosts() {
+        let db = OsFingerprintDatabase::from_os_db(
+            "Fingerprint Windows Server 2019\n\
+             Class Microsoft | Windows | Server 2019 | general purpose\n\
+             Fingerprint Linux server\n\
+             Class Linux | Linux | 6.X | general purpose\n",
+        );
+        let mut host = empty_host();
+        host.reverse_dns = Some("exchange-mbx-01.corp.example".to_string());
+        host.ports.push(PortFinding {
+            port: 80,
+            protocol: "tcp".to_string(),
+            state: PortState::Open,
+            service: Some("http".to_string()),
+            service_identity: Some(ServiceIdentity {
+                product: Some("Microsoft IIS".to_string()),
+                version: Some("10.0".to_string()),
+                info: Some("Microsoft-IIS/10.0".to_string()),
+                hostname: None,
+                operating_system: Some("Windows".to_string()),
+                device_type: None,
+                cpes: Vec::new(),
+            }),
+            banner: Some("HTTP/1.1 200 OK Server: Microsoft-IIS/10.0".to_string()),
+            reason: "test".to_string(),
+            matched_by: Some("test".to_string()),
+            confidence: Some(0.82),
+            vulnerability_hints: Vec::new(),
+            educational_note: None,
+            latency_ms: None,
+            explanation: None,
+        });
+        host.ports.push(PortFinding {
+            port: 445,
+            protocol: "tcp".to_string(),
+            state: PortState::Open,
+            service: Some("microsoft-ds".to_string()),
+            service_identity: Some(ServiceIdentity {
+                product: Some("SMB".to_string()),
+                version: None,
+                info: Some("Microsoft file sharing".to_string()),
+                hostname: None,
+                operating_system: None,
+                device_type: None,
+                cpes: Vec::new(),
+            }),
+            banner: None,
+            reason: "test".to_string(),
+            matched_by: Some("test".to_string()),
+            confidence: Some(0.74),
+            vulnerability_hints: Vec::new(),
+            educational_note: None,
+            latency_ms: None,
+            explanation: None,
+        });
+
+        let guess = db.guess_host(&host, Some(118)).expect("windows os guess");
+        assert_eq!(guess.label, "Microsoft Windows");
+        assert_ne!(guess.source, "passive-cpe-correlation");
     }
 }

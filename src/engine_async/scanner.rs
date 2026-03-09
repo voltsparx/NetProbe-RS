@@ -5,18 +5,17 @@
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::{
-    collections::VecDeque,
-    io,
-    net::{IpAddr, SocketAddr},
-};
+use std::{io, net::{IpAddr, SocketAddr}};
 
 use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use tokio::time::timeout;
 
-use crate::fingerprint_db::{FingerprintDatabase, ProbeProtocol};
+use crate::engine_packet::blackrock::BlackrockPermutation;
+use crate::fingerprint_db::{
+    FingerprintDatabase, FingerprintMatch, ProbePayloadPlan, ProbeProtocol,
+};
 use crate::models::{PortFinding, PortState, ServiceIdentity};
 use crate::service_db::ServiceRegistry;
 
@@ -36,7 +35,11 @@ pub struct AsyncScanConfig {
     pub burst_size: usize,
     pub max_retries: u8,
     pub scan_seed: Option<u64>,
+    pub sequential_port_order: bool,
     pub fingerprint_payload_budget: usize,
+    pub version_intensity: u8,
+    pub version_trace: bool,
+    pub source_port: Option<u16>,
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +50,9 @@ struct ProbeSharedContext {
     privileged_probes: bool,
     max_retries: u8,
     fingerprint_payload_budget: usize,
+    version_intensity: u8,
+    version_trace: bool,
+    source_port: Option<u16>,
     services: Arc<ServiceRegistry>,
     fingerprint_db: Arc<FingerprintDatabase>,
 }
@@ -71,6 +77,7 @@ struct DetectionEvidence {
     service_identity: Option<ServiceIdentity>,
     matched_by: Option<String>,
     confidence: Option<f32>,
+    trace_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -308,6 +315,9 @@ impl RateGovernor {
         if self.configured_rate_pps == 0 {
             return self.burst_size as f64;
         }
+        if self.burst_size <= 4 {
+            return self.burst_size as f64;
+        }
 
         let ratio = if self.max_rate_pps > 0.0 {
             (self.effective_rate_pps / self.max_rate_pps).clamp(0.10, 1.0)
@@ -316,6 +326,52 @@ impl RateGovernor {
         };
         let scaled = (self.burst_size as f64 * ratio).ceil();
         scaled.clamp(4.0, self.burst_size as f64)
+    }
+}
+
+enum PortSchedule<'a> {
+    Sequential { ports: Vec<u16>, next: usize },
+    Randomized {
+        ports: &'a [u16],
+        permutation: BlackrockPermutation,
+    },
+}
+
+impl<'a> PortSchedule<'a> {
+    fn new(ports: &'a [u16], sequential: bool, seed: u64) -> Self {
+        if sequential {
+            let mut ordered = ports.to_vec();
+            ordered.sort_unstable();
+            Self::Sequential {
+                ports: ordered,
+                next: 0,
+            }
+        } else {
+            Self::Randomized {
+                ports,
+                permutation: BlackrockPermutation::new(ports.len(), seed),
+            }
+        }
+    }
+
+    fn next_port(&mut self) -> Option<u16> {
+        match self {
+            Self::Sequential { ports, next } => {
+                let port = ports.get(*next).copied()?;
+                *next += 1;
+                Some(port)
+            }
+            Self::Randomized { ports, permutation } => {
+                permutation.next().map(|index| ports[index])
+            }
+        }
+    }
+
+    fn is_exhausted(&self) -> bool {
+        match self {
+            Self::Sequential { ports, next } => *next >= ports.len(),
+            Self::Randomized { permutation, .. } => permutation.is_exhausted(),
+        }
     }
 }
 
@@ -345,22 +401,23 @@ pub async fn scan_ports(
 }
 
 async fn scan_tcp(config: &AsyncScanConfig, services: Arc<ServiceRegistry>) -> Vec<PortFinding> {
-    let mut queue = VecDeque::from(shuffled_ports(
+    let mut schedule = PortSchedule::new(
         &config.ports,
+        config.sequential_port_order,
         protocol_seed(config.target, 0x5450_435f_5343_414e, config.scan_seed),
-    ));
+    );
     let mut in_flight = FuturesUnordered::new();
     let mut findings = Vec::with_capacity(config.ports.len());
     let mut control = AdaptiveProbeController::new(config.timeout, config.concurrency);
     let mut governor = RateGovernor::new(config.rate_limit_pps, config.burst_size);
 
-    while !queue.is_empty() || !in_flight.is_empty() {
+    while !schedule.is_exhausted() || !in_flight.is_empty() {
         let max_window = control.current_window().max(1);
         let timeout_value = control.current_timeout();
         let dispatch_delay = control.dispatch_delay(config.dispatch_delay);
 
         while in_flight.len() < max_window {
-            let Some(port) = queue.pop_front() else {
+            let Some(port) = schedule.next_port() else {
                 break;
             };
             governor.wait_for_slot().await;
@@ -375,6 +432,9 @@ async fn scan_tcp(config: &AsyncScanConfig, services: Arc<ServiceRegistry>) -> V
                     privileged_probes: config.privileged_probes,
                     max_retries: config.max_retries,
                     fingerprint_payload_budget: config.fingerprint_payload_budget,
+                    version_intensity: config.version_intensity,
+                    version_trace: config.version_trace,
+                    source_port: config.source_port,
                     services: services.clone(),
                     fingerprint_db: config.fingerprint_db.clone(),
                 },
@@ -399,22 +459,23 @@ async fn scan_tcp(config: &AsyncScanConfig, services: Arc<ServiceRegistry>) -> V
 }
 
 async fn scan_udp(config: &AsyncScanConfig, services: Arc<ServiceRegistry>) -> Vec<PortFinding> {
-    let mut queue = VecDeque::from(shuffled_ports(
+    let mut schedule = PortSchedule::new(
         &config.ports,
+        config.sequential_port_order,
         protocol_seed(config.target, 0x5544_505f_5343_414e, config.scan_seed),
-    ));
+    );
     let mut in_flight = FuturesUnordered::new();
     let mut findings = Vec::with_capacity(config.ports.len());
     let mut control = AdaptiveProbeController::new(config.timeout, config.concurrency);
     let mut governor = RateGovernor::new(config.rate_limit_pps, config.burst_size);
 
-    while !queue.is_empty() || !in_flight.is_empty() {
+    while !schedule.is_exhausted() || !in_flight.is_empty() {
         let max_window = control.current_window().max(1);
         let timeout_value = control.current_timeout();
         let dispatch_delay = control.dispatch_delay(config.dispatch_delay);
 
         while in_flight.len() < max_window {
-            let Some(port) = queue.pop_front() else {
+            let Some(port) = schedule.next_port() else {
                 break;
             };
             governor.wait_for_slot().await;
@@ -428,6 +489,9 @@ async fn scan_udp(config: &AsyncScanConfig, services: Arc<ServiceRegistry>) -> V
                     privileged_probes: config.privileged_probes,
                     max_retries: config.max_retries,
                     fingerprint_payload_budget: config.fingerprint_payload_budget,
+                    version_intensity: config.version_intensity,
+                    version_trace: config.version_trace,
+                    source_port: config.source_port,
                     services: services.clone(),
                     fingerprint_db: config.fingerprint_db.clone(),
                 },
@@ -484,33 +548,6 @@ fn duration_to_ms(duration: Duration) -> u64 {
     duration.as_millis().min(u64::MAX as u128) as u64
 }
 
-fn shuffled_ports(ports: &[u16], seed: u64) -> Vec<u16> {
-    let mut out = ports.to_vec();
-    if out.len() < 2 {
-        return out;
-    }
-
-    let mut state = if seed == 0 {
-        0x9e37_79b9_7f4a_7c15
-    } else {
-        seed
-    };
-
-    for idx in (1..out.len()).rev() {
-        state = xorshift64(state);
-        let swap_idx = (state as usize) % (idx + 1);
-        out.swap(idx, swap_idx);
-    }
-    out
-}
-
-fn xorshift64(mut value: u64) -> u64 {
-    value ^= value << 13;
-    value ^= value >> 7;
-    value ^= value << 17;
-    value
-}
-
 fn protocol_seed(target: IpAddr, marker: u64, custom_seed: Option<u64>) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -546,6 +583,9 @@ async fn scan_one_tcp(request: TcpProbeRequest) -> PortFinding {
         privileged_probes,
         max_retries,
         fingerprint_payload_budget,
+        version_intensity,
+        version_trace,
+        source_port,
         services,
         fingerprint_db,
     } = shared;
@@ -571,7 +611,12 @@ async fn scan_one_tcp(request: TcpProbeRequest) -> PortFinding {
 
     let start = Instant::now();
     let mut open_stream = None;
-    match timeout(timeout_value, connect_tcp(target, port, privileged_probes)).await {
+    match timeout(
+        timeout_value,
+        connect_tcp(target, port, privileged_probes, source_port),
+    )
+    .await
+    {
         Ok(Ok(stream)) => {
             finding.state = PortState::Open;
             finding.reason = if privileged_probes {
@@ -612,7 +657,12 @@ async fn scan_one_tcp(request: TcpProbeRequest) -> PortFinding {
         let retry_timeout = timeout_value
             .max(Duration::from_millis(450))
             .saturating_add(Duration::from_millis(200 + (retry_index as u64 * 120)));
-        match timeout(retry_timeout, connect_tcp(target, port, privileged_probes)).await {
+        match timeout(
+            retry_timeout,
+            connect_tcp(target, port, privileged_probes, source_port),
+        )
+        .await
+        {
             Ok(Ok(stream)) => {
                 finding.state = PortState::Open;
                 finding.reason = if retry_index == 0 && aggressive_root {
@@ -660,6 +710,8 @@ async fn scan_one_tcp(request: TcpProbeRequest) -> PortFinding {
                 fingerprint_db,
                 ProbeProtocol::Tcp,
                 fingerprint_payload_budget,
+                version_intensity,
+                version_trace,
             )
             .await;
             if evidence.banner.is_some() {
@@ -677,6 +729,9 @@ async fn scan_one_tcp(request: TcpProbeRequest) -> PortFinding {
             if evidence.confidence.is_some() {
                 finding.confidence = evidence.confidence;
             }
+            if evidence.trace_note.is_some() {
+                finding.educational_note = evidence.trace_note;
+            }
         }
     }
 
@@ -692,6 +747,9 @@ async fn scan_one_udp(request: UdpProbeRequest) -> PortFinding {
         privileged_probes,
         max_retries,
         fingerprint_payload_budget,
+        version_intensity,
+        version_trace,
+        source_port,
         services,
         fingerprint_db,
     } = shared;
@@ -715,7 +773,7 @@ async fn scan_one_udp(request: UdpProbeRequest) -> PortFinding {
         explanation: None,
     };
 
-    let socket = match bind_udp_probe_socket(target, port, privileged_probes).await {
+    let socket = match bind_udp_probe_socket(target, port, privileged_probes, source_port).await {
         Ok(sock) => sock,
         Err(err) => {
             finding.state = PortState::Filtered;
@@ -731,15 +789,32 @@ async fn scan_one_udp(request: UdpProbeRequest) -> PortFinding {
     }
 
     let start = Instant::now();
-    let mut payloads =
-        fingerprint_db.payloads_for(ProbeProtocol::Udp, port, fingerprint_payload_budget.max(1));
+    let mut payloads = fingerprint_db.payload_plan_for(
+        ProbeProtocol::Udp,
+        port,
+        fingerprint_payload_budget.max(1),
+        version_intensity,
+    );
     if payloads.is_empty() {
-        payloads.push(vec![0x00]);
+        payloads.push(ProbePayloadPlan {
+            bytes: vec![0x00],
+            source: "default-udp-null".to_string(),
+            rarity: 1,
+        });
+    }
+    let mut trace_steps = Vec::<String>::new();
+    if version_trace {
+        trace_steps.push(format!(
+            "udp-intensity={} budget={}",
+            version_intensity,
+            fingerprint_payload_budget.max(1)
+        ));
+        trace_steps.push(payload_trace_label("send", &payloads[0]));
     }
 
     match udp_probe_once(
         &socket,
-        &payloads[0],
+        &payloads[0].bytes,
         timeout_value,
         Duration::from_millis(350),
     )
@@ -750,36 +825,54 @@ async fn scan_one_udp(request: UdpProbeRequest) -> PortFinding {
             finding.reason = "udp response payload received".to_string();
             finding.latency_ms = Some(start.elapsed().as_millis());
             finding.banner = Some(sanitize_banner(&buffer));
+            if version_trace {
+                trace_steps.push(format!("recv={}B", buffer.len()));
+            }
 
             if let Some(matched) = fingerprint_db.match_banner(ProbeProtocol::Udp, port, &buffer) {
-                finding.service = Some(matched.service);
-                finding.service_identity = Some(matched.identity);
-                finding.matched_by = Some(if matched.soft {
-                    format!("fingerprint-soft:{}", matched.source)
-                } else {
-                    format!("fingerprint-hard:{}", matched.source)
-                });
-                finding.confidence = Some(matched.confidence);
+                if version_trace {
+                    trace_steps.push(format!("match={}", matched.source));
+                }
+                apply_matched_fingerprint(&mut finding, matched);
+            } else if let Some(matched) =
+                fingerprint_db.heuristic_banner_match(ProbeProtocol::Udp, port, &buffer)
+            {
+                if version_trace {
+                    trace_steps.push(format!("heuristic={}", matched.source));
+                }
+                apply_matched_fingerprint(&mut finding, matched);
             } else if let Some(heuristic) = infer_service_from_banner(&buffer) {
                 finding.service = Some(heuristic);
                 finding.matched_by = Some("banner-heuristic".to_string());
                 finding.confidence = Some(0.56);
+                if version_trace {
+                    trace_steps.push("heuristic=banner".to_string());
+                }
             }
         }
         UdpProbeOutcome::Closed => {
             finding.state = PortState::Closed;
             finding.reason = "icmp port unreachable / connection refused".to_string();
             finding.latency_ms = Some(start.elapsed().as_millis());
+            if version_trace {
+                trace_steps.push("reply=closed".to_string());
+            }
         }
         UdpProbeOutcome::NoReply => {
             finding.state = PortState::OpenOrFiltered;
             finding.reason = "no udp reply (open|filtered)".to_string();
             finding.latency_ms = Some(start.elapsed().as_millis());
+            if version_trace {
+                trace_steps.push("reply=no-reply".to_string());
+            }
         }
         UdpProbeOutcome::Error(err) => {
             finding.state = PortState::Filtered;
             finding.reason = err;
             finding.latency_ms = Some(start.elapsed().as_millis());
+            if version_trace {
+                trace_steps.push("reply=error".to_string());
+            }
         }
     }
 
@@ -796,9 +889,15 @@ async fn scan_one_udp(request: UdpProbeRequest) -> PortFinding {
             .get((retry_index + 1).min(payloads.len().saturating_sub(1)))
             .cloned()
             .unwrap_or_else(|| payloads[0].clone());
+        if version_trace {
+            trace_steps.push(payload_trace_label(
+                &format!("retry-{}", retry_index + 1),
+                &retry_payload,
+            ));
+        }
         match udp_probe_once(
             &socket,
-            &retry_payload,
+            &retry_payload.bytes,
             timeout_value
                 .max(Duration::from_millis(450))
                 .saturating_add(Duration::from_millis(200 + (retry_index as u64 * 140))),
@@ -818,21 +917,30 @@ async fn scan_one_udp(request: UdpProbeRequest) -> PortFinding {
                 };
                 finding.latency_ms = Some(start.elapsed().as_millis());
                 finding.banner = Some(sanitize_banner(&buffer));
+                if version_trace {
+                    trace_steps.push(format!("recv={}B", buffer.len()));
+                }
                 if let Some(matched) =
                     fingerprint_db.match_banner(ProbeProtocol::Udp, port, &buffer)
                 {
-                    finding.service = Some(matched.service);
-                    finding.service_identity = Some(matched.identity);
-                    finding.matched_by = Some(if matched.soft {
-                        format!("fingerprint-soft:{}", matched.source)
-                    } else {
-                        format!("fingerprint-hard:{}", matched.source)
-                    });
-                    finding.confidence = Some(matched.confidence);
+                    if version_trace {
+                        trace_steps.push(format!("match={}", matched.source));
+                    }
+                    apply_matched_fingerprint(&mut finding, matched);
+                } else if let Some(matched) =
+                    fingerprint_db.heuristic_banner_match(ProbeProtocol::Udp, port, &buffer)
+                {
+                    if version_trace {
+                        trace_steps.push(format!("heuristic={}", matched.source));
+                    }
+                    apply_matched_fingerprint(&mut finding, matched);
                 } else if let Some(heuristic) = infer_service_from_banner(&buffer) {
                     finding.service = Some(heuristic);
                     finding.matched_by = Some("banner-heuristic".to_string());
                     finding.confidence = Some(0.56);
+                    if version_trace {
+                        trace_steps.push("heuristic=banner".to_string());
+                    }
                 }
                 break;
             }
@@ -852,6 +960,9 @@ async fn scan_one_udp(request: UdpProbeRequest) -> PortFinding {
             UdpProbeOutcome::NoReply => {
                 finding.reason =
                     format!("{}; retry {} got no reply", finding.reason, retry_index + 1);
+                if version_trace {
+                    trace_steps.push(format!("retry-{}=no-reply", retry_index + 1));
+                }
             }
             UdpProbeOutcome::Error(err) => {
                 finding.reason = format!(
@@ -860,8 +971,15 @@ async fn scan_one_udp(request: UdpProbeRequest) -> PortFinding {
                     retry_index + 1,
                     err
                 );
+                if version_trace {
+                    trace_steps.push(format!("retry-{}=error", retry_index + 1));
+                }
             }
         }
+    }
+
+    if version_trace {
+        finding.educational_note = Some(render_version_trace(&trace_steps));
     }
 
     finding
@@ -876,7 +994,22 @@ enum UdpProbeOutcome {
     Error(String),
 }
 
-async fn connect_tcp(target: IpAddr, port: u16, privileged_probes: bool) -> io::Result<TcpStream> {
+async fn connect_tcp(
+    target: IpAddr,
+    port: u16,
+    privileged_probes: bool,
+    source_port: Option<u16>,
+) -> io::Result<TcpStream> {
+    if let Some(source_port) = source_port {
+        let remote = SocketAddr::new(target, port);
+        let socket = match target {
+            IpAddr::V4(_) => TcpSocket::new_v4(),
+            IpAddr::V6(_) => TcpSocket::new_v6(),
+        }?;
+        socket.bind(wildcard_bind_addr(target, source_port))?;
+        return socket.connect(remote).await;
+    }
+
     if !privileged_probes {
         return TcpStream::connect((target, port)).await;
     }
@@ -908,7 +1041,12 @@ async fn bind_udp_probe_socket(
     target: IpAddr,
     port: u16,
     privileged_probes: bool,
+    source_port: Option<u16>,
 ) -> io::Result<UdpSocket> {
+    if let Some(source_port) = source_port {
+        return UdpSocket::bind(wildcard_bind_addr(target, source_port)).await;
+    }
+
     if !privileged_probes {
         return UdpSocket::bind(wildcard_bind_addr(target, 0)).await;
     }
@@ -977,24 +1115,35 @@ async fn attempt_banner_and_fingerprint(
     fingerprint_db: Arc<FingerprintDatabase>,
     protocol: ProbeProtocol,
     fingerprint_payload_budget: usize,
+    version_intensity: u8,
+    version_trace: bool,
 ) -> DetectionEvidence {
     let mut best_banner = None;
+    let mut trace_steps = Vec::<String>::new();
+    if version_trace {
+        trace_steps.push(format!(
+            "intensity={} budget={}",
+            version_intensity, fingerprint_payload_budget
+        ));
+    }
 
     if let Some(raw) = read_response(stream, Duration::from_millis(220)).await {
         let banner_text = sanitize_banner(&raw);
         best_banner = Some(banner_text);
+        if version_trace {
+            trace_steps.push(format!("greeting={}B", raw.len()));
+        }
         if let Some(matched) = fingerprint_db.match_banner(protocol, port, &raw) {
-            return DetectionEvidence {
-                banner: best_banner,
-                service: Some(matched.service),
-                service_identity: Some(matched.identity),
-                matched_by: Some(if matched.soft {
-                    format!("fingerprint-soft:{}", matched.source)
-                } else {
-                    format!("fingerprint-hard:{}", matched.source)
-                }),
-                confidence: Some(matched.confidence),
-            };
+            if version_trace {
+                trace_steps.push(format!("match={}", matched.source));
+            }
+            return detection_from_match(best_banner, matched, trace_steps);
+        }
+        if let Some(matched) = fingerprint_db.heuristic_banner_match(protocol, port, &raw) {
+            if version_trace {
+                trace_steps.push(format!("heuristic={}", matched.source));
+            }
+            return detection_from_match(best_banner, matched, trace_steps);
         }
     }
 
@@ -1005,20 +1154,36 @@ async fn attempt_banner_and_fingerprint(
             service_identity: None,
             matched_by: None,
             confidence: None,
+            trace_note: version_trace.then(|| render_version_trace(&trace_steps)),
         };
     }
 
-    let mut payloads = fingerprint_db.payloads_for(protocol, port, fingerprint_payload_budget);
+    let mut payloads = fingerprint_db.payload_plan_for(
+        protocol,
+        port,
+        fingerprint_payload_budget,
+        version_intensity,
+    );
     if payloads.is_empty() {
-        payloads.push(default_probe_payload(port));
+        payloads.push(ProbePayloadPlan {
+            bytes: default_probe_payload(port),
+            source: "default-probe".to_string(),
+            rarity: 1,
+        });
     }
 
     for payload in payloads {
-        if !payload.is_empty()
-            && timeout(timeout_value, stream.write_all(&payload))
+        if version_trace {
+            trace_steps.push(payload_trace_label("probe", &payload));
+        }
+        if !payload.bytes.is_empty()
+            && timeout(timeout_value, stream.write_all(&payload.bytes))
                 .await
                 .is_err()
         {
+            if version_trace {
+                trace_steps.push("probe=write-timeout".to_string());
+            }
             continue;
         }
 
@@ -1029,28 +1194,34 @@ async fn attempt_banner_and_fingerprint(
             }
 
             if let Some(matched) = fingerprint_db.match_banner(protocol, port, &raw) {
-                return DetectionEvidence {
-                    banner: Some(banner_text),
-                    service: Some(matched.service),
-                    service_identity: Some(matched.identity),
-                    matched_by: Some(if matched.soft {
-                        format!("fingerprint-soft:{}", matched.source)
-                    } else {
-                        format!("fingerprint-hard:{}", matched.source)
-                    }),
-                    confidence: Some(matched.confidence),
-                };
+                if version_trace {
+                    trace_steps.push(format!("match={}", matched.source));
+                }
+                return detection_from_match(Some(banner_text), matched, trace_steps);
+            }
+
+            if let Some(matched) = fingerprint_db.heuristic_banner_match(protocol, port, &raw) {
+                if version_trace {
+                    trace_steps.push(format!("heuristic={}", matched.source));
+                }
+                return detection_from_match(Some(banner_text), matched, trace_steps);
             }
 
             if let Some(heuristic) = infer_service_from_sanitized_banner(&banner_text) {
+                if version_trace {
+                    trace_steps.push("heuristic=banner".to_string());
+                }
                 return DetectionEvidence {
                     banner: Some(banner_text),
                     service: Some(heuristic),
                     service_identity: None,
                     matched_by: Some("banner-heuristic".to_string()),
                     confidence: Some(0.57),
+                    trace_note: version_trace.then(|| render_version_trace(&trace_steps)),
                 };
             }
+        } else if version_trace {
+            trace_steps.push("probe=no-response".to_string());
         }
     }
 
@@ -1060,7 +1231,65 @@ async fn attempt_banner_and_fingerprint(
         service_identity: None,
         matched_by: None,
         confidence: None,
+        trace_note: version_trace.then(|| render_version_trace(&trace_steps)),
     }
+}
+
+fn detection_from_match(
+    banner: Option<String>,
+    matched: FingerprintMatch,
+    trace_steps: Vec<String>,
+) -> DetectionEvidence {
+    let matched_by = fingerprint_match_label(&matched);
+    DetectionEvidence {
+        banner,
+        service: Some(matched.service),
+        service_identity: Some(matched.identity),
+        matched_by: Some(matched_by),
+        confidence: Some(matched.confidence),
+        trace_note: (!trace_steps.is_empty()).then(|| render_version_trace(&trace_steps)),
+    }
+}
+
+fn apply_matched_fingerprint(finding: &mut PortFinding, matched: FingerprintMatch) {
+    let matched_by = fingerprint_match_label(&matched);
+    finding.service = Some(matched.service);
+    finding.service_identity = Some(matched.identity);
+    finding.matched_by = Some(matched_by);
+    finding.confidence = Some(matched.confidence);
+}
+
+fn fingerprint_match_label(matched: &FingerprintMatch) -> String {
+    if matched.heuristic {
+        format!("fingerprint-heuristic:{}", matched.source)
+    } else if matched.soft {
+        format!("fingerprint-soft:{}", matched.source)
+    } else {
+        format!("fingerprint-hard:{}", matched.source)
+    }
+}
+
+fn payload_trace_label(phase: &str, payload: &ProbePayloadPlan) -> String {
+    format!(
+        "{phase}={} rarity={} bytes={}",
+        payload.source,
+        payload.rarity,
+        payload.bytes.len()
+    )
+}
+
+fn render_version_trace(steps: &[String]) -> String {
+    let mut rendered = steps
+        .iter()
+        .filter(|step| !step.is_empty())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" -> ");
+    if rendered.len() > 240 {
+        rendered.truncate(237);
+        rendered.push_str("...");
+    }
+    format!("version-trace: {rendered}")
 }
 
 async fn read_response(stream: &mut TcpStream, wait: Duration) -> Option<Vec<u8>> {
@@ -1141,13 +1370,38 @@ fn sanitize_banner(raw: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    fn collect_schedule(mut schedule: PortSchedule<'_>) -> Vec<u16> {
+        let mut ports = Vec::new();
+        while let Some(port) = schedule.next_port() {
+            ports.push(port);
+        }
+        ports
+    }
+
     #[test]
-    fn shuffled_ports_is_deterministic_for_seed() {
+    fn randomized_schedule_is_deterministic_for_seed() {
         let source = vec![22, 80, 443, 8080, 3306, 5432];
-        let first = shuffled_ports(&source, 0x1234_5678_9abc_def0);
-        let second = shuffled_ports(&source, 0x1234_5678_9abc_def0);
+        let first = collect_schedule(PortSchedule::new(&source, false, 0x1234_5678_9abc_def0));
+        let second = collect_schedule(PortSchedule::new(&source, false, 0x1234_5678_9abc_def0));
         assert_eq!(first, second);
         assert_ne!(first, source);
+    }
+
+    #[test]
+    fn randomized_schedule_covers_each_port_once() {
+        let source = vec![22, 80, 443, 8080, 3306, 5432];
+        let mut scheduled = collect_schedule(PortSchedule::new(&source, false, 7));
+        scheduled.sort_unstable();
+        let mut expected = source.clone();
+        expected.sort_unstable();
+        assert_eq!(scheduled, expected);
+    }
+
+    #[test]
+    fn sequential_schedule_sorts_ports_instead_of_shuffling() {
+        let source = vec![443, 22, 8080, 80];
+        let ordered = collect_schedule(PortSchedule::new(&source, true, 7));
+        assert_eq!(ordered, vec![22, 80, 443, 8080]);
     }
 
     #[test]

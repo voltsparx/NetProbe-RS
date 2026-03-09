@@ -162,7 +162,7 @@ pub fn plan_hybrid_runtime(
         "inactive"
     };
     let action_manifest = if requested {
-        discover_action_triggers()?
+        discover_action_triggers(request)?
     } else {
         None
     };
@@ -295,7 +295,17 @@ fn current_platform_tier() -> GpuPlatformTier {
     }
 }
 
-fn discover_action_triggers() -> NProbeResult<Option<ActionTriggerManifest>> {
+fn discover_action_triggers(request: &ScanRequest) -> NProbeResult<Option<ActionTriggerManifest>> {
+    if let Some(path) = request.gpu_action_manifest.as_ref() {
+        if !path.exists() {
+            return Err(NProbeError::Gpu(format!(
+                "GPU action trigger manifest was requested via --gpu-actions, but no file was found at {}. Point the flag to a readable manifest or remove it.",
+                path.display()
+            )));
+        }
+        return load_action_triggers(path).map(Some);
+    }
+
     if let Some(path) = env::var_os("NPROBE_RS_GPU_ACTIONS") {
         let path = PathBuf::from(path);
         if !path.exists() {
@@ -538,18 +548,27 @@ mod tests {
     use super::{derive_dispatch_plan, parse_action_triggers, plan_hybrid_runtime};
     use crate::error::NProbeError;
     use crate::models::{ReportFormat, ScanProfile, ScanRequest};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn base_request() -> ScanRequest {
         ScanRequest {
             target: "127.0.0.1".to_string(),
+            target_inputs: Vec::new(),
+            exclude_targets: Vec::new(),
             session_id: None,
             ports: vec![22, 80, 443],
+            excluded_ports: Vec::new(),
             top_ports: None,
+            port_ratio: None,
+            list_scan: false,
             ping_scan: false,
             traceroute: false,
             include_udp: false,
             reverse_dns: false,
             service_detection: true,
+            version_intensity: None,
+            version_trace: false,
             explain: false,
             verbose: false,
             report_format: ReportFormat::Cli,
@@ -564,7 +583,9 @@ mod tests {
             strict_safety: false,
             output_path: None,
             lua_script: None,
+            source_port: None,
             callback_ping: false,
+            sequential_port_order: false,
             timeout_ms: None,
             concurrency: None,
             delay_ms: None,
@@ -576,6 +597,7 @@ mod tests {
             gpu_burst_size: None,
             gpu_timestamp: false,
             gpu_schedule_random: false,
+            gpu_action_manifest: None,
             assess_hardware: false,
             override_mode: false,
             burst_size: None,
@@ -695,5 +717,42 @@ triggers:
         let triggers = parse_action_triggers(raw).expect("parsed triggers");
         assert_eq!(triggers.len(), 1);
         assert_eq!(triggers[0].condition.total_found, Some(100));
+    }
+
+    #[test]
+    fn explicit_gpu_action_manifest_is_preferred() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("nprobe-rs-gpu-actions-{unique}.yaml"));
+        fs::write(
+            &path,
+            r#"
+triggers:
+  - name: "Explicit Trigger"
+    condition:
+      total_found: 1
+    action:
+      type: "notify"
+      message: "explicit"
+"#,
+        )
+        .expect("temp manifest should be writable");
+
+        let mut request = base_request();
+        request.gpu_rate_pps = Some(100);
+        request.gpu_rate_explicit = true;
+        request.gpu_action_manifest = Some(path.clone());
+
+        let plan = plan_hybrid_runtime(&request, "packet-blast", 4, 16).expect("hybrid plan");
+        let expected = path.to_string_lossy().into_owned();
+        assert_eq!(plan.action_trigger_count, 1);
+        assert_eq!(
+            plan.action_trigger_source.as_deref(),
+            Some(expected.as_str())
+        );
+
+        let _ = fs::remove_file(path);
     }
 }

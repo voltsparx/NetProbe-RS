@@ -75,9 +75,10 @@ pub fn plan(request: &ScanRequest, host_count: usize, port_count: usize) -> Scan
     let packet_blast_allowed = request.effective_privileged_probes()
         && !request.strict_safety
         && !request.service_detection
-        && !request.ping_scan;
+        && !request.ping_scan
+        && !request.list_scan;
 
-    let mut mode = if request.ping_scan {
+    let mut mode = if request.ping_scan || request.list_scan {
         ExecutionMode::Async
     } else {
         match request.profile {
@@ -104,7 +105,7 @@ pub fn plan(request: &ScanRequest, host_count: usize, port_count: usize) -> Scan
         mode = ExecutionMode::Hybrid;
     }
 
-    let persona = if request.ping_scan {
+    let persona = if request.ping_scan || request.list_scan {
         ScanPersona::Discovery
     } else {
         match request.profile {
@@ -224,7 +225,7 @@ pub fn plan(request: &ScanRequest, host_count: usize, port_count: usize) -> Scan
         }
     }
 
-    if request.ping_scan {
+    if request.ping_scan || request.list_scan {
         rate_limit_pps = rate_limit_pps.min(256);
         burst_size = burst_size.min(8);
         max_retries = max_retries.max(2);
@@ -397,14 +398,21 @@ mod tests {
     fn base_request() -> ScanRequest {
         ScanRequest {
             target: "127.0.0.1".to_string(),
+            target_inputs: Vec::new(),
+            exclude_targets: Vec::new(),
             session_id: None,
             ports: vec![22, 80, 443],
+            excluded_ports: Vec::new(),
             top_ports: None,
+            port_ratio: None,
+            list_scan: false,
             ping_scan: false,
             traceroute: false,
             include_udp: false,
             reverse_dns: false,
             service_detection: true,
+            version_intensity: None,
+            version_trace: false,
             explain: false,
             verbose: false,
             report_format: ReportFormat::Cli,
@@ -420,6 +428,8 @@ mod tests {
             strict_safety: false,
             output_path: None,
             lua_script: None,
+            source_port: None,
+            sequential_port_order: false,
             timeout_ms: None,
             concurrency: None,
             delay_ms: None,
@@ -431,6 +441,7 @@ mod tests {
             gpu_burst_size: None,
             gpu_timestamp: false,
             gpu_schedule_random: false,
+            gpu_action_manifest: None,
             assess_hardware: false,
             override_mode: false,
             burst_size: None,

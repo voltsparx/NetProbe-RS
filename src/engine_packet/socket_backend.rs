@@ -36,6 +36,7 @@ impl RawTxBackend for RawSocketTx {
         self.socket
             .send_to(packet, &SockAddr::from(SocketAddrV4::new(target, 0)))
             .map(|_| ())
+            .map_err(normalize_socket_send_error)
     }
 }
 
@@ -74,11 +75,48 @@ impl RawRxBackend for RawSocketRx {
             Err(err)
                 if err.kind() == ErrorKind::TimedOut
                     || err.kind() == ErrorKind::WouldBlock
-                    || err.kind() == ErrorKind::Interrupted =>
+                    || err.kind() == ErrorKind::Interrupted
+                    || err.kind() == ErrorKind::BrokenPipe
+                    || err.kind() == ErrorKind::ConnectionReset
+                    || err.kind() == ErrorKind::ConnectionAborted
+                    || is_socket_pressure_code(err.raw_os_error()) =>
             {
                 Ok(None)
             }
             Err(err) => Err(err),
         }
     }
+}
+
+fn normalize_socket_send_error(err: io::Error) -> io::Error {
+    if matches!(
+        err.kind(),
+        ErrorKind::WouldBlock
+            | ErrorKind::BrokenPipe
+            | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::Interrupted
+    ) {
+        return err;
+    }
+
+    match err.raw_os_error() {
+        Some(code) if is_socket_pressure_code(Some(code)) => io::Error::new(
+            ErrorKind::WouldBlock,
+            format!("raw socket transmit path is pressure-saturated: {err}"),
+        ),
+        Some(code) if is_socket_pipe_code(code) => io::Error::new(
+            ErrorKind::BrokenPipe,
+            format!("raw socket transmit path reset while crafting packets: {err}"),
+        ),
+        _ => err,
+    }
+}
+
+fn is_socket_pressure_code(code: Option<i32>) -> bool {
+    matches!(code, Some(11 | 105 | 10035 | 10055))
+}
+
+fn is_socket_pipe_code(code: i32) -> bool {
+    matches!(code, 32 | 104 | 103 | 10053 | 10054)
 }

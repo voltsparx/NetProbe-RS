@@ -268,7 +268,13 @@ pub async fn run(
     let mut raw_worker_cap = runtime.concurrency.max(1);
     let mut chunk_delay = runtime.delay;
     let mut stage2_service_detection = request.service_detection;
-    let mut fingerprint_payload_budget = if stage2_service_detection { 4 } else { 0 };
+    let version_intensity = request.effective_version_intensity();
+    let version_trace = request.version_trace;
+    let mut fingerprint_payload_budget = if stage2_service_detection {
+        request.effective_version_payload_budget()
+    } else {
+        0
+    };
     let mut burst_size = request.burst_size.unwrap_or(strategy.burst_size).max(1);
     let gpu_rate_cap_pps = request
         .gpu_rate_pps
@@ -278,7 +284,9 @@ pub async fn run(
     let gpu_timestamp_pacing = request.gpu_timestamp;
     let gpu_schedule_random = request.gpu_schedule_random;
     let seed = request.scan_seed.unwrap_or(0x4e50_5253_5241_5753_u64);
-    let source_port = source_port_from_seed(seed);
+    let source_port = request
+        .source_port
+        .unwrap_or_else(|| source_port_from_seed(seed));
     let scan_timeout = request
         .timeout_ms
         .map(Duration::from_millis)
@@ -333,7 +341,7 @@ pub async fn run(
 
     if override_mode {
         warnings.push(
-            "override mode active: raw lane bypassing adaptive device-profile, bio-response, phantom, and local-health safety governors at operator request"
+            "override mode active: raw lane bypassing device-profile, bio-response, and phantom target-facing governors at operator request while keeping runtime overflow protection armed"
                 .to_string(),
         );
         safety_actions.push("override-mode:raw-governors-bypassed".to_string());
@@ -512,7 +520,7 @@ pub async fn run(
 
     if override_mode {
         warnings.push(
-            "override mode bypassed bio-response governor for the raw lane; rate, concurrency, and service follow-up remained operator-controlled"
+            "override mode bypassed the bio-response governor's target-facing decisions for the raw lane; runtime overflow guard can still clamp local packet pressure if buffers saturate"
                 .to_string(),
         );
         safety_actions.push("override-mode:bio-response-bypassed".to_string());
@@ -878,8 +886,7 @@ pub async fn run(
         "token-bucket:rate={}pps:burst={}",
         rate_pps, burst_size
     ));
-    let mut local_runtime_monitor =
-        (!override_mode).then(local_system_guard::RuntimeHealthMonitor::new);
+    let mut local_runtime_monitor = Some(local_system_guard::RuntimeHealthMonitor::new());
 
     let mut fusion_engine = FusionEngine::default();
     let mut feedback = AdaptiveFusionFeedback::default();
@@ -900,20 +907,47 @@ pub async fn run(
             if let Some(adjustment) =
                 monitor.sample_raw_path(rate_pps, burst_size, raw_worker_cap, chunk_delay)
             {
-                if (adjustment.rate_cap_pps as u64) < rate_pps {
+                if !override_mode && (adjustment.rate_cap_pps as u64) < rate_pps {
                     rate_pps = adjustment.rate_cap_pps as u64;
                 }
                 if adjustment.burst_cap < burst_size {
+                    let previous = burst_size;
                     burst_size = adjustment.burst_cap;
+                    firehose_budget.tx_batch_cap =
+                        firehose_budget.tx_batch_cap.min(burst_size).max(1);
+                    if override_mode {
+                        warnings.push(format!(
+                            "override mode preserved operator rate intent, but runtime overflow guard tightened packet-crafter burst size from {} to {} because the local packet path reported {} pressure",
+                            previous, burst_size, adjustment.health_stage
+                        ));
+                    }
                 }
                 if adjustment.worker_cap < raw_worker_cap {
+                    let previous = raw_worker_cap;
                     raw_worker_cap = adjustment.worker_cap;
+                    if override_mode {
+                        warnings.push(format!(
+                            "override mode kept the accelerated lane active, but runtime overflow guard reduced packet-crafter worker parallelism from {} to {} because the local packet path reported {} pressure",
+                            previous, raw_worker_cap, adjustment.health_stage
+                        ));
+                    }
                 }
                 if adjustment.delay_floor > chunk_delay {
+                    let previous = chunk_delay;
                     chunk_delay = adjustment.delay_floor;
+                    if override_mode {
+                        warnings.push(format!(
+                            "override mode kept packet crafting active, but runtime overflow guard raised the packet-crafter cool-down from {}ms to {}ms because the local packet path reported {} pressure",
+                            previous.as_millis(),
+                            chunk_delay.as_millis(),
+                            adjustment.health_stage
+                        ));
+                    }
                 }
-                for note in adjustment.notes {
-                    warnings.push(note);
+                if !override_mode {
+                    for note in adjustment.notes {
+                        warnings.push(note);
+                    }
                 }
                 safety_actions.push(format!("local-health-monitor:{}", adjustment.health_stage));
                 if let Some(reason) = adjustment.emergency_brake_reason {
@@ -1167,6 +1201,8 @@ pub async fn run(
                 ),
                 safety_blacklist: safety_blacklist.clone(),
                 payload_budget: fingerprint_payload_budget.max(1),
+                version_intensity,
+                version_trace,
             },
         )
         .await;

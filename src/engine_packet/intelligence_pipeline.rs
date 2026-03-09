@@ -13,7 +13,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
-use crate::fingerprint_db::{FingerprintDatabase, ProbeProtocol};
+use crate::fingerprint_db::{
+    FingerprintDatabase, FingerprintMatch, ProbePayloadPlan, ProbeProtocol,
+};
 use crate::models::{PortFinding, PortState, ServiceIdentity};
 
 #[derive(Debug, Clone, Default)]
@@ -29,6 +31,8 @@ pub struct MultiStageProbePolicy {
     pub fragile_mode: bool,
     pub safety_blacklist: Vec<u16>,
     pub payload_budget: usize,
+    pub version_intensity: u8,
+    pub version_trace: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +43,7 @@ struct PortProbeUpdate {
     service_identity: Option<ServiceIdentity>,
     matched_by: Option<String>,
     confidence: Option<f32>,
+    trace_note: Option<String>,
     stage: &'static str,
 }
 
@@ -92,6 +97,8 @@ pub async fn run_multi_stage_tcp_probe_pipeline(
         .clamp(1, concurrency_cap)
         .min(candidates.len().max(1));
     let payload_budget = policy.payload_budget.max(1);
+    let version_intensity = policy.version_intensity;
+    let version_trace = policy.version_trace;
     let mut in_flight = FuturesUnordered::new();
 
     while !candidates.is_empty() || !in_flight.is_empty() {
@@ -101,7 +108,17 @@ pub async fn run_multi_stage_tcp_probe_pipeline(
             };
             let db = Arc::clone(&fingerprint_db);
             in_flight.push(tokio::spawn(async move {
-                probe_open_tcp_port(index, target, port, db, timeout_budget, payload_budget).await
+                probe_open_tcp_port(
+                    index,
+                    target,
+                    port,
+                    db,
+                    timeout_budget,
+                    payload_budget,
+                    version_intensity,
+                    version_trace,
+                )
+                .await
             }));
             report.tasks_spawned += 1;
         }
@@ -127,6 +144,9 @@ pub async fn run_multi_stage_tcp_probe_pipeline(
                 if update.confidence.is_some() {
                     finding.confidence = update.confidence;
                 }
+                if update.trace_note.is_some() {
+                    finding.educational_note = update.trace_note;
+                }
                 finding.reason = format!("{}; stage2={}", finding.reason, update.stage);
             }
         }
@@ -146,28 +166,45 @@ async fn probe_open_tcp_port(
     fingerprint_db: Arc<FingerprintDatabase>,
     timeout_budget: Duration,
     payload_budget: usize,
+    version_intensity: u8,
+    version_trace: bool,
 ) -> Option<PortProbeUpdate> {
     let generic = generic_probe_payload(port);
     let mut best_banner = None::<String>;
+    let mut trace_steps = Vec::<String>::new();
+    if version_trace {
+        trace_steps.push(format!(
+            "stage2-intensity={} budget={}",
+            version_intensity, payload_budget
+        ));
+        trace_steps.push(format!("generic-probe={}B", generic.len()));
+    }
     if let Some(raw) = tcp_probe_roundtrip(target, port, &generic, timeout_budget).await {
         let banner = sanitize_banner(&raw);
         if !banner.is_empty() {
             best_banner = Some(banner.clone());
         }
+        if version_trace {
+            trace_steps.push(format!("generic-recv={}B", raw.len()));
+        }
         if let Some(matched) = fingerprint_db.match_banner(ProbeProtocol::Tcp, port, &raw) {
-            return Some(PortProbeUpdate {
+            return Some(port_probe_update_from_match(
                 index,
-                banner: best_banner,
-                service: Some(matched.service),
-                service_identity: Some(matched.identity),
-                matched_by: Some(if matched.soft {
-                    format!("fingerprint-soft:{}", matched.source)
-                } else {
-                    format!("fingerprint-hard:{}", matched.source)
-                }),
-                confidence: Some(matched.confidence),
-                stage: "generic-match",
-            });
+                best_banner,
+                matched,
+                "generic-match",
+                trace_steps,
+            ));
+        }
+        if let Some(matched) = fingerprint_db.heuristic_banner_match(ProbeProtocol::Tcp, port, &raw)
+        {
+            return Some(port_probe_update_from_match(
+                index,
+                best_banner,
+                matched,
+                "generic-heuristic-match",
+                trace_steps,
+            ));
         }
         if let Some(heuristic) = infer_service_from_banner(&raw) {
             return Some(PortProbeUpdate {
@@ -177,6 +214,7 @@ async fn probe_open_tcp_port(
                 service_identity: None,
                 matched_by: Some("banner-heuristic".to_string()),
                 confidence: Some(0.57),
+                trace_note: version_trace.then(|| render_version_trace(&trace_steps)),
                 stage: "generic-heuristic",
             });
         }
@@ -191,39 +229,60 @@ async fn probe_open_tcp_port(
             service_identity: None,
             matched_by: None,
             confidence: None,
+            trace_note: version_trace.then(|| render_version_trace(&trace_steps)),
             stage: "banner-only",
         });
     }
 
-    let mut payloads =
-        fingerprint_db.payloads_for(ProbeProtocol::Tcp, port, targeted_payload_budget);
+    let mut payloads = fingerprint_db.payload_plan_for(
+        ProbeProtocol::Tcp,
+        port,
+        targeted_payload_budget,
+        version_intensity,
+    );
     if payloads.is_empty() {
-        payloads.push(b"\r\n".to_vec());
+        payloads.push(ProbePayloadPlan {
+            bytes: b"\r\n".to_vec(),
+            source: "default-probe".to_string(),
+            rarity: 1,
+        });
     }
     for payload in payloads {
-        if payload == generic {
+        if payload.bytes == generic {
             continue;
         }
-        if let Some(raw) = tcp_probe_roundtrip(target, port, &payload, timeout_budget).await {
+        if version_trace {
+            trace_steps.push(payload_trace_label("probe", &payload));
+        }
+        if let Some(raw) = tcp_probe_roundtrip(target, port, &payload.bytes, timeout_budget).await {
             let banner = sanitize_banner(&raw);
             if best_banner.is_none() && !banner.is_empty() {
                 best_banner = Some(banner);
             }
+            if version_trace {
+                trace_steps.push(format!("recv={}B", raw.len()));
+            }
 
             if let Some(matched) = fingerprint_db.match_banner(ProbeProtocol::Tcp, port, &raw) {
-                return Some(PortProbeUpdate {
+                return Some(port_probe_update_from_match(
                     index,
-                    banner: best_banner,
-                    service: Some(matched.service),
-                    service_identity: Some(matched.identity),
-                    matched_by: Some(if matched.soft {
-                        format!("fingerprint-soft:{}", matched.source)
-                    } else {
-                        format!("fingerprint-hard:{}", matched.source)
-                    }),
-                    confidence: Some(matched.confidence),
-                    stage: "targeted-match",
-                });
+                    best_banner,
+                    matched,
+                    "targeted-match",
+                    trace_steps,
+                ));
+            }
+
+            if let Some(matched) =
+                fingerprint_db.heuristic_banner_match(ProbeProtocol::Tcp, port, &raw)
+            {
+                return Some(port_probe_update_from_match(
+                    index,
+                    best_banner,
+                    matched,
+                    "targeted-heuristic-match",
+                    trace_steps,
+                ));
             }
 
             if let Some(heuristic) = infer_service_from_banner(&raw) {
@@ -234,9 +293,12 @@ async fn probe_open_tcp_port(
                     service_identity: None,
                     matched_by: Some("banner-heuristic".to_string()),
                     confidence: Some(0.57),
+                    trace_note: version_trace.then(|| render_version_trace(&trace_steps)),
                     stage: "targeted-heuristic",
                 });
             }
+        } else if version_trace {
+            trace_steps.push("probe=no-response".to_string());
         }
     }
 
@@ -247,8 +309,62 @@ async fn probe_open_tcp_port(
         service_identity: None,
         matched_by: None,
         confidence: None,
+        trace_note: version_trace.then(|| render_version_trace(&trace_steps)),
         stage: "banner-only",
     })
+}
+
+fn port_probe_update_from_match(
+    index: usize,
+    banner: Option<String>,
+    matched: FingerprintMatch,
+    stage: &'static str,
+    trace_steps: Vec<String>,
+) -> PortProbeUpdate {
+    let matched_by = fingerprint_match_label(&matched);
+    PortProbeUpdate {
+        index,
+        banner,
+        service: Some(matched.service),
+        service_identity: Some(matched.identity),
+        matched_by: Some(matched_by),
+        confidence: Some(matched.confidence),
+        trace_note: (!trace_steps.is_empty()).then(|| render_version_trace(&trace_steps)),
+        stage,
+    }
+}
+
+fn fingerprint_match_label(matched: &FingerprintMatch) -> String {
+    if matched.heuristic {
+        format!("fingerprint-heuristic:{}", matched.source)
+    } else if matched.soft {
+        format!("fingerprint-soft:{}", matched.source)
+    } else {
+        format!("fingerprint-hard:{}", matched.source)
+    }
+}
+
+fn payload_trace_label(phase: &str, payload: &ProbePayloadPlan) -> String {
+    format!(
+        "{phase}={} rarity={} bytes={}",
+        payload.source,
+        payload.rarity,
+        payload.bytes.len()
+    )
+}
+
+fn render_version_trace(steps: &[String]) -> String {
+    let mut rendered = steps
+        .iter()
+        .filter(|step| !step.is_empty())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" -> ");
+    if rendered.len() > 240 {
+        rendered.truncate(237);
+        rendered.push_str("...");
+    }
+    format!("version-trace: {rendered}")
 }
 
 async fn tcp_probe_roundtrip(
@@ -387,6 +503,8 @@ mod tests {
                 fragile_mode: false,
                 safety_blacklist: Vec::new(),
                 payload_budget: 4,
+                version_intensity: 7,
+                version_trace: false,
             },
         )
         .await;
@@ -429,6 +547,8 @@ mod tests {
                 fragile_mode: false,
                 safety_blacklist: Vec::new(),
                 payload_budget: 4,
+                version_intensity: 7,
+                version_trace: false,
             },
         ));
         assert_eq!(report.tasks_spawned, 0);

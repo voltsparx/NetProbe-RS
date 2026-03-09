@@ -3,8 +3,11 @@ name = "nprobe-rs"
 version = "4.5.0"
 edition = "2021"
 authors = ["voltsparx"]
-description = "Nmap-inspired network recon scanner in Rust with explainable output."
+description = "Rust network scanner for authorized internal and lab use with explainable output."
 license = "MIT"
+readme = "README.md"
+keywords = ["network", "scanner", "security", "cli", "defensive"]
+categories = ["command-line-utilities", "network-programming"]
 
 [package.metadata.nprobe-rs]
 release_theme = "Rusty Nail"

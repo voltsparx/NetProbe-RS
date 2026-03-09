@@ -2,7 +2,9 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::io::ErrorKind;
 use std::net::Ipv4Addr;
+use std::ops::Range;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -115,7 +117,13 @@ impl RawSynScanner {
         TX: RawTxBackend,
         RX: RawRxBackend,
     {
-        self.run_with_tx_backends(vec![Box::new(tx_backend)], rx_backend, targets)
+        let shared_targets = Arc::<[(Ipv4Addr, u16)]>::from(targets.to_vec());
+        self.run_with_tx_backends_range(
+            vec![Box::new(tx_backend)],
+            rx_backend,
+            shared_targets,
+            0..targets.len(),
+        )
     }
 
     pub fn run_with_tx_factory<RX, F>(
@@ -128,29 +136,47 @@ impl RawSynScanner {
         RX: RawRxBackend,
         F: FnMut(usize) -> io::Result<Box<dyn RawTxBackend>>,
     {
-        if targets.is_empty() {
+        let shared_targets = Arc::<[(Ipv4Addr, u16)]>::from(targets.to_vec());
+        self.run_with_tx_factory_range(tx_factory, rx_backend, shared_targets, 0..targets.len())
+    }
+
+    pub fn run_with_tx_factory_range<RX, F>(
+        &self,
+        mut tx_factory: F,
+        rx_backend: RX,
+        targets: Arc<[(Ipv4Addr, u16)]>,
+        range: Range<usize>,
+    ) -> io::Result<Vec<RawSynResult>>
+    where
+        RX: RawRxBackend,
+        F: FnMut(usize) -> io::Result<Box<dyn RawTxBackend>>,
+    {
+        let target_count = validate_target_range(targets.as_ref(), &range)?;
+        if target_count == 0 {
             return Ok(Vec::new());
         }
 
-        let workers = self.effective_tx_workers(targets.len());
+        let workers = self.effective_tx_workers(target_count);
         let mut tx_backends = Vec::<Box<dyn RawTxBackend>>::with_capacity(workers);
         for worker_id in 0..workers {
             tx_backends.push(tx_factory(worker_id)?);
         }
 
-        self.run_with_tx_backends(tx_backends, rx_backend, targets)
+        self.run_with_tx_backends_range(tx_backends, rx_backend, targets, range)
     }
 
-    fn run_with_tx_backends<RX>(
+    fn run_with_tx_backends_range<RX>(
         &self,
         tx_backends: Vec<Box<dyn RawTxBackend>>,
         mut rx_backend: RX,
-        targets: &[(Ipv4Addr, u16)],
+        targets: Arc<[(Ipv4Addr, u16)]>,
+        range: Range<usize>,
     ) -> io::Result<Vec<RawSynResult>>
     where
         RX: RawRxBackend,
     {
-        if targets.is_empty() {
+        let target_count = validate_target_range(targets.as_ref(), &range)?;
+        if target_count == 0 {
             return Ok(Vec::new());
         }
         if tx_backends.is_empty() {
@@ -163,11 +189,12 @@ impl RawSynScanner {
         let rate_pps = self.config.rate_pps;
         let burst_size = self.config.burst_size.max(1);
         let tx_batch_size = self.config.tx_batch_size.max(1) as u64;
-        let worker_count = tx_backends.len().min(targets.len().max(1));
-        let tx_targets = Arc::new(targets.to_vec());
-        let permutation = Arc::new(BlackrockPermutation::new(tx_targets.len(), scan_seed));
+        let worker_count = tx_backends.len().min(target_count.max(1));
+        let tx_targets = targets;
+        let permutation = Arc::new(BlackrockPermutation::new(target_count, scan_seed));
+        let range_start = range.start;
 
-        let result_capacity = targets.len().saturating_mul(2).clamp(256, 262_144);
+        let result_capacity = target_count.saturating_mul(2).clamp(256, 262_144);
         let result_queue = Arc::new(ArrayQueue::<RawSynResult>::new(result_capacity));
         let error_queue = Arc::new(ArrayQueue::<io::Error>::new(worker_count.saturating_add(8)));
         let stop = Arc::new(AtomicBool::new(false));
@@ -218,7 +245,7 @@ impl RawSynScanner {
 
                 let mut logical_index = worker_id;
                 let mut sent_packets = 0u64;
-                while logical_index < tx_targets.len() {
+                while logical_index < target_count {
                     if tx_stop.load(Ordering::Relaxed) {
                         break;
                     }
@@ -227,22 +254,52 @@ impl RawSynScanner {
                     let permits = limiter.acquire_batch_blocking(adaptive_batch);
                     let mut dispatched = 0u64;
                     while dispatched < permits {
-                        if logical_index >= tx_targets.len() || tx_stop.load(Ordering::Relaxed) {
+                        if logical_index >= target_count || tx_stop.load(Ordering::Relaxed) {
                             break;
                         }
 
                         let permuted = permutation.at(logical_index);
-                        logical_index = logical_index.saturating_add(worker_count);
-                        let (target_ip, target_port) = tx_targets[permuted];
+                        let physical_index = range_start + permuted;
+                        let (target_ip, target_port) = tx_targets[physical_index];
                         let sequence =
                             stateless_syn_cookie_sequence(target_ip, target_port, scan_seed);
 
                         match crafter.craft_syn(target_ip, target_port, sequence) {
                             Ok(packet) => {
-                                if let Err(err) = tx_backend.send_ipv4(packet, target_ip) {
-                                    tx_stop.store(true, Ordering::Relaxed);
-                                    let _ = push_lock_free(&tx_error_queue, err, &tx_stop);
-                                    return;
+                                let mut pressure_retry = 0u8;
+                                loop {
+                                    match tx_backend.send_ipv4(packet, target_ip) {
+                                        Ok(()) => {
+                                            logical_index =
+                                                logical_index.saturating_add(worker_count);
+                                            dispatched += 1;
+                                            sent_packets = sent_packets.saturating_add(1);
+                                            break;
+                                        }
+                                        Err(err) if is_transient_tx_pressure(&err) => {
+                                            pressure_retry = pressure_retry.saturating_add(1);
+                                            if pressure_retry > 8 {
+                                                tx_stop.store(true, Ordering::Relaxed);
+                                                let _ = push_lock_free(
+                                                    &tx_error_queue,
+                                                    io::Error::new(
+                                                        ErrorKind::WouldBlock,
+                                                        format!(
+                                                            "packet backend remained saturated after repeated retries: {err}"
+                                                        ),
+                                                    ),
+                                                    &tx_stop,
+                                                );
+                                                return;
+                                            }
+                                            thread::sleep(tx_pressure_retry_delay(pressure_retry));
+                                        }
+                                        Err(err) => {
+                                            tx_stop.store(true, Ordering::Relaxed);
+                                            let _ = push_lock_free(&tx_error_queue, err, &tx_stop);
+                                            return;
+                                        }
+                                    }
                                 }
                             }
                             Err(err) => {
@@ -251,9 +308,6 @@ impl RawSynScanner {
                                 return;
                             }
                         }
-
-                        dispatched += 1;
-                        sent_packets = sent_packets.saturating_add(1);
                     }
                 }
             });
@@ -276,7 +330,7 @@ impl RawSynScanner {
             return Err(err);
         }
 
-        let mut dedup = HashMap::<(Ipv4Addr, u16), RawSynResult>::with_capacity(targets.len());
+        let mut dedup = HashMap::<(Ipv4Addr, u16), RawSynResult>::with_capacity(target_count);
         while let Some(result) = result_queue.pop() {
             let key = (result.ip, result.port);
             dedup
@@ -292,6 +346,13 @@ impl RawSynScanner {
         values.sort_unstable_by_key(|value| (u32::from(value.ip), value.port));
         Ok(values)
     }
+}
+
+fn validate_target_range(targets: &[(Ipv4Addr, u16)], range: &Range<usize>) -> io::Result<usize> {
+    if range.start > range.end || range.end > targets.len() {
+        return Err(io::Error::other("invalid target range for raw syn scanner"));
+    }
+    Ok(range.end.saturating_sub(range.start))
 }
 
 fn split_u64(total: u64, workers: usize, worker_idx: usize) -> u64 {
@@ -328,6 +389,26 @@ fn push_lock_free<T>(queue: &ArrayQueue<T>, item: T, stop: &AtomicBool) -> bool 
             }
         }
     }
+}
+
+fn is_transient_tx_pressure(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        ErrorKind::WouldBlock
+            | ErrorKind::BrokenPipe
+            | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::Interrupted
+    ) || matches!(
+        err.raw_os_error(),
+        Some(11 | 32 | 103 | 104 | 105 | 10035 | 10053 | 10054 | 10055)
+    )
+}
+
+fn tx_pressure_retry_delay(attempt: u8) -> Duration {
+    let shift = u32::from(attempt.saturating_sub(1).min(5));
+    let millis = 1u64 << shift;
+    Duration::from_millis(millis.clamp(1, 32))
 }
 
 #[cfg(test)]
@@ -488,6 +569,49 @@ mod tests {
                 100,
                 tcp.get_sequence().wrapping_add(1),
                 response_flags,
+            )?;
+            self.responses
+                .lock()
+                .map_err(|_| io::Error::other("response queue poisoned"))?
+                .push_back(response);
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct FlakyTxBackend {
+        responses: Arc<Mutex<VecDeque<Vec<u8>>>>,
+        remaining_failures: Arc<Mutex<usize>>,
+    }
+
+    impl RawTxBackend for FlakyTxBackend {
+        fn send_ipv4(&mut self, packet: &[u8], _target: Ipv4Addr) -> io::Result<()> {
+            let mut remaining = self
+                .remaining_failures
+                .lock()
+                .map_err(|_| io::Error::other("failure budget poisoned"))?;
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Err(io::Error::new(
+                    ErrorKind::BrokenPipe,
+                    "simulated transient pipe saturation",
+                ));
+            }
+            drop(remaining);
+
+            let ipv4 = Ipv4Packet::new(packet)
+                .ok_or_else(|| io::Error::other("invalid tx ipv4 packet"))?;
+            let tcp = TcpPacket::new(ipv4.payload())
+                .ok_or_else(|| io::Error::other("invalid tx tcp packet"))?;
+
+            let response = build_tcp_ipv4_packet(
+                ipv4.get_destination(),
+                ipv4.get_source(),
+                tcp.get_destination(),
+                tcp.get_source(),
+                100,
+                tcp.get_sequence().wrapping_add(1),
+                TcpFlags::SYN | TcpFlags::ACK,
             )?;
             self.responses
                 .lock()
@@ -695,5 +819,40 @@ mod tests {
         assert!(results
             .iter()
             .any(|value| value.state == RawPortState::Closed));
+    }
+
+    #[test]
+    fn transient_pipe_errors_are_retried_before_failing() {
+        let responses = Arc::new(Mutex::new(VecDeque::new()));
+        let rx = MockRxBackend {
+            responses: Arc::clone(&responses),
+            current_frame: None,
+        };
+        let remaining_failures = Arc::new(Mutex::new(2usize));
+
+        let scanner = RawSynScanner::new(RawSynScannerConfig {
+            source_ip: Ipv4Addr::new(10, 0, 0, 5),
+            source_port: 40000,
+            rate_pps: 1000,
+            burst_size: 8,
+            tx_workers: 1,
+            tx_batch_size: 4,
+            rx_grace: Duration::from_millis(40),
+            scan_seed: 77,
+        });
+
+        let results = scanner
+            .run_with_backends(
+                FlakyTxBackend {
+                    responses,
+                    remaining_failures,
+                },
+                rx,
+                &[(Ipv4Addr::new(10, 0, 0, 10), 80)],
+            )
+            .expect("scan should succeed after transient retries");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].state, RawPortState::Open);
     }
 }

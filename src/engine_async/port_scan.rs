@@ -31,7 +31,13 @@ pub async fn run(
     let mut blocked_findings = Vec::new();
     let mut scan_ports = ports;
     let mut service_detection = request.service_detection;
-    let mut fingerprint_payload_budget = if service_detection { 4 } else { 0 };
+    let version_intensity = request.effective_version_intensity();
+    let version_trace = request.version_trace;
+    let mut fingerprint_payload_budget = if service_detection {
+        request.effective_version_payload_budget()
+    } else {
+        0
+    };
     let base_rate_pps = request.rate_limit_pps.unwrap_or(strategy.rate_limit_pps);
     let mut rate_limit_pps = base_rate_pps;
     let mut profile_class = None::<DeviceClass>;
@@ -340,7 +346,11 @@ pub async fn run(
         burst_size: request.burst_size.unwrap_or(strategy.burst_size),
         max_retries: request.max_retries.unwrap_or(strategy.max_retries),
         scan_seed: request.scan_seed,
+        sequential_port_order: request.sequential_port_order,
         fingerprint_payload_budget,
+        version_intensity,
+        version_trace,
+        source_port: request.source_port,
     };
 
     let (mut findings, task_count) = scanner::scan_ports(config, services).await;

@@ -21,9 +21,11 @@ pub fn render(report: &ScanReport) -> String {
     ));
     out.push_str(&format!("override_mode={}\n", report.request.override_mode));
     out.push_str(&format!(
-        "request ping_scan={} traceroute={} timing_template={}\n",
+        "request list_scan={} ping_scan={} traceroute={} sequential_port_order={} timing_template={}\n",
+        report.request.list_scan,
         report.request.ping_scan,
         report.request.traceroute,
+        report.request.sequential_port_order,
         report
             .request
             .timing_template

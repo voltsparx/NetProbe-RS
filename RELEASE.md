@@ -1,0 +1,48 @@
+# Release Checklist
+
+Use this checklist before publishing NProbe-RS or cutting a tagged release.
+
+## Scope Review
+
+- Confirm the README matches the currently supported live feature set.
+- Confirm `nprobe-rs --scan-types` reflects implemented versus cataloged scan concepts accurately.
+- Confirm examples use authorized internal or lab targets.
+
+## Build Verification
+
+Run the full local quality gate:
+
+```bash
+cargo fmt --all -- --check
+cargo check
+cargo test
+cargo build --release
+```
+
+Optional install smoke check:
+
+```bash
+cargo install --path .
+nprobe-rs --help
+nprobe-rs --scan-types
+```
+
+## Packaging Review
+
+- Bump `version` in `Cargo.toml` if this is a new release.
+- Review `Cargo.toml` metadata, license, and README for accuracy.
+- Review generated artifacts under `target/release/`.
+- Confirm platform install scripts under `building-scripts/` still match the current CLI.
+
+## Safety Review
+
+- Keep the documented usage restricted to authorized internal and lab environments.
+- Do not advertise cataloged or blocked concepts as live functionality.
+- Keep the safety defaults and guardrails enabled in the published branch.
+
+## Release Steps
+
+1. Commit the release-ready tree.
+2. Tag the version you are publishing.
+3. Publish the source or binary artifact through your chosen channel.
+4. Include the verification commands and supported scope in the release notes.

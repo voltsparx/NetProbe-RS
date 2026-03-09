@@ -12,3 +12,4 @@ pub mod reasoning;
 pub mod scoring;
 pub mod service_intelligence;
 pub mod service_knowledge;
+pub mod tbns_profiles;

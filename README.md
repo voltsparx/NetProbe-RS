@@ -1,8 +1,8 @@
 # NProbe-RS
 
-**NProbe-RS** is a Rust-native, explainable network reconnaissance tool focused on learning, safety, and actionable insights.
+**NProbe-RS** is a Rust-native network scanner for authorized internal and lab use, with explainable output, defensive defaults, and multi-engine execution.
 
-It reimplements proven network scanning concepts with a modern, safe architecture while helping users understand *why* results matter — not just what was found.
+It reimplements familiar scanning workflows with a modern Rust architecture while helping users understand *why* results matter, not just what was found.
 
 **Version**: v4.5 "Rusty Nail"  <br>
 **Edition**: 2026 Edition  <br>
@@ -22,6 +22,8 @@ Instead of only reporting open ports, it explains findings, highlights risks, an
 - 🧪 Lab environments
 - 🧑‍💻 Internal reviews
 - 🔬 Security research
+
+The project is publishable in its current supported scope as a defensive scanner. Concepts documented under `docs/scan-types/` are not automatically equivalent to live packet paths; use `nprobe-rs --scan-types` to inspect what is currently implemented versus cataloged.
 
 ---
 
@@ -74,9 +76,25 @@ NProbe-RS promotes responsible usage through built-in safeguards:
 
 ```bash
 cargo run -- 127.0.0.1 --explain
+cargo install --path .
 # after install:
 nprobe-rs 127.0.0.1 --top-ports 100
 ```
+
+---
+
+## ✅ Release Quality Gates
+
+Run these before publishing or tagging a release:
+
+```bash
+cargo fmt --all -- --check
+cargo check
+cargo test
+cargo build --release
+```
+
+For the full release checklist, see [RELEASE.md](RELEASE.md).
 
 ---
 
@@ -222,6 +240,8 @@ NProbe-RS is intended for:
 - defensive security research
 
 Always obtain proper authorization before scanning networks you do not own or manage.
+
+This repository intentionally favors bounded, explainable, low-impact behavior over stealth, spoofing, or deceptive packet injection.
 
 ---
 

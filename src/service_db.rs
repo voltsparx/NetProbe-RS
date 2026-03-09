@@ -11,6 +11,9 @@ use std::path::Path;
 pub struct ServiceRegistry {
     services: HashMap<(u16, String), String>,
     ranked_tcp_ports: Vec<u16>,
+    ranked_combined_ports: Vec<u16>,
+    tcp_frequencies: HashMap<u16, f64>,
+    combined_frequencies: HashMap<u16, f64>,
 }
 
 impl ServiceRegistry {
@@ -28,11 +31,27 @@ impl ServiceRegistry {
         self.services.get(&key).map(String::as_str)
     }
 
-    pub fn top_tcp_ports(&self, count: usize) -> Vec<u16> {
-        self.ranked_tcp_ports
+    pub fn top_ports_for_scan(&self, count: usize, include_udp: bool) -> Vec<u16> {
+        let ranking = if include_udp {
+            &self.ranked_combined_ports
+        } else {
+            &self.ranked_tcp_ports
+        };
+        ranking.iter().copied().take(count.max(1)).collect()
+    }
+
+    pub fn ports_by_ratio(&self, ratio: f64, include_udp: bool) -> Vec<u16> {
+        let normalized_ratio = ratio.clamp(0.0, 1.0);
+        let ranking = if include_udp {
+            &self.ranked_combined_ports
+        } else {
+            &self.ranked_tcp_ports
+        };
+
+        ranking
             .iter()
             .copied()
-            .take(count.max(1))
+            .filter(|port| self.frequency_for_scan(*port, include_udp) >= normalized_ratio)
             .collect()
     }
 
@@ -47,6 +66,8 @@ impl ServiceRegistry {
     fn from_nmap_services(content: &str) -> Self {
         let mut services = HashMap::new();
         let mut ranking = Vec::<(u16, f64)>::new();
+        let mut tcp_frequencies = HashMap::<u16, f64>::new();
+        let mut udp_frequencies = HashMap::<u16, f64>::new();
 
         for line in content.lines() {
             let trimmed = line.trim();
@@ -82,6 +103,15 @@ impl ServiceRegistry {
                 .or_insert(service_name);
             if proto == "tcp" {
                 ranking.push((port, freq));
+                tcp_frequencies
+                    .entry(port)
+                    .and_modify(|existing| *existing = existing.max(freq))
+                    .or_insert(freq);
+            } else if proto == "udp" {
+                udp_frequencies
+                    .entry(port)
+                    .and_modify(|existing| *existing = existing.max(freq))
+                    .or_insert(freq);
             }
         }
 
@@ -98,9 +128,32 @@ impl ServiceRegistry {
             return Self::fallback();
         }
 
+        let mut combined_frequencies = HashMap::<u16, f64>::new();
+        for (port, freq) in &tcp_frequencies {
+            combined_frequencies
+                .entry(*port)
+                .and_modify(|existing| *existing = existing.max(*freq))
+                .or_insert(*freq);
+        }
+        for (port, freq) in &udp_frequencies {
+            combined_frequencies
+                .entry(*port)
+                .and_modify(|existing| *existing = existing.max(*freq))
+                .or_insert(*freq);
+        }
+        let mut combined_ranking = combined_frequencies
+            .iter()
+            .map(|(port, freq)| (*port, *freq))
+            .collect::<Vec<_>>();
+        combined_ranking.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+        let ranked_combined_ports = combined_ranking.into_iter().map(|(port, _)| port).collect();
+
         Self {
             services,
             ranked_tcp_ports,
+            ranked_combined_ports,
+            tcp_frequencies,
+            combined_frequencies,
         }
     }
 
@@ -114,6 +167,8 @@ impl ServiceRegistry {
             27017, 161, 162, 123, 69, 500, 520, 1900, 5353, 67, 68, 514, 177, 4500, 1701,
         ];
         let mut services = HashMap::new();
+        let mut tcp_frequencies = HashMap::new();
+        let mut udp_frequencies = HashMap::new();
         let common = [
             (20, "tcp", "ftp-data"),
             (21, "tcp", "ftp"),
@@ -145,11 +200,42 @@ impl ServiceRegistry {
         ];
         for (port, proto, name) in common {
             services.insert((port, proto.to_string()), name.to_string());
+            let fallback_freq = 1.0 / (port as f64);
+            if proto == "tcp" {
+                tcp_frequencies.insert(port, fallback_freq);
+            } else if proto == "udp" {
+                udp_frequencies.insert(port, fallback_freq);
+            }
         }
+
+        let mut combined_frequencies = HashMap::new();
+        for (port, freq) in &tcp_frequencies {
+            combined_frequencies.insert(*port, *freq);
+        }
+        for (port, freq) in &udp_frequencies {
+            combined_frequencies
+                .entry(*port)
+                .and_modify(|existing| *existing = existing.max(*freq))
+                .or_insert(*freq);
+        }
+        let ranked_combined_ports = top_ports.clone();
 
         Self {
             services,
             ranked_tcp_ports: top_ports,
+            ranked_combined_ports,
+            tcp_frequencies,
+            combined_frequencies,
+        }
+    }
+}
+
+impl ServiceRegistry {
+    fn frequency_for_scan(&self, port: u16, include_udp: bool) -> f64 {
+        if include_udp {
+            self.combined_frequencies.get(&port).copied().unwrap_or(0.0)
+        } else {
+            self.tcp_frequencies.get(&port).copied().unwrap_or(0.0)
         }
     }
 }

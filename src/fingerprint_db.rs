@@ -31,6 +31,7 @@ pub struct FingerprintMatch {
     pub service: String,
     pub source: String,
     pub soft: bool,
+    pub heuristic: bool,
     pub confidence: f32,
     pub identity: ServiceIdentity,
 }
@@ -56,6 +57,13 @@ struct FingerprintRule {
     metadata: MatchMetadataTemplate,
 }
 
+#[derive(Debug, Clone)]
+pub struct ProbePayloadPlan {
+    pub bytes: Vec<u8>,
+    pub source: String,
+    pub rarity: u8,
+}
+
 impl FingerprintRule {
     fn applies_to(&self, protocol: ProbeProtocol, port: u16) -> bool {
         if let Some(rule_proto) = self.protocol {
@@ -69,10 +77,10 @@ impl FingerprintRule {
 
 #[derive(Debug, Clone)]
 pub struct FingerprintDatabase {
-    payloads_tcp_by_port: HashMap<u16, Vec<Vec<u8>>>,
-    payloads_udp_by_port: HashMap<u16, Vec<Vec<u8>>>,
-    payloads_tcp_generic: Vec<Vec<u8>>,
-    payloads_udp_generic: Vec<Vec<u8>>,
+    payloads_tcp_by_port: HashMap<u16, Vec<ProbePayloadPlan>>,
+    payloads_udp_by_port: HashMap<u16, Vec<ProbePayloadPlan>>,
+    payloads_tcp_generic: Vec<ProbePayloadPlan>,
+    payloads_udp_generic: Vec<ProbePayloadPlan>,
     hard_rules: Vec<FingerprintRule>,
     soft_rules: Vec<FingerprintRule>,
     stats: FingerprintStats,
@@ -84,6 +92,7 @@ struct ProbeContext {
     name: String,
     payload: Vec<u8>,
     ports: Vec<u16>,
+    rarity: u8,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -136,7 +145,8 @@ impl FingerprintDatabase {
         };
 
         if db.payloads_tcp_generic.is_empty() {
-            db.payloads_tcp_generic.push(b"\r\n".to_vec());
+            db.payloads_tcp_generic
+                .push(probe_payload("fallback-generic", b"\r\n".to_vec(), 1));
         }
 
         db
@@ -146,8 +156,8 @@ impl FingerprintDatabase {
         Self {
             payloads_tcp_by_port: HashMap::new(),
             payloads_udp_by_port: HashMap::new(),
-            payloads_tcp_generic: vec![b"\r\n".to_vec()],
-            payloads_udp_generic: vec![vec![0x00]],
+            payloads_tcp_generic: vec![probe_payload("fallback-generic", b"\r\n".to_vec(), 1)],
+            payloads_udp_generic: vec![probe_payload("fallback-udp-generic", vec![0x00], 1)],
             hard_rules: Vec::new(),
             soft_rules: Vec::new(),
             stats: FingerprintStats {
@@ -165,9 +175,16 @@ impl FingerprintDatabase {
         &self.stats
     }
 
-    pub fn payloads_for(&self, protocol: ProbeProtocol, port: u16, limit: usize) -> Vec<Vec<u8>> {
+    pub fn payload_plan_for(
+        &self,
+        protocol: ProbeProtocol,
+        port: u16,
+        limit: usize,
+        intensity: u8,
+    ) -> Vec<ProbePayloadPlan> {
         let max_items = limit.max(1);
-        let mut out = Vec::<Vec<u8>>::new();
+        let mut out = Vec::<ProbePayloadPlan>::new();
+        let effective_intensity = intensity.min(9);
 
         let (port_map, generic) = match protocol {
             ProbeProtocol::Tcp => (&self.payloads_tcp_by_port, &self.payloads_tcp_generic),
@@ -175,20 +192,14 @@ impl FingerprintDatabase {
         };
 
         if let Some(items) = port_map.get(&port) {
-            for item in items.iter().take(max_items) {
-                push_unique_payload(&mut out, item);
-                if out.len() >= max_items {
-                    return out;
-                }
+            extend_payload_plan(&mut out, items, effective_intensity, max_items);
+            if out.len() >= max_items {
+                return out;
             }
         }
 
-        for item in generic.iter().take(max_items) {
-            push_unique_payload(&mut out, item);
-            if out.len() >= max_items {
-                break;
-            }
-        }
+        extend_payload_plan(&mut out, generic, effective_intensity, max_items);
+        out.truncate(max_items);
 
         out
     }
@@ -199,10 +210,14 @@ impl FingerprintDatabase {
         port: u16,
         banner: &[u8],
     ) -> Option<FingerprintMatch> {
+        let mut best: Option<(FingerprintMatch, usize)> = None;
+
         for rule in &self.hard_rules {
             if rule.applies_to(protocol, port) {
                 if let Some(captures) = rule.regex.captures(banner) {
-                    return Some(build_fingerprint_match(rule, captures, false));
+                    let matched = build_fingerprint_match(rule, captures, false);
+                    let score = rule_match_score(rule, &matched, false);
+                    record_best_match(&mut best, matched, score);
                 }
             }
         }
@@ -210,12 +225,26 @@ impl FingerprintDatabase {
         for rule in &self.soft_rules {
             if rule.applies_to(protocol, port) {
                 if let Some(captures) = rule.regex.captures(banner) {
-                    return Some(build_fingerprint_match(rule, captures, true));
+                    let matched = build_fingerprint_match(rule, captures, true);
+                    let score = rule_match_score(rule, &matched, true);
+                    record_best_match(&mut best, matched, score);
                 }
             }
         }
 
-        None
+        best.map(|(matched, _)| matched)
+    }
+
+    pub fn heuristic_banner_match(
+        &self,
+        protocol: ProbeProtocol,
+        port: u16,
+        banner: &[u8],
+    ) -> Option<FingerprintMatch> {
+        match protocol {
+            ProbeProtocol::Tcp => heuristic_tcp_banner_match(port, banner),
+            ProbeProtocol::Udp => heuristic_udp_banner_match(port, banner),
+        }
     }
 
     fn from_service_probes(
@@ -227,10 +256,10 @@ impl FingerprintDatabase {
     ) -> Self {
         const MAX_GENERIC_RULES_PER_PROTOCOL: usize = 60;
         const MAX_RULES_PER_PORT_PROTOCOL: usize = 120;
-        let mut payloads_tcp_by_port = HashMap::<u16, Vec<Vec<u8>>>::new();
-        let mut payloads_udp_by_port = HashMap::<u16, Vec<Vec<u8>>>::new();
-        let mut payloads_tcp_generic = Vec::<Vec<u8>>::new();
-        let mut payloads_udp_generic = Vec::<Vec<u8>>::new();
+        let mut payloads_tcp_by_port = HashMap::<u16, Vec<ProbePayloadPlan>>::new();
+        let mut payloads_udp_by_port = HashMap::<u16, Vec<ProbePayloadPlan>>::new();
+        let mut payloads_tcp_generic = Vec::<ProbePayloadPlan>::new();
+        let mut payloads_udp_generic = Vec::<ProbePayloadPlan>::new();
         let mut hard_rules = Vec::<FingerprintRule>::new();
         let mut soft_rules = Vec::<FingerprintRule>::new();
         let mut rules_loaded = 0usize;
@@ -272,6 +301,15 @@ impl FingerprintDatabase {
             if let Some(rest) = trimmed.strip_prefix("sslports ") {
                 if let Some(probe) = current_probe.as_mut() {
                     probe.ports = parse_ports_expr(rest, probe.protocol);
+                }
+                continue;
+            }
+
+            if let Some(rest) = trimmed.strip_prefix("rarity ") {
+                if let Some(probe) = current_probe.as_mut() {
+                    if let Ok(rarity) = rest.trim().parse::<u8>() {
+                        probe.rarity = rarity.clamp(1, 9);
+                    }
                 }
                 continue;
             }
@@ -327,50 +365,98 @@ impl FingerprintDatabase {
         let mut payloads_tcp_by_port = HashMap::new();
         payloads_tcp_by_port.insert(
             80,
-            vec![b"HEAD / HTTP/1.0\r\nHost: target\r\n\r\n".to_vec()],
+            vec![probe_payload(
+                "fallback-head",
+                b"HEAD / HTTP/1.0\r\nHost: target\r\n\r\n".to_vec(),
+                1,
+            )],
         );
-        payloads_tcp_by_port.insert(21, vec![b"HELP\r\n".to_vec()]);
-        payloads_tcp_by_port.insert(25, vec![b"EHLO nprobe.local\r\n".to_vec()]);
-        payloads_tcp_by_port.insert(110, vec![b"CAPA\r\n".to_vec()]);
-        payloads_tcp_by_port.insert(143, vec![b"A1 CAPABILITY\r\n".to_vec()]);
-        payloads_tcp_by_port.insert(6379, vec![b"PING\r\n".to_vec()]);
+        payloads_tcp_by_port.insert(
+            21,
+            vec![probe_payload("fallback-help", b"HELP\r\n".to_vec(), 1)],
+        );
+        payloads_tcp_by_port.insert(
+            25,
+            vec![probe_payload(
+                "fallback-ehlo",
+                b"EHLO nprobe.local\r\n".to_vec(),
+                1,
+            )],
+        );
+        payloads_tcp_by_port.insert(
+            110,
+            vec![probe_payload("fallback-capa", b"CAPA\r\n".to_vec(), 1)],
+        );
+        payloads_tcp_by_port.insert(
+            143,
+            vec![probe_payload(
+                "fallback-imap-capability",
+                b"A1 CAPABILITY\r\n".to_vec(),
+                1,
+            )],
+        );
+        payloads_tcp_by_port.insert(
+            6379,
+            vec![probe_payload(
+                "fallback-redis-ping",
+                b"PING\r\n".to_vec(),
+                1,
+            )],
+        );
         let mut payloads_udp_by_port = HashMap::new();
         // DNS standard query: A record for root label.
         payloads_udp_by_port.insert(
             53,
-            vec![vec![
-                0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x01, 0x00, 0x01,
-            ]],
+            vec![probe_payload(
+                "fallback-dns-a",
+                vec![
+                    0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x01, 0x00, 0x01,
+                ],
+                1,
+            )],
         );
         // Minimal SNMPv1 GetRequest for sysDescr.0 using community "public".
         payloads_udp_by_port.insert(
             161,
-            vec![vec![
-                0x30, 0x26, 0x02, 0x01, 0x00, 0x04, 0x06, b'p', b'u', b'b', b'l', b'i', b'c', 0xa0,
-                0x19, 0x02, 0x04, 0x70, 0x71, 0x72, 0x73, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x30,
-                0x0b, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x06, 0x01, 0x02, 0x01, 0x05, 0x00,
-            ]],
+            vec![probe_payload(
+                "fallback-snmp-sysdescr",
+                vec![
+                    0x30, 0x26, 0x02, 0x01, 0x00, 0x04, 0x06, b'p', b'u', b'b', b'l', b'i', b'c',
+                    0xa0, 0x19, 0x02, 0x04, 0x70, 0x71, 0x72, 0x73, 0x02, 0x01, 0x00, 0x02, 0x01,
+                    0x00, 0x30, 0x0b, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x06, 0x01, 0x02, 0x01, 0x05,
+                    0x00,
+                ],
+                1,
+            )],
         );
         // NTP client mode request.
         payloads_udp_by_port.insert(
             123,
-            vec![{
-                let mut ntp = vec![0u8; 48];
-                ntp[0] = 0x1b;
-                ntp
-            }],
+            vec![probe_payload(
+                "fallback-ntp-client",
+                {
+                    let mut ntp = vec![0u8; 48];
+                    ntp[0] = 0x1b;
+                    ntp
+                },
+                1,
+            )],
         );
         payloads_udp_by_port.insert(
             1900,
-            vec![b"M-SEARCH * HTTP/1.1\r\nHOST:239.255.255.250:1900\r\nMAN:\"ssdp:discover\"\r\nMX:1\r\nST:ssdp:all\r\n\r\n".to_vec()],
+            vec![probe_payload(
+                "fallback-ssdp-msearch",
+                b"M-SEARCH * HTTP/1.1\r\nHOST:239.255.255.250:1900\r\nMAN:\"ssdp:discover\"\r\nMX:1\r\nST:ssdp:all\r\n\r\n".to_vec(),
+                1,
+            )],
         );
 
         Self {
             payloads_tcp_by_port,
             payloads_udp_by_port,
-            payloads_tcp_generic: vec![b"\r\n".to_vec()],
-            payloads_udp_generic: vec![vec![0x00]],
+            payloads_tcp_generic: vec![probe_payload("fallback-generic", b"\r\n".to_vec(), 1)],
+            payloads_udp_generic: vec![probe_payload("fallback-udp-generic", vec![0x00], 1)],
             hard_rules: Vec::new(),
             soft_rules: Vec::new(),
             stats: FingerprintStats {
@@ -383,6 +469,49 @@ impl FingerprintDatabase {
             },
         }
     }
+}
+
+fn record_best_match(
+    best: &mut Option<(FingerprintMatch, usize)>,
+    matched: FingerprintMatch,
+    score: usize,
+) {
+    match best {
+        Some((_, best_score)) if *best_score >= score => {}
+        _ => *best = Some((matched, score)),
+    }
+}
+
+fn rule_match_score(rule: &FingerprintRule, matched: &FingerprintMatch, soft: bool) -> usize {
+    let metadata_fields = [
+        matched.identity.product.as_ref(),
+        matched.identity.version.as_ref(),
+        matched.identity.info.as_ref(),
+        matched.identity.hostname.as_ref(),
+        matched.identity.operating_system.as_ref(),
+        matched.identity.device_type.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .count();
+
+    let specificity = if rule.ports.is_empty() {
+        0
+    } else {
+        24 + 40 / rule.ports.len().max(1)
+    };
+    let protocol_bias = usize::from(rule.protocol.is_some()) * 10;
+    let cpe_bias = matched.identity.cpes.len() * 8;
+    let pattern_bias = rule.regex.as_str().len().min(96) / 6;
+    let confidence_bias = (matched.confidence * 100.0) as usize / 4;
+
+    (if soft { 100 } else { 200 })
+        + specificity
+        + protocol_bias
+        + cpe_bias
+        + metadata_fields * 10
+        + pattern_bias
+        + confidence_bias
 }
 
 fn rule_relevant(
@@ -468,6 +597,7 @@ fn parse_probe_line(line: &str) -> Option<ProbeContext> {
         name,
         payload,
         ports: Vec::new(),
+        rarity: 5,
     })
 }
 
@@ -539,10 +669,10 @@ fn normalized_ports(ports: &[u16]) -> Vec<u16> {
 
 fn add_probe_payload(
     probe: ProbeContext,
-    payloads_tcp_by_port: &mut HashMap<u16, Vec<Vec<u8>>>,
-    payloads_udp_by_port: &mut HashMap<u16, Vec<Vec<u8>>>,
-    payloads_tcp_generic: &mut Vec<Vec<u8>>,
-    payloads_udp_generic: &mut Vec<Vec<u8>>,
+    payloads_tcp_by_port: &mut HashMap<u16, Vec<ProbePayloadPlan>>,
+    payloads_udp_by_port: &mut HashMap<u16, Vec<ProbePayloadPlan>>,
+    payloads_tcp_generic: &mut Vec<ProbePayloadPlan>,
+    payloads_udp_generic: &mut Vec<ProbePayloadPlan>,
     payloads_loaded: &mut usize,
 ) {
     if probe.payload.is_empty() {
@@ -550,10 +680,11 @@ fn add_probe_payload(
     }
 
     *payloads_loaded += 1;
+    let payload = probe_payload(&probe.name, probe.payload.clone(), probe.rarity);
     if probe.ports.is_empty() {
         match probe.protocol {
-            ProbeProtocol::Tcp => push_unique_payload(payloads_tcp_generic, &probe.payload),
-            ProbeProtocol::Udp => push_unique_payload(payloads_udp_generic, &probe.payload),
+            ProbeProtocol::Tcp => push_unique_payload(payloads_tcp_generic, &payload),
+            ProbeProtocol::Udp => push_unique_payload(payloads_udp_generic, &payload),
         }
         return;
     }
@@ -563,7 +694,7 @@ fn add_probe_payload(
             for port in probe.ports.iter().copied() {
                 let bucket = payloads_tcp_by_port.entry(port).or_default();
                 if bucket.len() < 8 {
-                    push_unique_payload(bucket, &probe.payload);
+                    push_unique_payload(bucket, &payload);
                 }
             }
         }
@@ -571,16 +702,63 @@ fn add_probe_payload(
             for port in probe.ports.iter().copied() {
                 let bucket = payloads_udp_by_port.entry(port).or_default();
                 if bucket.len() < 6 {
-                    push_unique_payload(bucket, &probe.payload);
+                    push_unique_payload(bucket, &payload);
                 }
             }
         }
     }
 }
 
-fn push_unique_payload(bucket: &mut Vec<Vec<u8>>, payload: &[u8]) {
-    if !bucket.iter().any(|item| item == payload) {
-        bucket.push(payload.to_vec());
+fn push_unique_payload(bucket: &mut Vec<ProbePayloadPlan>, payload: &ProbePayloadPlan) {
+    if let Some(existing) = bucket.iter_mut().find(|item| item.bytes == payload.bytes) {
+        if payload.rarity < existing.rarity {
+            *existing = payload.clone();
+        }
+    } else {
+        bucket.push(payload.clone());
+    }
+}
+
+fn probe_payload(source: &str, bytes: Vec<u8>, rarity: u8) -> ProbePayloadPlan {
+    ProbePayloadPlan {
+        bytes,
+        source: source.to_string(),
+        rarity: rarity.clamp(1, 9),
+    }
+}
+
+fn extend_payload_plan(
+    out: &mut Vec<ProbePayloadPlan>,
+    items: &[ProbePayloadPlan],
+    intensity: u8,
+    max_items: usize,
+) {
+    if items.is_empty() || out.len() >= max_items {
+        return;
+    }
+
+    let mut preferred = items
+        .iter()
+        .filter(|item| item.rarity <= intensity)
+        .cloned()
+        .collect::<Vec<_>>();
+    if preferred.is_empty() {
+        if let Some(fallback) = items.iter().min_by_key(|item| item.rarity) {
+            preferred.push(fallback.clone());
+        }
+    }
+
+    preferred.sort_by(|left, right| {
+        left.rarity
+            .cmp(&right.rarity)
+            .then_with(|| left.source.cmp(&right.source))
+    });
+
+    for item in preferred {
+        push_unique_payload(out, &item);
+        if out.len() >= max_items {
+            break;
+        }
     }
 }
 
@@ -725,6 +903,7 @@ fn build_fingerprint_match(
         service: rule.service.clone(),
         source: rule.source.clone(),
         soft,
+        heuristic: false,
         confidence: if soft { 0.64 } else { 0.93 },
         identity: ServiceIdentity {
             product: expand_template_opt(rule.metadata.product.as_deref(), &captures),
@@ -928,6 +1107,730 @@ fn sanitize_banner_like(raw: &[u8]) -> String {
     out.trim().to_string()
 }
 
+fn heuristic_tcp_banner_match(port: u16, banner: &[u8]) -> Option<FingerprintMatch> {
+    let banner_text = String::from_utf8_lossy(banner);
+    let sanitized = sanitize_banner_like(banner);
+
+    heuristic_ssh_banner_match(&sanitized)
+        .or_else(|| heuristic_http_banner_match(port, &banner_text, &sanitized, false))
+        .or_else(|| heuristic_smtp_banner_match(&sanitized))
+        .or_else(|| heuristic_ftp_banner_match(&sanitized))
+        .or_else(|| heuristic_imap_banner_match(&sanitized))
+        .or_else(|| heuristic_pop3_banner_match(&sanitized))
+        .or_else(|| heuristic_redis_banner_match(&sanitized))
+        .or_else(|| heuristic_mysql_banner_match(banner))
+        .or_else(|| heuristic_vnc_banner_match(&sanitized))
+}
+
+fn heuristic_udp_banner_match(port: u16, banner: &[u8]) -> Option<FingerprintMatch> {
+    let banner_text = String::from_utf8_lossy(banner);
+    let sanitized = sanitize_banner_like(banner);
+
+    heuristic_upnp_banner_match(port, &banner_text, &sanitized)
+        .or_else(|| heuristic_http_banner_match(port, &banner_text, &sanitized, true))
+        .or_else(|| heuristic_redis_banner_match(&sanitized))
+}
+
+fn heuristic_ssh_banner_match(sanitized: &str) -> Option<FingerprintMatch> {
+    let first_line = sanitized.trim();
+    let lower = first_line.to_ascii_lowercase();
+    if !lower.starts_with("ssh-") {
+        return None;
+    }
+
+    let payload = first_line.splitn(3, '-').nth(2).unwrap_or_default();
+    if payload.is_empty() {
+        return None;
+    }
+
+    let mut identity = ServiceIdentity::default();
+    let payload_lower = payload.to_ascii_lowercase();
+
+    if let Some(version) = extract_version_after_token(payload, "OpenSSH_", '_') {
+        identity.product = Some("OpenSSH".to_string());
+        identity.version = Some(version.clone());
+        identity
+            .cpes
+            .push(format!("cpe:/a:openbsd:openssh:{version}"));
+    } else if let Some(version) = extract_version_after_token(payload, "dropbear_", '_') {
+        identity.product = Some("Dropbear SSH".to_string());
+        identity.version = Some(version.clone());
+        identity
+            .cpes
+            .push(format!("cpe:/a:dropbear_ssh:dropbear_ssh:{version}"));
+    } else if let Some(version) = extract_version_after_token(payload, "libssh-", '-') {
+        identity.product = Some("libssh".to_string());
+        identity.version = Some(version.clone());
+        identity
+            .cpes
+            .push(format!("cpe:/a:libssh:libssh:{version}"));
+    } else if payload_lower.contains("openssh") {
+        identity.product = Some("OpenSSH".to_string());
+    } else if payload_lower.contains("dropbear") {
+        identity.product = Some("Dropbear SSH".to_string());
+    } else if payload_lower.contains("libssh") {
+        identity.product = Some("libssh".to_string());
+    }
+
+    if let Some(os) = infer_operating_system_hint(payload) {
+        identity.operating_system = Some(os);
+    }
+
+    let trailing = payload
+        .split_once(' ')
+        .map(|(_, extra)| extra.trim())
+        .unwrap_or_default();
+    if !trailing.is_empty() {
+        identity.info = Some(trailing.to_string());
+    }
+
+    Some(heuristic_match("ssh", "ssh-banner", 0.83, identity, true))
+}
+
+fn heuristic_http_banner_match(
+    port: u16,
+    banner_text: &str,
+    sanitized: &str,
+    udp_friendly: bool,
+) -> Option<FingerprintMatch> {
+    let lower = sanitized.to_ascii_lowercase();
+    let looks_like_http = lower.contains("http/1.")
+        || lower.contains("http/2")
+        || lower.contains("server:")
+        || lower.contains("x-powered-by:")
+        || (udp_friendly && lower.contains("location:"));
+    if !looks_like_http {
+        return None;
+    }
+
+    let server = header_value_case_insensitive(banner_text, "server");
+    let powered_by = header_value_case_insensitive(banner_text, "x-powered-by");
+    let mut identity = ServiceIdentity::default();
+
+    if let Some(server_value) = server.as_deref() {
+        apply_http_server_identity(server_value, &mut identity);
+    }
+    if let Some(powered_value) = powered_by.as_deref() {
+        apply_powered_by_identity(powered_value, &mut identity);
+    }
+
+    if let Some(os) = server
+        .as_deref()
+        .and_then(infer_operating_system_hint)
+        .or_else(|| powered_by.as_deref().and_then(infer_operating_system_hint))
+    {
+        if identity.operating_system.is_none() {
+            identity.operating_system = Some(os);
+        }
+    }
+
+    if identity.product.is_none() {
+        identity.product = Some("HTTP service".to_string());
+    }
+
+    if let Some(server_value) = server {
+        append_info(&mut identity, server_value);
+    }
+    if let Some(powered_value) = powered_by {
+        append_info(&mut identity, format!("powered-by {powered_value}"));
+    }
+
+    Some(heuristic_match(
+        "http",
+        if port == 1900 {
+            "http-udp-banner"
+        } else {
+            "http-header"
+        },
+        if identity.cpes.is_empty() { 0.72 } else { 0.81 },
+        identity,
+        true,
+    ))
+}
+
+fn heuristic_smtp_banner_match(sanitized: &str) -> Option<FingerprintMatch> {
+    let lower = sanitized.to_ascii_lowercase();
+    if !(lower.starts_with("220 ") || lower.contains(" esmtp ") || lower.contains(" smtp ")) {
+        return None;
+    }
+    if !lower.contains("smtp") && !lower.contains("esmtp") {
+        return None;
+    }
+
+    let mut identity = ServiceIdentity::default();
+    let hostname = sanitized
+        .split_whitespace()
+        .nth(1)
+        .filter(|value| value.contains('.'))
+        .map(str::to_string);
+    identity.hostname = hostname;
+
+    if let Some(version) = extract_version_after_ci(sanitized, "postfix") {
+        identity.product = Some("Postfix".to_string());
+        identity.version = Some(version.clone());
+        identity
+            .cpes
+            .push(format!("cpe:/a:postfix:postfix:{version}"));
+    } else if lower.contains("postfix") {
+        identity.product = Some("Postfix".to_string());
+        identity.cpes.push("cpe:/a:postfix:postfix".to_string());
+    } else if let Some(version) = extract_version_after_ci(sanitized, "exim") {
+        identity.product = Some("Exim".to_string());
+        identity.version = Some(version.clone());
+        identity.cpes.push(format!("cpe:/a:exim:exim:{version}"));
+    } else if lower.contains("exim") {
+        identity.product = Some("Exim".to_string());
+        identity.cpes.push("cpe:/a:exim:exim".to_string());
+    } else if let Some(version) = extract_version_after_ci(sanitized, "sendmail") {
+        identity.product = Some("Sendmail".to_string());
+        identity.version = Some(version.clone());
+        identity
+            .cpes
+            .push(format!("cpe:/a:sendmail:sendmail:{version}"));
+    } else if lower.contains("sendmail") {
+        identity.product = Some("Sendmail".to_string());
+        identity.cpes.push("cpe:/a:sendmail:sendmail".to_string());
+    } else if lower.contains("microsoft") || lower.contains("exchange") {
+        identity.product = Some("Microsoft SMTP service".to_string());
+        identity.operating_system = Some("Windows".to_string());
+        identity.cpes.push("cpe:/o:microsoft:windows".to_string());
+    }
+
+    append_info(&mut identity, sanitized);
+    Some(heuristic_match("smtp", "smtp-banner", 0.77, identity, true))
+}
+
+fn heuristic_ftp_banner_match(sanitized: &str) -> Option<FingerprintMatch> {
+    let lower = sanitized.to_ascii_lowercase();
+    if !lower.starts_with("220 ") || !lower.contains("ftp") {
+        return None;
+    }
+
+    let mut identity = ServiceIdentity::default();
+    if let Some(version) = extract_version_after_ci(sanitized, "vsftpd") {
+        identity.product = Some("vsftpd".to_string());
+        identity.version = Some(version.clone());
+        identity
+            .cpes
+            .push(format!("cpe:/a:vsftpd:vsftpd:{version}"));
+    } else if lower.contains("vsftpd") {
+        identity.product = Some("vsftpd".to_string());
+        identity.cpes.push("cpe:/a:vsftpd:vsftpd".to_string());
+    } else if let Some(version) = extract_version_after_ci(sanitized, "proftpd") {
+        identity.product = Some("ProFTPD".to_string());
+        identity.version = Some(version.clone());
+        identity
+            .cpes
+            .push(format!("cpe:/a:proftpd:proftpd:{version}"));
+    } else if lower.contains("proftpd") {
+        identity.product = Some("ProFTPD".to_string());
+        identity.cpes.push("cpe:/a:proftpd:proftpd".to_string());
+    } else if let Some(version) = extract_version_after_ci(sanitized, "pure-ftpd") {
+        identity.product = Some("Pure-FTPd".to_string());
+        identity.version = Some(version.clone());
+        identity
+            .cpes
+            .push(format!("cpe:/a:pureftpd:pure-ftpd:{version}"));
+    } else if lower.contains("pure-ftpd") {
+        identity.product = Some("Pure-FTPd".to_string());
+        identity.cpes.push("cpe:/a:pureftpd:pure-ftpd".to_string());
+    } else if let Some(version) = extract_version_after_ci(sanitized, "filezilla server") {
+        identity.product = Some("FileZilla Server".to_string());
+        identity.version = Some(version.clone());
+        identity.cpes.push(format!(
+            "cpe:/a:filezilla-project:filezilla_server:{version}"
+        ));
+        identity.operating_system = Some("Windows".to_string());
+    } else if lower.contains("filezilla") {
+        identity.product = Some("FileZilla Server".to_string());
+        identity
+            .cpes
+            .push("cpe:/a:filezilla-project:filezilla_server".to_string());
+        identity.operating_system = Some("Windows".to_string());
+    }
+
+    append_info(&mut identity, sanitized);
+    Some(heuristic_match("ftp", "ftp-banner", 0.78, identity, true))
+}
+
+fn heuristic_imap_banner_match(sanitized: &str) -> Option<FingerprintMatch> {
+    let lower = sanitized.to_ascii_lowercase();
+    if !lower.contains("imap") {
+        return None;
+    }
+
+    let mut identity = ServiceIdentity::default();
+    if let Some(version) = extract_version_after_ci(sanitized, "dovecot") {
+        identity.product = Some("Dovecot".to_string());
+        identity.version = Some(version.clone());
+        identity
+            .cpes
+            .push(format!("cpe:/a:dovecot:dovecot:{version}"));
+    } else if lower.contains("dovecot") {
+        identity.product = Some("Dovecot".to_string());
+        identity.cpes.push("cpe:/a:dovecot:dovecot".to_string());
+    } else if lower.contains("courier") {
+        identity.product = Some("Courier".to_string());
+        identity.cpes.push("cpe:/a:courier-mta:courier".to_string());
+    } else if lower.contains("cyrus") {
+        identity.product = Some("Cyrus IMAP".to_string());
+        identity
+            .cpes
+            .push("cpe:/a:cyrusimap:cyrus_imap_server".to_string());
+    }
+
+    append_info(&mut identity, sanitized);
+    Some(heuristic_match("imap", "imap-banner", 0.73, identity, true))
+}
+
+fn heuristic_pop3_banner_match(sanitized: &str) -> Option<FingerprintMatch> {
+    let lower = sanitized.to_ascii_lowercase();
+    if !lower.contains("pop3") && !lower.starts_with("+ok") {
+        return None;
+    }
+
+    let mut identity = ServiceIdentity::default();
+    if let Some(version) = extract_version_after_ci(sanitized, "dovecot") {
+        identity.product = Some("Dovecot".to_string());
+        identity.version = Some(version.clone());
+        identity
+            .cpes
+            .push(format!("cpe:/a:dovecot:dovecot:{version}"));
+    } else if lower.contains("dovecot") {
+        identity.product = Some("Dovecot".to_string());
+        identity.cpes.push("cpe:/a:dovecot:dovecot".to_string());
+    } else if lower.contains("courier") {
+        identity.product = Some("Courier".to_string());
+        identity.cpes.push("cpe:/a:courier-mta:courier".to_string());
+    }
+
+    append_info(&mut identity, sanitized);
+    Some(heuristic_match("pop3", "pop3-banner", 0.71, identity, true))
+}
+
+fn heuristic_redis_banner_match(sanitized: &str) -> Option<FingerprintMatch> {
+    let lower = sanitized.to_ascii_lowercase();
+    if !(lower.starts_with("+pong")
+        || lower.contains("redis_version")
+        || lower.contains("redis")
+        || lower.starts_with("-noauth"))
+    {
+        return None;
+    }
+
+    let mut identity = ServiceIdentity {
+        product: Some("Redis".to_string()),
+        ..ServiceIdentity::default()
+    };
+    if let Some(version) = extract_value_after_ci(sanitized, "redis_version:") {
+        identity.version = Some(version.clone());
+        identity
+            .cpes
+            .push(format!("cpe:/a:redislabs:redis:{version}"));
+    } else {
+        identity.cpes.push("cpe:/a:redislabs:redis".to_string());
+    }
+    append_info(&mut identity, sanitized);
+    Some(heuristic_match(
+        "redis",
+        "redis-banner",
+        0.76,
+        identity,
+        true,
+    ))
+}
+
+fn heuristic_mysql_banner_match(banner: &[u8]) -> Option<FingerprintMatch> {
+    if banner.first().copied()? != 0x0a {
+        return None;
+    }
+
+    let version_end = banner.iter().skip(1).position(|byte| *byte == 0)?;
+    let version = String::from_utf8_lossy(&banner[1..=version_end])
+        .trim_end_matches('\0')
+        .to_string();
+    if version.is_empty() || version.len() > 64 {
+        return None;
+    }
+
+    let lower = version.to_ascii_lowercase();
+    let mut identity = ServiceIdentity::default();
+    if lower.contains("mariadb") {
+        identity.product = Some("MariaDB".to_string());
+        let product_version = version
+            .split('-')
+            .next()
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        if let Some(product_version) = product_version {
+            identity.version = Some(product_version.clone());
+            identity
+                .cpes
+                .push(format!("cpe:/a:mariadb:mariadb:{product_version}"));
+        } else {
+            identity.cpes.push("cpe:/a:mariadb:mariadb".to_string());
+        }
+    } else {
+        identity.product = Some("MySQL".to_string());
+        identity.version = Some(version.clone());
+        identity.cpes.push(format!("cpe:/a:mysql:mysql:{version}"));
+    }
+    append_info(&mut identity, format!("protocol-handshake {version}"));
+    Some(heuristic_match(
+        "mysql",
+        "mysql-handshake",
+        0.86,
+        identity,
+        true,
+    ))
+}
+
+fn heuristic_vnc_banner_match(sanitized: &str) -> Option<FingerprintMatch> {
+    let version = sanitized.strip_prefix("RFB ")?;
+    let version = version
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit() || *ch == '.')
+        .collect::<String>();
+    if version.is_empty() {
+        return None;
+    }
+
+    let mut identity = ServiceIdentity {
+        product: Some("VNC".to_string()),
+        version: Some(version.clone()),
+        info: Some("RFB banner".to_string()),
+        hostname: None,
+        operating_system: None,
+        device_type: None,
+        cpes: Vec::new(),
+    };
+    identity.cpes.push(format!("cpe:/a:realvnc:vnc:{version}"));
+    Some(heuristic_match("vnc", "rfb-banner", 0.74, identity, true))
+}
+
+fn heuristic_upnp_banner_match(
+    port: u16,
+    banner_text: &str,
+    sanitized: &str,
+) -> Option<FingerprintMatch> {
+    let lower = sanitized.to_ascii_lowercase();
+    if port != 1900 && !lower.contains("upnp") && !lower.contains("ssdp") {
+        return None;
+    }
+
+    let server = header_value_case_insensitive(banner_text, "server")
+        .or_else(|| header_value_case_insensitive(banner_text, "user-agent"));
+    let mut identity = ServiceIdentity::default();
+    if let Some(server_value) = server.as_deref() {
+        apply_http_server_identity(server_value, &mut identity);
+        if identity.product.is_none() {
+            if let Some(version) = extract_version_after_ci(server_value, "miniupnpd") {
+                identity.product = Some("miniupnpd".to_string());
+                identity.version = Some(version.clone());
+                identity
+                    .cpes
+                    .push(format!("cpe:/a:miniupnp_project:miniupnpd:{version}"));
+            } else if server_value.to_ascii_lowercase().contains("miniupnpd") {
+                identity.product = Some("miniupnpd".to_string());
+                identity
+                    .cpes
+                    .push("cpe:/a:miniupnp_project:miniupnpd".to_string());
+            }
+        }
+        if let Some(os) = infer_operating_system_hint(server_value) {
+            identity.operating_system = Some(os);
+        }
+        append_info(&mut identity, server_value.to_string());
+    }
+    if identity.product.is_none() {
+        identity.product = Some("UPnP/SSDP service".to_string());
+    }
+
+    Some(heuristic_match("upnp", "upnp-ssdp", 0.74, identity, true))
+}
+
+fn heuristic_match(
+    service: &str,
+    source: &str,
+    confidence: f32,
+    identity: ServiceIdentity,
+    soft: bool,
+) -> FingerprintMatch {
+    FingerprintMatch {
+        service: service.to_string(),
+        source: source.to_string(),
+        soft,
+        heuristic: true,
+        confidence,
+        identity,
+    }
+}
+
+fn apply_http_server_identity(server_value: &str, identity: &mut ServiceIdentity) {
+    let lower = server_value.to_ascii_lowercase();
+
+    if let Some(version) = extract_version_after_ci(server_value, "microsoft-iis") {
+        identity.product = Some("Microsoft IIS".to_string());
+        identity.version = Some(version.clone());
+        identity
+            .cpes
+            .push(format!("cpe:/a:microsoft:iis:{version}"));
+        identity.operating_system = Some("Windows".to_string());
+        return;
+    }
+    if lower.contains("microsoft-iis") {
+        identity.product = Some("Microsoft IIS".to_string());
+        identity.cpes.push("cpe:/a:microsoft:iis".to_string());
+        identity.operating_system = Some("Windows".to_string());
+        return;
+    }
+
+    if let Some(version) = extract_version_after_ci(server_value, "apache") {
+        identity.product = Some("Apache httpd".to_string());
+        identity.version = Some(version.clone());
+        identity
+            .cpes
+            .push(format!("cpe:/a:apache:http_server:{version}"));
+        return;
+    }
+    if lower.contains("apache") {
+        identity.product = Some("Apache httpd".to_string());
+        identity.cpes.push("cpe:/a:apache:http_server".to_string());
+        return;
+    }
+
+    if let Some(version) = extract_version_after_ci(server_value, "nginx") {
+        identity.product = Some("nginx".to_string());
+        identity.version = Some(version.clone());
+        identity.cpes.push(format!("cpe:/a:nginx:nginx:{version}"));
+        return;
+    }
+    if lower.contains("nginx") {
+        identity.product = Some("nginx".to_string());
+        identity.cpes.push("cpe:/a:nginx:nginx".to_string());
+        return;
+    }
+
+    if let Some(version) = extract_version_after_ci(server_value, "openresty") {
+        identity.product = Some("OpenResty".to_string());
+        identity.version = Some(version.clone());
+        identity
+            .cpes
+            .push(format!("cpe:/a:openresty:openresty:{version}"));
+        return;
+    }
+    if lower.contains("openresty") {
+        identity.product = Some("OpenResty".to_string());
+        identity.cpes.push("cpe:/a:openresty:openresty".to_string());
+        return;
+    }
+
+    if let Some(version) = extract_version_after_ci(server_value, "lighttpd") {
+        identity.product = Some("lighttpd".to_string());
+        identity.version = Some(version.clone());
+        identity
+            .cpes
+            .push(format!("cpe:/a:lighttpd:lighttpd:{version}"));
+        return;
+    }
+    if lower.contains("lighttpd") {
+        identity.product = Some("lighttpd".to_string());
+        identity.cpes.push("cpe:/a:lighttpd:lighttpd".to_string());
+        return;
+    }
+
+    if let Some(version) = extract_version_after_ci(server_value, "caddy") {
+        identity.product = Some("Caddy".to_string());
+        identity.version = Some(version.clone());
+        identity
+            .cpes
+            .push(format!("cpe:/a:caddyserver:caddy:{version}"));
+        return;
+    }
+    if lower.contains("caddy") {
+        identity.product = Some("Caddy".to_string());
+        identity.cpes.push("cpe:/a:caddyserver:caddy".to_string());
+        return;
+    }
+
+    if let Some(version) = extract_version_after_ci(server_value, "jetty") {
+        identity.product = Some("Jetty".to_string());
+        identity.version = Some(version.clone());
+        return;
+    }
+    if lower.contains("jetty") {
+        identity.product = Some("Jetty".to_string());
+        return;
+    }
+
+    if let Some(version) = extract_version_after_ci(server_value, "gunicorn") {
+        identity.product = Some("gunicorn".to_string());
+        identity.version = Some(version.clone());
+        return;
+    }
+    if let Some(version) = extract_version_after_ci(server_value, "uvicorn") {
+        identity.product = Some("uvicorn".to_string());
+        identity.version = Some(version.clone());
+        return;
+    }
+    if let Some(version) = extract_version_after_ci(server_value, "werkzeug") {
+        identity.product = Some("Werkzeug".to_string());
+        identity.version = Some(version.clone());
+        return;
+    }
+}
+
+fn apply_powered_by_identity(powered_by: &str, identity: &mut ServiceIdentity) {
+    if identity.product.is_some() {
+        return;
+    }
+
+    let lower = powered_by.to_ascii_lowercase();
+    if let Some(version) = extract_version_after_ci(powered_by, "php") {
+        identity.product = Some("PHP".to_string());
+        identity.version = Some(version.clone());
+        identity.cpes.push(format!("cpe:/a:php:php:{version}"));
+        return;
+    }
+    if lower.contains("php") {
+        identity.product = Some("PHP".to_string());
+        identity.cpes.push("cpe:/a:php:php".to_string());
+    }
+}
+
+fn header_value_case_insensitive(banner_text: &str, name: &str) -> Option<String> {
+    for line in banner_text.lines() {
+        let line = line.trim_matches(|ch| matches!(ch, '\r' | '\n' | '\0'));
+        let Some((header_name, header_value)) = line.split_once(':') else {
+            continue;
+        };
+        if header_name.trim().eq_ignore_ascii_case(name) {
+            let value = header_value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn extract_version_after_token(raw: &str, token: &str, separator: char) -> Option<String> {
+    let token_lower = token.to_ascii_lowercase();
+    let raw_lower = raw.to_ascii_lowercase();
+    let index = raw_lower.find(&token_lower)?;
+    let rest = &raw[index + token.len()..];
+    let rest = rest.strip_prefix(separator).unwrap_or(rest);
+    parse_version_fragment(rest)
+}
+
+fn extract_version_after_ci(raw: &str, needle: &str) -> Option<String> {
+    let raw_lower = raw.to_ascii_lowercase();
+    let needle_lower = needle.to_ascii_lowercase();
+    let index = raw_lower.find(&needle_lower)?;
+    let rest = &raw[index + needle.len()..];
+    let rest = rest.trim_start_matches(|ch: char| matches!(ch, '/' | ' ' | '_' | '(' | '-'));
+    parse_version_fragment(rest)
+}
+
+fn extract_value_after_ci(raw: &str, needle: &str) -> Option<String> {
+    let raw_lower = raw.to_ascii_lowercase();
+    let needle_lower = needle.to_ascii_lowercase();
+    let index = raw_lower.find(&needle_lower)?;
+    let rest = raw[index + needle.len()..].trim_start();
+    let value = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | ':'))
+        .collect::<String>();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn parse_version_fragment(raw: &str) -> Option<String> {
+    let version = raw
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | ':' | 'p'))
+        .collect::<String>()
+        .trim_matches(|ch: char| matches!(ch, '(' | ')' | ';' | ',' | '[' | ']'))
+        .to_string();
+    if version.is_empty() {
+        None
+    } else {
+        Some(version)
+    }
+}
+
+fn infer_operating_system_hint(raw: &str) -> Option<String> {
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("windows")
+        || lower.contains("microsoft-iis")
+        || lower.contains("microsoft esmtp")
+        || lower.contains("exchange")
+        || lower.contains("win32")
+        || lower.contains("win64")
+    {
+        return Some("Windows".to_string());
+    }
+    if lower.contains("ubuntu") {
+        return Some("Ubuntu Linux".to_string());
+    }
+    if lower.contains("debian") {
+        return Some("Debian Linux".to_string());
+    }
+    if lower.contains("centos") {
+        return Some("CentOS Linux".to_string());
+    }
+    if lower.contains("red hat") || lower.contains("rhel") {
+        return Some("Red Hat Enterprise Linux".to_string());
+    }
+    if lower.contains("fedora") {
+        return Some("Fedora Linux".to_string());
+    }
+    if lower.contains("alpine") {
+        return Some("Alpine Linux".to_string());
+    }
+    if lower.contains("freebsd") {
+        return Some("FreeBSD".to_string());
+    }
+    if lower.contains("openbsd") {
+        return Some("OpenBSD".to_string());
+    }
+    if lower.contains("netbsd") {
+        return Some("NetBSD".to_string());
+    }
+    if lower.contains("solaris") {
+        return Some("Solaris".to_string());
+    }
+    if lower.contains("darwin") || lower.contains("macos") || lower.contains("mac os") {
+        return Some("macOS".to_string());
+    }
+    if lower.contains("linux") {
+        return Some("Linux".to_string());
+    }
+    if lower.contains("unix") {
+        return Some("Unix".to_string());
+    }
+    None
+}
+
+fn append_info(identity: &mut ServiceIdentity, fragment: impl Into<String>) {
+    let fragment = sanitize_template_output(&fragment.into());
+    if fragment.is_empty() {
+        return;
+    }
+
+    match identity.info.as_mut() {
+        Some(current) if current.contains(&fragment) => {}
+        Some(current) => {
+            current.push_str("; ");
+            current.push_str(&fragment);
+        }
+        None => identity.info = Some(fragment),
+    }
+}
+
 fn decode_payload(raw: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(raw.len());
     let mut idx = 0usize;
@@ -1100,6 +2003,7 @@ mod tests {
             name: "GetRequest".to_string(),
             payload: b"GET / HTTP/1.0\r\n\r\n".to_vec(),
             ports: vec![80],
+            rarity: 1,
         };
         let rule = parse_match_line(
             "match http m|^HTTP/1\\.1 200 OK\\r\\nServer: nginx/([\\d.]+)| p/nginx/ v/$1/ cpe:/a:nginx:nginx:$1/",
@@ -1130,5 +2034,76 @@ mod tests {
         assert_eq!(expand_template("$P(1)", &captures), "A");
         assert_eq!(expand_template("$I(2,\">\")", &captures), "12594");
         assert_eq!(expand_template("v$SUBST(2,\"1\",\"7\")", &captures), "v72");
+    }
+
+    #[test]
+    fn prefers_more_specific_hard_rule_match() {
+        let db = FingerprintDatabase::from_service_probes(
+            "Probe TCP Null q||\n\
+             match http m|^HTTP/1\\.1 200 OK| p/Generic HTTP/\n\
+             Probe TCP GetRequest q|GET / HTTP/1.0\\r\\n\\r\\n|\n\
+             ports 80\n\
+             match http m|^HTTP/1\\.1 200 OK\\r\\nServer: nginx/([\\d.]+)| p/nginx/ v/$1/ cpe:/a:nginx:nginx:$1/\n",
+            0,
+            0,
+            &HashSet::from([80]),
+            false,
+        );
+
+        let matched = db
+            .match_banner(
+                ProbeProtocol::Tcp,
+                80,
+                b"HTTP/1.1 200 OK\r\nServer: nginx/1.25.5\r\n\r\n",
+            )
+            .expect("matched");
+
+        assert_eq!(matched.identity.product.as_deref(), Some("nginx"));
+        assert_eq!(matched.identity.version.as_deref(), Some("1.25.5"));
+    }
+
+    #[test]
+    fn heuristic_http_match_extracts_identity_and_os_hint() {
+        let matched = FingerprintDatabase::empty()
+            .heuristic_banner_match(
+                ProbeProtocol::Tcp,
+                80,
+                b"HTTP/1.1 200 OK\r\nServer: Microsoft-IIS/10.0\r\nX-Powered-By: ASP.NET\r\n\r\n",
+            )
+            .expect("http heuristic");
+
+        assert_eq!(matched.service, "http");
+        assert!(matched.heuristic);
+        assert_eq!(matched.identity.product.as_deref(), Some("Microsoft IIS"));
+        assert_eq!(matched.identity.version.as_deref(), Some("10.0"));
+        assert_eq!(
+            matched.identity.operating_system.as_deref(),
+            Some("Windows")
+        );
+    }
+
+    #[test]
+    fn heuristic_ssh_match_extracts_product_version_and_platform() {
+        let matched = FingerprintDatabase::empty()
+            .heuristic_banner_match(
+                ProbeProtocol::Tcp,
+                22,
+                b"SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.8\r\n",
+            )
+            .expect("ssh heuristic");
+
+        assert_eq!(matched.service, "ssh");
+        assert!(matched.heuristic);
+        assert_eq!(matched.identity.product.as_deref(), Some("OpenSSH"));
+        assert_eq!(matched.identity.version.as_deref(), Some("9.6p1"));
+        assert_eq!(
+            matched.identity.operating_system.as_deref(),
+            Some("Ubuntu Linux")
+        );
+        assert!(matched
+            .identity
+            .cpes
+            .iter()
+            .any(|cpe| cpe == "cpe:/a:openbsd:openssh:9.6p1"));
     }
 }

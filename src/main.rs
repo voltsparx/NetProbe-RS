@@ -26,6 +26,7 @@ mod reporter;
 mod scan_types;
 mod scheduler;
 mod service_db;
+mod targeting;
 mod tasks;
 mod utils;
 

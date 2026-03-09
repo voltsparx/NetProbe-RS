@@ -58,9 +58,11 @@ pub fn render(report: &ScanReport) -> String {
         }
     ));
     html.push_str(&format!(
-        "<div class=\"meta\">Request mode: ping-scan={} | traceroute={} | timing={}</div>",
+        "<div class=\"meta\">Request mode: list-scan={} | ping-scan={} | traceroute={} | sequential={} | timing={}</div>",
+        report.request.list_scan,
         report.request.ping_scan,
         report.request.traceroute,
+        report.request.sequential_port_order,
         esc(&report
             .request
             .timing_template

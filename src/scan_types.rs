@@ -267,11 +267,14 @@ const SCAN_TYPES: &[ScanTypeEntry] = &[
     ScanTypeEntry {
         id: "source-port-pin",
         category: "evasion",
-        status: ScanTypeStatus::Planned,
+        status: ScanTypeStatus::Implemented,
         flags: &["-g <port>", "--source-port <port>"],
         aliases: &["source-port"],
-        summary: "pinned source-port behavior is cataloged from the encyclopedia and intentionally not exposed as a runtime feature.",
-        docs: &["cooking-reverse-engineering/nmap-scan-encyclopedia.txt"],
+        summary: "pins the outbound source port across async TCP/UDP probes and the raw packet-crafter lane, with low ports still guarded by elevation requirements.",
+        docs: &[
+            "docs/scan-types/source-port-pin.md",
+            "cooking-reverse-engineering/nmap-scan-encyclopedia.txt",
+        ],
     },
     ScanTypeEntry {
         id: "banner",

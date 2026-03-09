@@ -32,6 +32,10 @@ impl BlackrockPermutation {
         self.size as usize
     }
 
+    pub fn is_exhausted(&self) -> bool {
+        self.index >= self.size
+    }
+
     pub fn at(&self, index: usize) -> usize {
         if self.size <= 1 {
             return 0;

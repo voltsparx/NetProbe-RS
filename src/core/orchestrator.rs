@@ -36,7 +36,9 @@ use crate::models::{
 };
 use crate::os_fingerprint_db::OsFingerprintDatabase;
 use crate::platform::capability_registry;
+use crate::reporter::tbns_profiles;
 use crate::service_db::ServiceRegistry;
+use crate::targeting;
 
 const MAX_RESOLVED_HOSTS: usize = 16;
 const MAX_CIDR_HOSTS: usize = 4096;
@@ -86,29 +88,44 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
     enforce_defensive_scope(&mut request, &resolved, &mut global_warnings)?;
     enforce_privileged_modes(&mut request, &mut global_warnings)?;
 
-    let mut selected_ports = if request.ping_scan {
+    let mut selected_ports = if request.ping_scan || request.list_scan {
         Vec::new()
     } else if request.ports.is_empty() {
-        let top = request.top_ports.unwrap_or(100);
-        service_registry.top_tcp_ports(top)
+        if let Some(ratio) = request.port_ratio {
+            service_registry.ports_by_ratio(ratio, request.include_udp)
+        } else {
+            let top = request.top_ports.unwrap_or(100);
+            service_registry.top_ports_for_scan(top, request.include_udp)
+        }
     } else {
         request.ports.clone()
     };
-    if !request.ping_scan {
+    if !request.ping_scan && !request.list_scan {
         apply_defensive_port_policy(
             &request,
             has_public_targets,
             &mut selected_ports,
             &mut global_warnings,
         )?;
+        if !request.excluded_ports.is_empty() {
+            let before = selected_ports.len();
+            selected_ports.retain(|port| !request.excluded_ports.contains(port));
+            let removed = before.saturating_sub(selected_ports.len());
+            if removed > 0 {
+                global_warnings.push(format!(
+                    "excluded {} port(s) from the active scan set via --exclude-ports",
+                    removed
+                ));
+            }
+        }
     }
-    if selected_ports.is_empty() && !request.ping_scan {
+    if selected_ports.is_empty() && !request.ping_scan && !request.list_scan {
         return Err(NProbeError::Parse(
             "no ports selected for scanning".to_string(),
         ));
     }
 
-    let fingerprint_db = if request.service_detection && !request.ping_scan {
+    let fingerprint_db = if request.service_detection && !request.ping_scan && !request.list_scan {
         Arc::new(FingerprintDatabase::load_for_ports(
             &selected_ports,
             request.include_udp,
@@ -118,7 +135,12 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
     };
     let os_fingerprint_db = Arc::new(OsFingerprintDatabase::load());
 
-    let max_resolved_hosts = if packet_arp::parse_ipv4_cidr(&request.target).is_some() {
+    let max_resolved_hosts = if request.target_inputs.iter().any(|value| {
+        packet_arp::parse_ipv4_cidr(value).is_some()
+            || targeting::expand_ipv4_range(value, 2).is_some()
+    }) || packet_arp::parse_ipv4_cidr(&request.target).is_some()
+        || targeting::expand_ipv4_range(&request.target, 2).is_some()
+    {
         MAX_CIDR_HOSTS
     } else {
         MAX_RESOLVED_HOSTS
@@ -224,6 +246,12 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
                 .to_string(),
         );
     }
+    if request.list_scan {
+        global_warnings.push(
+            "list scan mode active: targets will be resolved and listed, but no scan packets will be transmitted"
+                .to_string(),
+        );
+    }
     if request.traceroute {
         global_warnings.push(
             "traceroute follow-up active: NProbe-RS will attempt a bounded path trace after positive host evidence is observed"
@@ -232,7 +260,7 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
     }
     if request.override_mode {
         global_warnings.push(
-            "override mode active: adaptive local throttles, target fragility brakes, and runtime emergency brakes are bypassed for the accelerated lanes on this run"
+            "override mode active: target-facing throttles and pre-execution local caps are bypassed for accelerated lanes on this run, but runtime overflow protection remains armed"
                 .to_string(),
         );
     }
@@ -550,6 +578,7 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
         request: ScanRequestSummary {
             target: request.target.clone(),
             port_count: selected_ports.len(),
+            list_scan: request.list_scan,
             ping_scan: request.ping_scan,
             traceroute: request.traceroute,
             include_udp: request.include_udp,
@@ -565,6 +594,7 @@ pub async fn run_scan(mut request: ScanRequest) -> NProbeResult<ScanReport> {
             callback_ping: request.callback_ping,
             assess_hardware: request.assess_hardware,
             override_mode: request.override_mode,
+            sequential_port_order: request.sequential_port_order,
             timing_template: request.timing_template,
             total_shards: request.total_shards,
             shard_index: request.shard_index,
@@ -588,66 +618,127 @@ async fn resolve_targets(
     request: &ScanRequest,
     warnings: &mut Vec<String>,
 ) -> NProbeResult<Vec<IpAddr>> {
-    if let Some(cidr) = packet_arp::parse_ipv4_cidr(&request.target) {
+    let include_specs = if request.target_inputs.is_empty() {
+        targeting::split_target_expression(&request.target)
+    } else {
+        request.target_inputs.clone()
+    };
+
+    let mut resolved = Vec::new();
+    let mut seen = HashSet::new();
+    for spec in include_specs {
+        for ip in expand_target_spec(&spec, Some(request), warnings).await? {
+            if seen.insert(ip) {
+                resolved.push(ip);
+            }
+        }
+    }
+
+    if !request.exclude_targets.is_empty() {
+        let mut ignored_warnings = Vec::new();
+        let mut excluded = HashSet::new();
+        for spec in &request.exclude_targets {
+            for ip in expand_target_spec(spec, None, &mut ignored_warnings).await? {
+                excluded.insert(ip);
+            }
+        }
+        let before = resolved.len();
+        resolved.retain(|ip| !excluded.contains(ip));
+        let removed = before.saturating_sub(resolved.len());
+        if removed > 0 {
+            warnings.push(format!(
+                "excluded {} target(s) after expansion via --exclude/--exclude-file",
+                removed
+            ));
+        }
+    }
+
+    if resolved.is_empty() {
+        return Err(NProbeError::Parse(
+            "target selection resolved to zero hosts".to_string(),
+        ));
+    }
+
+    Ok(resolved)
+}
+
+async fn expand_target_spec(
+    raw: &str,
+    request: Option<&ScanRequest>,
+    warnings: &mut Vec<String>,
+) -> NProbeResult<Vec<IpAddr>> {
+    let token = raw.trim();
+    if token.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if let Some(cidr) = packet_arp::parse_ipv4_cidr(token) {
         let (fallback_hosts, truncated) = cidr.expand_hosts(MAX_CIDR_HOSTS);
         if fallback_hosts.is_empty() {
             return Err(NProbeError::Parse(format!(
                 "cidr target '{}' resolved to zero hosts",
-                request.target
+                token
             )));
         }
         if truncated {
             warnings.push(format!(
                 "cidr target {} exceeds {} hosts; limiting scan scope",
-                request.target, MAX_CIDR_HOSTS
+                token, MAX_CIDR_HOSTS
             ));
         }
 
-        let auto_arp_discovery = request.ping_scan && packet_arp::is_lan_ipv4(cidr.network());
-        if request.arp_discovery || auto_arp_discovery {
-            if !packet_arp::is_lan_ipv4(cidr.network()) {
-                warnings.push(
-                    "arp sweep skipped: target cidr is not private/link-local ipv4".to_string(),
-                );
-            } else {
-                if auto_arp_discovery && !request.arp_discovery {
+        if let Some(request) = request {
+            let auto_arp_discovery =
+                !request.list_scan && request.ping_scan && packet_arp::is_lan_ipv4(cidr.network());
+            if request.arp_discovery || auto_arp_discovery {
+                if !packet_arp::is_lan_ipv4(cidr.network()) {
                     warnings.push(
-                        "ping scan mode auto-enabled ARP-first discovery for this local IPv4 cidr target"
+                        "arp sweep skipped: target cidr is not private/link-local ipv4".to_string(),
+                    );
+                } else {
+                    if auto_arp_discovery && !request.arp_discovery {
+                        warnings.push(
+                            "ping scan mode auto-enabled ARP-first discovery for this local IPv4 cidr target"
+                                .to_string(),
+                        );
+                    }
+                    let sweep = tokio::task::spawn_blocking(move || {
+                        packet_arp::sweep_ipv4_cidr(
+                            cidr,
+                            Duration::from_millis(220),
+                            MAX_CIDR_HOSTS,
+                        )
+                    })
+                    .await
+                    .map_err(NProbeError::Join)?
+                    .map_err(NProbeError::Io)?;
+
+                    warnings.push(format!(
+                        "arp sweep: {} responsive hosts from {} probed addresses (cidr host budget={})",
+                        sweep.discovered_hosts.len(),
+                        sweep.attempted_hosts,
+                        sweep.requested_hosts
+                    ));
+                    if sweep.truncated {
+                        warnings.push(format!(
+                            "arp sweep truncated host list to {} addresses",
+                            sweep.attempted_hosts
+                        ));
+                    }
+
+                    if !sweep.discovered_hosts.is_empty() {
+                        return Ok(sweep
+                            .discovered_hosts
+                            .into_iter()
+                            .map(IpAddr::V4)
+                            .collect::<Vec<_>>());
+                    }
+
+                    warnings.push(
+                        "arp sweep found no live neighbors; falling back to expanded cidr target list"
                             .to_string(),
                     );
                 }
-                let sweep = tokio::task::spawn_blocking(move || {
-                    packet_arp::sweep_ipv4_cidr(cidr, Duration::from_millis(220), MAX_CIDR_HOSTS)
-                })
-                .await
-                .map_err(NProbeError::Join)?
-                .map_err(NProbeError::Io)?;
-
-                warnings.push(format!(
-                    "arp sweep: {} responsive hosts from {} probed addresses (cidr host budget={})",
-                    sweep.discovered_hosts.len(),
-                    sweep.attempted_hosts,
-                    sweep.requested_hosts
-                ));
-                if sweep.truncated {
-                    warnings.push(format!(
-                        "arp sweep truncated host list to {} addresses",
-                        sweep.attempted_hosts
-                    ));
-                }
-
-                if !sweep.discovered_hosts.is_empty() {
-                    return Ok(sweep
-                        .discovered_hosts
-                        .into_iter()
-                        .map(IpAddr::V4)
-                        .collect::<Vec<_>>());
-                }
-
-                warnings.push(
-                    "arp sweep found no live neighbors; falling back to expanded cidr target list"
-                        .to_string(),
-                );
             }
         }
 
@@ -657,7 +748,49 @@ async fn resolve_targets(
             .collect::<Vec<_>>());
     }
 
-    dns::resolve(&request.target).await
+    if let Some((hosts, truncated)) = targeting::expand_ipv4_range(token, MAX_CIDR_HOSTS) {
+        if truncated {
+            warnings.push(format!(
+                "ipv4 range target {} exceeds {} hosts; limiting scan scope",
+                token, MAX_CIDR_HOSTS
+            ));
+        }
+        return Ok(hosts.into_iter().map(IpAddr::V4).collect());
+    }
+
+    if let Ok(ip) = token.parse::<IpAddr>() {
+        return Ok(vec![ip]);
+    }
+
+    if let Some((hostname, prefix_len)) = targeting::parse_hostname_prefix(token) {
+        let resolved = dns::resolve(hostname).await?;
+        let mut hosts = Vec::new();
+        let mut truncated = false;
+        for ip in resolved {
+            if let IpAddr::V4(v4) = ip {
+                let (expanded, did_truncate) =
+                    targeting::expand_ipv4_prefix(v4, prefix_len, MAX_CIDR_HOSTS);
+                truncated |= did_truncate;
+                hosts.extend(expanded.into_iter().map(IpAddr::V4));
+            }
+        }
+
+        if hosts.is_empty() {
+            return Err(NProbeError::Parse(format!(
+                "target '{}' resolved without IPv4 addresses for /{} expansion",
+                hostname, prefix_len
+            )));
+        }
+        if truncated {
+            warnings.push(format!(
+                "hostname prefix target {} exceeds {} hosts; limiting scan scope",
+                token, MAX_CIDR_HOSTS
+            ));
+        }
+        return Ok(hosts);
+    }
+
+    dns::resolve(token).await
 }
 
 async fn process_host(
@@ -671,6 +804,50 @@ async fn process_host(
     defer_enrichment: bool,
 ) -> NProbeResult<HostExecution> {
     let ip = work_item.ip;
+    if request.list_scan {
+        let reverse_dns = if request.reverse_dns {
+            dns::reverse(ip).await
+        } else {
+            None
+        };
+        let mut host = HostResult {
+            target: request.target.clone(),
+            ip: ip.to_string(),
+            reverse_dns,
+            observed_mac: None,
+            device_class: None,
+            device_vendor: None,
+            operating_system: None,
+            phantom_device_check: None,
+            safety_actions: vec!["host-discovery:list-scan".to_string()],
+            warnings: global_warnings,
+            ports: Vec::new(),
+            risk_score: 0,
+            insights: vec![
+                "list scan mode active: target was resolved and listed without transmitting scan probes"
+                    .to_string(),
+            ],
+            defensive_advice: Vec::new(),
+            learning_notes: vec![
+                "List scan mode behaves like a planner: it expands targets and optional reverse DNS, but does not open discovery or port-scan lanes."
+                    .to_string(),
+            ],
+            lua_findings: Vec::new(),
+        };
+        dedupe_sort_strings(&mut host.safety_actions);
+        dedupe_sort_strings(&mut host.insights);
+        dedupe_sort_strings(&mut host.learning_notes);
+
+        return Ok(HostExecution {
+            checkpoint_unit: work_item.checkpoint_unit,
+            host,
+            async_tasks: 0,
+            thread_pool_tasks: usize::from(request.reverse_dns),
+            parallel_tasks: 0,
+            lua_hooks_ran: false,
+        });
+    }
+
     if request.ping_scan {
         let mut host = HostResult {
             target: request.target.clone(),
@@ -982,6 +1159,7 @@ async fn finalize_host(
         }
         host.operating_system = Some(operating_system);
     }
+    tbns_profiles::annotate_host(request.profile, request.callback_ping, host);
     dedupe_sort_strings(&mut host.warnings);
     dedupe_sort_strings(&mut host.insights);
     dedupe_sort_strings(&mut host.learning_notes);
@@ -1393,13 +1571,25 @@ fn apply_defensive_port_policy(
     if let Some(profile_budget) = request.profile.concept_port_budget() {
         if selected_ports.len() > profile_budget {
             let previous = selected_ports.len();
-            selected_ports.truncate(profile_budget);
+            *selected_ports =
+                reshape_concept_port_scope(request.profile, selected_ports, profile_budget);
             warnings.push(format!(
                 "{} profile reduced active port scope from {} to {} ports",
                 format!("{:?}", request.profile).to_ascii_lowercase(),
                 previous,
                 profile_budget
             ));
+        }
+    }
+
+    if matches!(request.profile, ScanProfile::Idf) {
+        let reshaped = diffuse_port_order(selected_ports);
+        if reshaped != *selected_ports {
+            *selected_ports = reshaped;
+            warnings.push(
+                "idf profile diffused the guarded port order to spread sparse checkpoints across the requested scope"
+                    .to_string(),
+            );
         }
     }
 
@@ -1411,6 +1601,78 @@ fn apply_defensive_port_policy(
     }
 
     Ok(())
+}
+
+fn reshape_concept_port_scope(
+    profile: ScanProfile,
+    selected_ports: &[u16],
+    profile_budget: usize,
+) -> Vec<u16> {
+    if selected_ports.len() <= profile_budget {
+        return selected_ports.to_vec();
+    }
+
+    if !matches!(profile, ScanProfile::Idf) {
+        return selected_ports[..profile_budget].to_vec();
+    }
+
+    sparse_even_sample(selected_ports, profile_budget)
+}
+
+fn sparse_even_sample(selected_ports: &[u16], sample_size: usize) -> Vec<u16> {
+    if selected_ports.is_empty() || sample_size == 0 {
+        return Vec::new();
+    }
+    if selected_ports.len() <= sample_size {
+        return selected_ports.to_vec();
+    }
+    if sample_size == 1 {
+        return vec![selected_ports[0]];
+    }
+
+    let mut sampled = Vec::with_capacity(sample_size);
+    let last_index = selected_ports.len() - 1;
+    for step in 0..sample_size {
+        let index = step * last_index / (sample_size - 1);
+        let port = selected_ports[index];
+        if sampled.last().copied() != Some(port) {
+            sampled.push(port);
+        }
+    }
+
+    if sampled.len() < sample_size {
+        for port in selected_ports {
+            if sampled.contains(port) {
+                continue;
+            }
+            sampled.push(*port);
+            if sampled.len() == sample_size {
+                break;
+            }
+        }
+    }
+
+    sampled
+}
+
+fn diffuse_port_order(selected_ports: &[u16]) -> Vec<u16> {
+    if selected_ports.len() <= 2 {
+        return selected_ports.to_vec();
+    }
+
+    let mut diffused = Vec::with_capacity(selected_ports.len());
+    let mut left = 0usize;
+    let mut right = selected_ports.len() - 1;
+    while left <= right {
+        diffused.push(selected_ports[left]);
+        left += 1;
+        if left <= right {
+            diffused.push(selected_ports[right]);
+            right = right.saturating_sub(1);
+        }
+    }
+
+    diffused
 }
 
 fn apply_root_only_limits(request: &mut ScanRequest) {
@@ -1474,6 +1736,9 @@ fn build_root_required_message(request: &ScanRequest) -> String {
     }
     if request.privileged_probes {
         modes.push("--privileged-probes");
+    }
+    if request.source_port_requires_root() {
+        modes.push("--source-port");
     }
 
     let mode_text = modes.join(", ");
@@ -1560,7 +1825,7 @@ fn prepare_shard_checkpoint(
         &host_targets,
         selected_ports,
         shard_dimension,
-        request.ping_scan,
+        request.ping_scan || request.list_scan,
     );
     if total_shards <= 1 || shard_dimension == "none" || work_items.is_empty() {
         return Ok((work_items, None));
@@ -1662,13 +1927,13 @@ fn build_scan_work_items(
     hosts: &[IpAddr],
     selected_ports: &[u16],
     shard_dimension: &str,
-    ping_scan: bool,
+    host_only_mode: bool,
 ) -> Vec<ScanWorkItem> {
-    if hosts.is_empty() || (!ping_scan && selected_ports.is_empty()) {
+    if hosts.is_empty() || (!host_only_mode && selected_ports.is_empty()) {
         return Vec::new();
     }
 
-    if ping_scan {
+    if host_only_mode {
         return hosts
             .iter()
             .copied()
@@ -1881,14 +2146,21 @@ mod tests {
     fn base_request() -> ScanRequest {
         ScanRequest {
             target: "127.0.0.1".to_string(),
+            target_inputs: Vec::new(),
+            exclude_targets: Vec::new(),
             session_id: None,
             ports: vec![22, 80, 443],
+            excluded_ports: Vec::new(),
             top_ports: None,
+            port_ratio: None,
+            list_scan: false,
             ping_scan: false,
             traceroute: false,
             include_udp: false,
             reverse_dns: false,
             service_detection: true,
+            version_intensity: None,
+            version_trace: false,
             explain: false,
             verbose: false,
             report_format: ReportFormat::Cli,
@@ -1904,6 +2176,8 @@ mod tests {
             strict_safety: false,
             output_path: None,
             lua_script: None,
+            source_port: None,
+            sequential_port_order: false,
             timeout_ms: None,
             concurrency: None,
             delay_ms: None,
@@ -1915,6 +2189,7 @@ mod tests {
             gpu_burst_size: None,
             gpu_timestamp: false,
             gpu_schedule_random: false,
+            gpu_action_manifest: None,
             assess_hardware: false,
             override_mode: false,
             burst_size: None,
@@ -1990,6 +2265,27 @@ mod tests {
         assert!(!warnings.is_empty());
     }
 
+    #[test]
+    fn idf_profile_reshapes_scope_into_sparse_diffused_checkpoints() {
+        let mut request = base_request();
+        request.profile = ScanProfile::Idf;
+        let mut warnings = Vec::new();
+        let mut ports = vec![
+            21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 389, 443, 445, 465, 587,
+        ];
+
+        apply_defensive_port_policy(&request, false, &mut ports, &mut warnings)
+            .expect("idf port policy should succeed");
+
+        assert_eq!(
+            ports,
+            vec![21, 587, 22, 445, 23, 443, 53, 143, 80, 139, 110, 135]
+        );
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("idf profile diffused the guarded port order")));
+    }
+
     #[tokio::test]
     async fn hybrid_scan_executes_successfully() {
         let mut request = base_request();
@@ -2000,6 +2296,27 @@ mod tests {
 
         let report = run_scan(request).await.expect("hybrid scan should succeed");
         assert!(!report.hosts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_scan_resolves_targets_without_port_findings() {
+        let mut request = base_request();
+        request.target = "127.0.0.1; localhost".to_string();
+        request.target_inputs = vec!["127.0.0.1".to_string(), "localhost".to_string()];
+        request.list_scan = true;
+        request.top_ports = None;
+        request.ports = Vec::new();
+        request.reverse_dns = false;
+
+        let report = run_scan(request).await.expect("list scan should succeed");
+        assert!(!report.hosts.is_empty());
+        assert!(report.request.list_scan);
+        assert!(report.hosts.iter().all(|host| host.ports.is_empty()));
+        assert!(report.hosts.iter().all(|host| {
+            host.safety_actions
+                .iter()
+                .any(|action| action == "host-discovery:list-scan")
+        }));
     }
 
     #[tokio::test]

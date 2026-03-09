@@ -40,13 +40,23 @@ pub fn render(report: &ScanReport) -> String {
         }
     ));
     out.push_str(&format!(
-        "Request mode: ping-scan={} | traceroute={} | timing={}\n",
+        "Request mode: list-scan={} | ping-scan={} | traceroute={} | sequential={} | timing={}\n",
+        if report.request.list_scan {
+            "on"
+        } else {
+            "off"
+        },
         if report.request.ping_scan {
             "on"
         } else {
             "off"
         },
         if report.request.traceroute {
+            "on"
+        } else {
+            "off"
+        },
+        if report.request.sequential_port_order {
             "on"
         } else {
             "off"
@@ -205,7 +215,9 @@ pub fn render(report: &ScanReport) -> String {
             .any(|p| matches!(p.state, PortState::OpenOrFiltered));
         let discovery_evidence = host_discovery_evidence(host);
 
-        if definite_response {
+        if report.request.list_scan {
+            out.push_str("Host status: listed only (no probes sent).\n");
+        } else if definite_response {
             out.push_str("Host is up.\n");
         } else if ambiguous_response {
             out.push_str("Host status: up or filtered (no definitive response).\n");

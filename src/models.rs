@@ -188,9 +188,19 @@ pub struct RuntimeSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanRequest {
     pub target: String,
+    #[serde(default)]
+    pub target_inputs: Vec<String>,
+    #[serde(default)]
+    pub exclude_targets: Vec<String>,
     pub session_id: Option<String>,
     pub ports: Vec<u16>,
+    #[serde(default)]
+    pub excluded_ports: Vec<u16>,
     pub top_ports: Option<usize>,
+    #[serde(default)]
+    pub port_ratio: Option<f64>,
+    #[serde(default)]
+    pub list_scan: bool,
     #[serde(default)]
     pub ping_scan: bool,
     #[serde(default)]
@@ -198,6 +208,10 @@ pub struct ScanRequest {
     pub include_udp: bool,
     pub reverse_dns: bool,
     pub service_detection: bool,
+    #[serde(default)]
+    pub version_intensity: Option<u8>,
+    #[serde(default)]
+    pub version_trace: bool,
     pub explain: bool,
     pub verbose: bool,
     pub report_format: ReportFormat,
@@ -212,7 +226,10 @@ pub struct ScanRequest {
     pub strict_safety: bool,
     pub output_path: Option<PathBuf>,
     pub lua_script: Option<PathBuf>,
+    pub source_port: Option<u16>,
     pub callback_ping: bool,
+    #[serde(default)]
+    pub sequential_port_order: bool,
     pub timeout_ms: Option<u64>,
     pub concurrency: Option<usize>,
     pub delay_ms: Option<u64>,
@@ -227,6 +244,7 @@ pub struct ScanRequest {
     pub gpu_timestamp: bool,
     #[serde(default)]
     pub gpu_schedule_random: bool,
+    pub gpu_action_manifest: Option<PathBuf>,
     #[serde(default)]
     pub assess_hardware: bool,
     #[serde(default)]
@@ -254,11 +272,30 @@ impl ScanRequest {
     }
 
     pub fn requires_root(&self) -> bool {
-        self.aggressive_root || self.privileged_probes
+        self.aggressive_root || self.privileged_probes || self.source_port_requires_root()
+    }
+
+    pub fn source_port_requires_root(&self) -> bool {
+        self.source_port.is_some_and(|port| port < 1024)
     }
 
     pub fn effective_privileged_probes(&self) -> bool {
         self.privileged_probes || self.aggressive_root
+    }
+
+    pub fn effective_version_intensity(&self) -> u8 {
+        self.version_intensity.unwrap_or(7).min(9)
+    }
+
+    pub fn effective_version_payload_budget(&self) -> usize {
+        match self.effective_version_intensity() {
+            0 => 1,
+            1..=2 => 2,
+            3..=4 => 3,
+            5..=6 => 4,
+            7..=8 => 6,
+            _ => 8,
+        }
     }
 }
 
@@ -562,6 +599,7 @@ pub struct EngineStats {
 pub struct ScanRequestSummary {
     pub target: String,
     pub port_count: usize,
+    pub list_scan: bool,
     pub ping_scan: bool,
     pub traceroute: bool,
     pub include_udp: bool,
@@ -575,6 +613,7 @@ pub struct ScanRequestSummary {
     pub callback_ping: bool,
     pub assess_hardware: bool,
     pub override_mode: bool,
+    pub sequential_port_order: bool,
     pub timing_template: Option<u8>,
     pub report_format: ReportFormat,
     pub lab_mode: bool,
