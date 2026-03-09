@@ -12,67 +12,7 @@ const IPV4_HEADER_LEN: usize = 20;
 const TCP_HEADER_LEN: usize = 20;
 const SYN_PACKET_LEN: usize = IPV4_HEADER_LEN + TCP_HEADER_LEN;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Stage 1 exposes the probe catalog before scanner integration lands.
-pub enum TcpAuditProbe {
-    Syn,
-    FirewallRuleGapIdentification,
-    StatelessFilterDropPolicyValidation,
-    Fin,
-    IllegalRfcFlagCombinationTesting,
-    FinAck,
-    Custom {
-        flags: u8,
-        acknowledgement: u32,
-    },
-}
-
-impl TcpAuditProbe {
-    pub fn label(self) -> &'static str {
-        match self {
-            TcpAuditProbe::Syn => "syn",
-            TcpAuditProbe::FirewallRuleGapIdentification => "firewall-rule-gap-identification",
-            TcpAuditProbe::StatelessFilterDropPolicyValidation => {
-                "stateless-filter-drop-policy-validation"
-            }
-            TcpAuditProbe::Fin => "fin",
-            TcpAuditProbe::IllegalRfcFlagCombinationTesting => {
-                "illegal-rfc-flag-combination-testing"
-            }
-            TcpAuditProbe::FinAck => "fin-ack",
-            TcpAuditProbe::Custom { .. } => "custom",
-        }
-    }
-
-    fn flags(self) -> u8 {
-        match self {
-            TcpAuditProbe::Syn => TcpFlags::SYN,
-            TcpAuditProbe::FirewallRuleGapIdentification => TcpFlags::ACK,
-            TcpAuditProbe::StatelessFilterDropPolicyValidation => 0,
-            TcpAuditProbe::Fin => TcpFlags::FIN,
-            TcpAuditProbe::IllegalRfcFlagCombinationTesting => {
-                TcpFlags::FIN | TcpFlags::PSH | TcpFlags::URG
-            }
-            TcpAuditProbe::FinAck => TcpFlags::FIN | TcpFlags::ACK,
-            TcpAuditProbe::Custom { flags, .. } => flags,
-        }
-    }
-
-    fn acknowledgement(self) -> u32 {
-        match self {
-            TcpAuditProbe::FirewallRuleGapIdentification => 1,
-            TcpAuditProbe::FinAck => 1,
-            TcpAuditProbe::Custom { acknowledgement, .. } => acknowledgement,
-            _ => 0,
-        }
-    }
-}
-
-// OfflineValidation / Protocol Simulation only:
-// this builder intentionally writes caller-provided TCP flag and acknowledgement
-// values without sanitization so fixtures, pcaps, and simulators can model
-// arbitrary header states while live transmission paths remain separate.
-pub fn build_raw_tcp_header(
+fn build_tcp_header(
     packet: &mut MutableTcpPacket<'_>,
     source_port: u16,
     target_port: u16,
@@ -116,14 +56,7 @@ impl SynPacketCrafter {
 
             let mut tcp_packet = MutableTcpPacket::new(ipv4_packet.payload_mut())
                 .ok_or_else(|| io::Error::other("failed to allocate tcp packet"))?;
-            build_raw_tcp_header(
-                &mut tcp_packet,
-                source_port,
-                0,
-                0,
-                0,
-                TcpAuditProbe::Syn.flags(),
-            );
+            build_tcp_header(&mut tcp_packet, source_port, 0, 0, 0, TcpFlags::SYN);
         }
 
         Ok(Self {
@@ -139,15 +72,16 @@ impl SynPacketCrafter {
         target_port: u16,
         sequence: u32,
     ) -> io::Result<&[u8]> {
-        self.craft_probe(target_ip, target_port, sequence, TcpAuditProbe::Syn)
+        self.craft_with_flags(target_ip, target_port, sequence, 0, TcpFlags::SYN)
     }
 
-    pub fn craft_probe(
+    fn craft_with_flags(
         &mut self,
         target_ip: Ipv4Addr,
         target_port: u16,
         sequence: u32,
-        probe: TcpAuditProbe,
+        acknowledgement: u32,
+        flags: u8,
     ) -> io::Result<&[u8]> {
         let mut ipv4_packet = MutableIpv4Packet::new(&mut self.buffer)
             .ok_or_else(|| io::Error::other("failed to map ipv4 packet"))?;
@@ -158,13 +92,13 @@ impl SynPacketCrafter {
         {
             let mut tcp_packet = MutableTcpPacket::new(ipv4_packet.payload_mut())
                 .ok_or_else(|| io::Error::other("failed to map tcp packet"))?;
-            build_raw_tcp_header(
+            build_tcp_header(
                 &mut tcp_packet,
                 self.source_port,
                 target_port,
                 sequence,
-                probe.acknowledgement(),
-                probe.flags(),
+                acknowledgement,
+                flags,
             );
             tcp_packet.set_checksum(0);
             let checksum = ipv4_checksum(&tcp_packet.to_immutable(), &self.source_ip, &target_ip);
@@ -174,68 +108,6 @@ impl SynPacketCrafter {
         let checksum = ipv4::checksum(&ipv4_packet.to_immutable());
         ipv4_packet.set_checksum(checksum);
         Ok(&self.buffer)
-    }
-
-    pub fn craft_firewall_rule_gap_probe(
-        &mut self,
-        target_ip: Ipv4Addr,
-        target_port: u16,
-        sequence: u32,
-    ) -> io::Result<&[u8]> {
-        self.craft_probe(
-            target_ip,
-            target_port,
-            sequence,
-            TcpAuditProbe::FirewallRuleGapIdentification,
-        )
-    }
-
-    pub fn craft_stateless_filter_drop_probe(
-        &mut self,
-        target_ip: Ipv4Addr,
-        target_port: u16,
-        sequence: u32,
-    ) -> io::Result<&[u8]> {
-        self.craft_probe(
-            target_ip,
-            target_port,
-            sequence,
-            TcpAuditProbe::StatelessFilterDropPolicyValidation,
-        )
-    }
-
-    #[allow(dead_code)] // Planned scanner wiring will consume this in a follow-up step.
-    pub fn craft_fin(
-        &mut self,
-        target_ip: Ipv4Addr,
-        target_port: u16,
-        sequence: u32,
-    ) -> io::Result<&[u8]> {
-        self.craft_probe(target_ip, target_port, sequence, TcpAuditProbe::Fin)
-    }
-
-    pub fn craft_illegal_rfc_flag_probe(
-        &mut self,
-        target_ip: Ipv4Addr,
-        target_port: u16,
-        sequence: u32,
-    ) -> io::Result<&[u8]> {
-        self.craft_probe(
-            target_ip,
-            target_port,
-            sequence,
-            TcpAuditProbe::IllegalRfcFlagCombinationTesting,
-        )
-    }
-
-    #[allow(dead_code)] // Planned scanner wiring will consume this in a follow-up step.
-    pub fn craft_fin_ack(
-        &mut self,
-        target_ip: Ipv4Addr,
-        target_port: u16,
-        sequence: u32,
-    ) -> io::Result<&[u8]> {
-        self.craft_probe(target_ip, target_port, sequence, TcpAuditProbe::FinAck)
     }
 }
 
@@ -257,8 +129,8 @@ pub fn syn_cookie_ack_expected(target_ip: Ipv4Addr, target_port: u16, seed: u64)
 #[cfg(test)]
 mod tests {
     use super::{
-        build_raw_tcp_header, syn_cookie_ack_expected, syn_cookie_sequence, SynPacketCrafter,
-        TcpAuditProbe, TCP_HEADER_LEN,
+        build_tcp_header, syn_cookie_ack_expected, syn_cookie_sequence, SynPacketCrafter,
+        TCP_HEADER_LEN,
     };
     use pnet_packet::ipv4::Ipv4Packet;
     use pnet_packet::tcp::{MutableTcpPacket, TcpFlags, TcpPacket};
@@ -281,55 +153,15 @@ mod tests {
     }
 
     #[test]
-    fn crafter_supports_firewall_rule_gap_probe() {
+    fn crafter_can_write_custom_flags_for_local_packet_tests() {
         let mut crafter = SynPacketCrafter::new(Ipv4Addr::new(10, 1, 0, 5), 42000).expect("init");
         let packet = crafter
-            .craft_firewall_rule_gap_probe(Ipv4Addr::new(10, 1, 0, 77), 80, 77)
-            .expect("craft");
-
-        let ipv4 = Ipv4Packet::new(packet).expect("ipv4");
-        let tcp = TcpPacket::new(ipv4.payload()).expect("tcp");
-        assert_eq!(tcp.get_flags(), TcpFlags::ACK);
-        assert_eq!(tcp.get_acknowledgement(), 1);
-    }
-
-    #[test]
-    fn crafter_supports_stateless_filter_drop_probe() {
-        let mut crafter = SynPacketCrafter::new(Ipv4Addr::new(10, 1, 0, 5), 42000).expect("init");
-        let packet = crafter
-            .craft_stateless_filter_drop_probe(Ipv4Addr::new(10, 1, 0, 77), 80, 77)
-            .expect("craft");
-
-        let ipv4 = Ipv4Packet::new(packet).expect("ipv4");
-        let tcp = TcpPacket::new(ipv4.payload()).expect("tcp");
-        assert_eq!(tcp.get_flags(), 0);
-        assert_eq!(tcp.get_acknowledgement(), 0);
-    }
-
-    #[test]
-    fn crafter_supports_illegal_rfc_flag_probe() {
-        let mut crafter = SynPacketCrafter::new(Ipv4Addr::new(10, 1, 0, 5), 42000).expect("init");
-        let packet = crafter
-            .craft_illegal_rfc_flag_probe(Ipv4Addr::new(10, 1, 0, 77), 80, 77)
-            .expect("craft");
-
-        let ipv4 = Ipv4Packet::new(packet).expect("ipv4");
-        let tcp = TcpPacket::new(ipv4.payload()).expect("tcp");
-        assert_eq!(tcp.get_flags(), TcpFlags::FIN | TcpFlags::PSH | TcpFlags::URG);
-    }
-
-    #[test]
-    fn crafter_supports_custom_probe_flags() {
-        let mut crafter = SynPacketCrafter::new(Ipv4Addr::new(10, 1, 0, 5), 42000).expect("init");
-        let packet = crafter
-            .craft_probe(
+            .craft_with_flags(
                 Ipv4Addr::new(10, 1, 0, 77),
                 80,
                 77,
-                TcpAuditProbe::Custom {
-                    flags: TcpFlags::RST | TcpFlags::PSH,
-                    acknowledgement: 9,
-                },
+                9,
+                TcpFlags::RST | TcpFlags::PSH,
             )
             .expect("craft");
 
@@ -347,28 +179,16 @@ mod tests {
     }
 
     #[test]
-    fn audit_probe_labels_match_catalog_terms() {
-        assert_eq!(
-            TcpAuditProbe::StatelessFilterDropPolicyValidation.label(),
-            "stateless-filter-drop-policy-validation"
-        );
-        assert_eq!(
-            TcpAuditProbe::IllegalRfcFlagCombinationTesting.label(),
-            "illegal-rfc-flag-combination-testing"
-        );
-    }
-
-    #[test]
-    fn raw_tcp_header_builder_preserves_unvalidated_inputs() {
+    fn tcp_header_builder_preserves_requested_inputs() {
         let mut buffer = [0u8; TCP_HEADER_LEN];
         let mut tcp = MutableTcpPacket::new(&mut buffer).expect("tcp");
-        build_raw_tcp_header(
+        build_tcp_header(
             &mut tcp,
             41000,
             8080,
             1234,
             9876,
-            TcpFlags::FIN | TcpFlags::PSH | TcpFlags::URG,
+            TcpFlags::RST | TcpFlags::PSH,
         );
 
         let parsed = TcpPacket::new(tcp.packet()).expect("parsed tcp");
@@ -376,20 +196,6 @@ mod tests {
         assert_eq!(parsed.get_destination(), 8080);
         assert_eq!(parsed.get_sequence(), 1234);
         assert_eq!(parsed.get_acknowledgement(), 9876);
-        assert_eq!(
-            parsed.get_flags(),
-            TcpFlags::FIN | TcpFlags::PSH | TcpFlags::URG
-        );
-    }
-
-    #[test]
-    fn raw_tcp_header_builder_allows_null_flag_protocol_simulation() {
-        let mut buffer = [0u8; TCP_HEADER_LEN];
-        let mut tcp = MutableTcpPacket::new(&mut buffer).expect("tcp");
-        build_raw_tcp_header(&mut tcp, 41000, 22, 77, 0, 0);
-
-        let parsed = TcpPacket::new(tcp.packet()).expect("parsed tcp");
-        assert_eq!(parsed.get_flags(), 0);
-        assert_eq!(parsed.get_acknowledgement(), 0);
+        assert_eq!(parsed.get_flags(), TcpFlags::RST | TcpFlags::PSH);
     }
 }

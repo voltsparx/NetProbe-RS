@@ -32,7 +32,7 @@ pub enum ScanPersona {
     IdfFog,
     MirrorReflective,
     Discovery,
-    Audit,
+    AggressiveEnrichment,
     MassScan,
 }
 
@@ -46,7 +46,7 @@ impl ScanPersona {
             ScanPersona::IdfFog => "idf-fog",
             ScanPersona::MirrorReflective => "mirror-reflective",
             ScanPersona::Discovery => "discovery",
-            ScanPersona::Audit => "audit",
+            ScanPersona::AggressiveEnrichment => "aggressive-enrichment",
             ScanPersona::MassScan => "mass-scan",
         }
     }
@@ -127,7 +127,7 @@ pub fn plan(request: &ScanRequest, host_count: usize, port_count: usize) -> Scan
                 } else if request.service_detection
                     && matches!(request.profile, ScanProfile::Aggressive)
                 {
-                    ScanPersona::Audit
+                    ScanPersona::AggressiveEnrichment
                 } else {
                     ScanPersona::Discovery
                 }
@@ -211,7 +211,7 @@ pub fn plan(request: &ScanRequest, host_count: usize, port_count: usize) -> Scan
             burst_size = burst_size.min(256);
             recommended_concurrency = recommended_concurrency.min(256);
         }
-        ScanPersona::Audit => {
+        ScanPersona::AggressiveEnrichment => {
             max_retries = max_retries.max(2);
             recommended_timeout = recommended_timeout.max(Duration::from_millis(900));
             recommended_concurrency = recommended_concurrency.min(512);

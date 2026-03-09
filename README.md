@@ -20,7 +20,7 @@ Instead of only reporting open ports, it explains findings, highlights risks, an
 - 🎓 Students & learners
 - 🛡️ Blue teams & defenders
 - 🧪 Lab environments
-- 🧑‍💻 Internal audits
+- 🧑‍💻 Internal reviews
 - 🔬 Security research
 
 ---
@@ -97,8 +97,8 @@ nprobe-rs 192.168.1.10 --root-only --allow-external
 ## 📄 Output Controls
 
 ```bash
-nprobe-rs 192.168.1.20 --output internal-audit --file-type json
-nprobe-rs 192.168.1.20 --output internal-audit --location ./reports --file-type html
+nprobe-rs 192.168.1.20 --output scan-report --file-type json
+nprobe-rs 192.168.1.20 --output scan-report --location ./reports --file-type html
 nprobe-rs 192.168.1.20 --location ./reports --file-type csv
 ```
 

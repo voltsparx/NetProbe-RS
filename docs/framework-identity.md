@@ -1,11 +1,11 @@
 # Framework Identity
 
-NProbe-RS is a defensive network audit framework, not just a port scanner.
+NProbe-RS is a defensive network assessment framework, not just a port scanner.
 
 ## Identity
 
 - safe enough for fragile and unknown devices
-- useful enough for specialists performing broad internal audits
+- useful enough for specialists performing broad internal reviews
 - teachable enough for learners who need explanations, not just raw results
 - trustworthy enough for long-running enterprise use through integrity checks and session history
 
@@ -37,4 +37,4 @@ NProbe-RS is optimized for balanced defensive throughput:
 - raw mass-recon acceleration primitives
 - unsafe defaults that trade target stability for scan speed
 
-The framework's identity is not "quietest attacker tool." It is "strongest defensive audit platform that still explains itself."
+The framework's identity is not "quietest attacker tool." It is "strongest defensive assessment platform that still explains itself."

@@ -33,7 +33,7 @@ Non-goals:
 
 - stealth or evasion
 - anonymous scanning
-- zombie-style behavior
+- reflection-style behavior
 - source hiding
 
 If a device shows stress signals or remains unclassified, Phantom stays conservative, reduces payload budget, and defers deeper probing.

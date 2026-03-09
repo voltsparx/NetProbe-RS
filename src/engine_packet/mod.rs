@@ -2,7 +2,6 @@
 
 pub mod afxdp_backend;
 pub mod arp;
-pub mod audit_fixture_generator;
 pub mod blackrock;
 pub mod datalink_backend;
 pub mod intelligence_pipeline;

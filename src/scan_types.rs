@@ -163,38 +163,11 @@ const SCAN_TYPES: &[ScanTypeEntry] = &[
         docs: &["self-assesment/scan-combo.txt"],
     },
     ScanTypeEntry {
-        id: "null",
-        category: "classic",
-        status: ScanTypeStatus::Planned,
-        flags: &["planned --null", "-sN"],
-        aliases: &["null-scan"],
-        summary: "NULL flag scan is part of the framework inventory and combo recipes, but not a live engine yet.",
-        docs: &["self-assesment/scan-combo.txt"],
-    },
-    ScanTypeEntry {
-        id: "fin",
-        category: "classic",
-        status: ScanTypeStatus::Planned,
-        flags: &["planned --fin", "-sF"],
-        aliases: &["fin-scan"],
-        summary: "FIN scan is listed as a classic raw-flag scan and remains a planned engine.",
-        docs: &["self-assesment/scan-combo.txt"],
-    },
-    ScanTypeEntry {
-        id: "xmas",
-        category: "classic",
-        status: ScanTypeStatus::Planned,
-        flags: &["planned --xmas", "-sX"],
-        aliases: &["xmas-scan"],
-        summary: "Xmas (FIN/PSH/URG) scan is cataloged for future raw-flag support and combo recipes.",
-        docs: &["self-assesment/scan-combo.txt"],
-    },
-    ScanTypeEntry {
         id: "maimon",
         category: "classic",
         status: ScanTypeStatus::Planned,
         flags: &["-sM"],
-        aliases: &["fin-ack-scan"],
+        aliases: &["maimon-scan"],
         summary: "Maimon FIN/ACK scanning is cataloged from the encyclopedia, but remains non-executable in the current framework.",
         docs: &["cooking-reverse-engineering/nmap-scan-encyclopedia.txt"],
     },
@@ -208,18 +181,6 @@ const SCAN_TYPES: &[ScanTypeEntry] = &[
         docs: &[
             "cooking-reverse-engineering/nmap-scan-encyclopedia.txt",
             "cooking-reverse-engineering/packet-factory.txt",
-        ],
-    },
-    ScanTypeEntry {
-        id: "zombie",
-        category: "classic",
-        status: ScanTypeStatus::Planned,
-        flags: &["planned --zombie <host>", "-sI <zombie>"],
-        aliases: &["idle", "idle-scan", "zombie-reflection"],
-        summary: "idle/zombie scan via predictable IPID deltas is documented from Nmap reverse-engineering, but remains framework inventory only for now.",
-        docs: &[
-            "cooking-reverse-engineering/zombie-scan-from-nmap.txt",
-            "self-assesment/scan-combo.txt",
         ],
     },
     ScanTypeEntry {
@@ -430,15 +391,6 @@ const SCAN_TYPES: &[ScanTypeEntry] = &[
         docs: &["self-assesment/introducing-literal-new-scan-types-for-defensive-sec/callback-ping/callback-ping-doc.txt"],
     },
     ScanTypeEntry {
-        id: "ghost-recon",
-        category: "combo",
-        status: ScanTypeStatus::Planned,
-        flags: &["--phantom --idf --stealth --null"],
-        aliases: &[],
-        summary: "scan-combo recipe for minimalist NULL-style defensive recon; cataloged as a composed recipe.",
-        docs: &["self-assesment/scan-combo.txt"],
-    },
-    ScanTypeEntry {
         id: "kinetic-fingerprint",
         category: "combo",
         status: ScanTypeStatus::Planned,
@@ -448,51 +400,12 @@ const SCAN_TYPES: &[ScanTypeEntry] = &[
         docs: &["self-assesment/scan-combo.txt"],
     },
     ScanTypeEntry {
-        id: "vanguard-bypass",
-        category: "combo",
-        status: ScanTypeStatus::Planned,
-        flags: &["--phantom --kis --tcp --fin"],
-        aliases: &[],
-        summary: "scan-combo recipe combining timing noise and classic FIN concepts; catalog only for now.",
-        docs: &["self-assesment/scan-combo.txt"],
-    },
-    ScanTypeEntry {
-        id: "zombie-reflection",
-        category: "combo",
-        status: ScanTypeStatus::Planned,
-        flags: &["--zombie <host> --ack --phantom --stealth"],
-        aliases: &[],
-        summary: "scan-combo recipe built around the classic idle/zombie concept and Phantom observation.",
-        docs: &[
-            "self-assesment/scan-combo.txt",
-            "cooking-reverse-engineering/zombie-scan-from-nmap.txt",
-        ],
-    },
-    ScanTypeEntry {
-        id: "xmas-collapse",
-        category: "combo",
-        status: ScanTypeStatus::Planned,
-        flags: &["--xmas --kis --sars --tcp"],
-        aliases: &[],
-        summary: "scan-combo recipe using Xmas flag semantics plus KIS/SAR timing concepts.",
-        docs: &["self-assesment/scan-combo.txt"],
-    },
-    ScanTypeEntry {
         id: "sovereign-callback",
         category: "combo",
         status: ScanTypeStatus::Planned,
         flags: &["--callback-ping --idf --sars"],
         aliases: &[],
         summary: "scan-combo recipe for callback validation and identity-aware mesh confirmation.",
-        docs: &["self-assesment/scan-combo.txt"],
-    },
-    ScanTypeEntry {
-        id: "null-resonance",
-        category: "combo",
-        status: ScanTypeStatus::Planned,
-        flags: &["--null --phantom --sars"],
-        aliases: &[],
-        summary: "scan-combo recipe for minimalist NULL-style probing plus SAR observation.",
         docs: &["self-assesment/scan-combo.txt"],
     },
     ScanTypeEntry {
@@ -524,7 +437,7 @@ pub fn render_scan_type_catalog(raw_query: Option<&str>) -> String {
     if matches.is_empty() {
         out.push_str("No scan type matched that query.\n");
         out.push_str(
-            "Try: --scan-type syn | --scan-type phantom | --scan-type zombie | --scan-type -sI | --scan-type all\n",
+            "Try: --scan-type syn | --scan-type phantom | --scan-type arp | --scan-type -sS | --scan-type all\n",
         );
         return out;
     }
@@ -570,8 +483,8 @@ pub fn render_scan_type_catalog(raw_query: Option<&str>) -> String {
 
     out.push_str("Examples:\n");
     out.push_str("  nprobe-rs --scan-type\n");
-    out.push_str("  nprobe-rs --scan-type zombie\n");
-    out.push_str("  nprobe-rs --scan-type -sI\n");
+    out.push_str("  nprobe-rs --scan-type syn\n");
+    out.push_str("  nprobe-rs --scan-type -sS\n");
     out.push_str("  nprobe-rs --scan-type phantom\n");
     out
 }
@@ -636,24 +549,24 @@ mod tests {
     fn catalog_lists_live_and_planned_scan_types() {
         let rendered = render_scan_type_catalog(None);
         assert!(rendered.contains("syn [implemented]"));
-        assert!(rendered.contains("zombie [planned]"));
+        assert!(rendered.contains("ack [planned]"));
         assert!(rendered.contains("phantom [implemented]"));
         assert!(rendered.contains("timing-profile [implemented]"));
     }
 
     #[test]
-    fn catalog_query_filters_to_zombie_material() {
-        let rendered = render_scan_type_catalog(Some("zombie"));
-        assert!(rendered.contains("zombie [planned]"));
-        assert!(rendered.contains("zombie-scan-from-nmap"));
+    fn catalog_query_filters_to_syn_material() {
+        let rendered = render_scan_type_catalog(Some("syn"));
+        assert!(rendered.contains("syn [implemented]"));
+        assert!(rendered.contains("syn-scan"));
         assert!(!rendered.contains("phantom [implemented]"));
     }
 
     #[test]
     fn catalog_query_matches_nmap_shortcut_alias() {
-        let rendered = render_scan_type_catalog(Some("-sI"));
-        assert!(rendered.contains("zombie [planned]"));
-        assert!(rendered.contains("detail: docs/scan-types/zombie.md"));
+        let rendered = render_scan_type_catalog(Some("-sS"));
+        assert!(rendered.contains("syn [implemented]"));
+        assert!(rendered.contains("detail: docs/scan-types/syn.md"));
     }
 
     #[test]
@@ -661,5 +574,12 @@ mod tests {
         let rendered = render_scan_type_catalog(Some("-PR"));
         assert!(rendered.contains("arp [implemented]"));
         assert!(rendered.contains("detail: docs/scan-types/arp.md"));
+    }
+
+    #[test]
+    fn catalog_query_surfaces_combo_entries() {
+        let rendered = render_scan_type_catalog(Some("sovereign-callback"));
+        assert!(rendered.contains("sovereign-callback [planned]"));
+        assert!(rendered.contains("--callback-ping --idf --sars"));
     }
 }

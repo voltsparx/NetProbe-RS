@@ -22,10 +22,6 @@ Core types:
 - `syn`
 - `udp`
 - `ack`
-- `null`
-- `fin`
-- `xmas`
-- `zombie`
 - `ip-protocol`
 - `sctp-init`
 - `banner`
@@ -41,10 +37,5 @@ Core types:
 
 Combo recipes:
 
-- `ghost-recon`
 - `kinetic-fingerprint`
-- `vanguard-bypass`
-- `zombie-reflection`
-- `xmas-collapse`
 - `sovereign-callback`
-- `null-resonance`

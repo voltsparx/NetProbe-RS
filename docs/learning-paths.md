@@ -12,7 +12,7 @@ NProbe-RS is structured so one framework can serve different defensive users wit
 
 - Use direct CLI entry: `nprobe-rs <target> [options]`
 - Nmap-style aliases are supported where semantics are honest: `-sU`, `-sS`, `-sT`, `-sV`, `-Pn`, `-A`, `-T0..-T5`, `-p-`
-- Prefer `balanced` or `stealth` for normal audits
+- Prefer `balanced` or `stealth` for normal reviews
 
 ## Fragile Device Triage
 
@@ -33,5 +33,5 @@ These are grouped as `TBNS` and stay inside low-impact guardrails.
 
 - Startup integrity verification is enforced before sessions and scans
 - Scan reports include integrity state so operators can see whether the runtime was verified
-- Session history keeps defensive runs auditable and resumable
+- Session history keeps defensive runs reviewable and resumable
 - SQLite-backed host snapshots preserve progress during long scans, not just final reports
