@@ -197,6 +197,7 @@ pub enum TcpScanMode {
 }
 
 impl TcpScanMode {
+    #[allow(dead_code)]
     pub fn as_str(self) -> &'static str {
         match self {
             TcpScanMode::Connect => "connect",
